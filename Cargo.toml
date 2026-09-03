@@ -1,0 +1,39 @@
+[package]
+name = "tidal_dash"
+version = "0.1.0"
+authors = ["Patrick Hayes <patrick.d.hayes@gmail.com>"]
+description = "Parse TIDAL MPEG-DASH manifests and set them up for progressive streaming playback"
+license = "MIT"
+edition = "2024"
+repository = "https://github.com/phayes/tidal_dash"
+homepage = "https://github.com/phayes/tidal_dash"
+documentation = "https://docs.rs/tidal_dash"
+readme = "README.md"
+keywords = ["tidal", "dash", "mpeg-dash", "streaming", "audio"]
+categories = ["multimedia::audio", "parser-implementations"]
+
+[dependencies]
+base64 = "0.23"
+log = "^0.4"
+quick-xml = "0.42.0"
+rodio = { version = "0.22", optional = true, default-features = false, features = [
+    "symphonia-aac",
+    "symphonia-flac",
+    "symphonia-isomp4",
+] }
+serde = { version = "^1.0", features = ["derive"] }
+thiserror = "^2.0"
+ureq = { version = "3.1", default-features = false, features = ["rustls"] }
+
+[features]
+default = []
+rodio = ["dep:rodio"]
+
+[dev-dependencies]
+crossterm = "0.29"
+env_logger = "0.11"
+rodio = { version = "0.22", default-features = false, features = ["playback"] }
+
+[[example]]
+name = "player"
+required-features = ["rodio"]

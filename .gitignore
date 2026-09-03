@@ -1,0 +1,5 @@
+/target
+manifest.xml
+.DS_Store
+.env
+Cargo.lock
