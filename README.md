@@ -60,7 +60,7 @@ player.sleep_until_end();
 
 ## Caveats
 
-This crate is currently built to parse TIDAL-style mpeg-dash manifest files, and many other flavours of mpeg-dash are not well supported. Contributions to improve this are very welcome. 
+This crate is currently built to parse TIDAL-style dash manifest files, and many other flavours of mpeg-dash are not well supported. Contributions to improve this are very welcome. 
 
 ## Example player
 
@@ -77,5 +77,5 @@ to read stdin. Arrow keys jump 1 second or 1 minute.
 
 Contributions are welcome.  I would be particularily grateful for contributions that:
 
-1. Extend this crate to be a generic MPEG-DASH playback crate. 
+1. Replace the tidal-specific MPEG-DASH manifest parser with a pure-rust 3rd party crate dedicated to dash manifest parsing.
 2. Add support for encrypted stream
