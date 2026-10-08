@@ -1,5 +1,7 @@
 //! Progressive in-memory reader over MPEG-DASH fragments.
 
+#[cfg(feature = "encryption")]
+use crate::cenc::{self, ContentKeys, FragmentRole};
 use crate::error::Error;
 use log::warn;
 use std::collections::HashMap;
@@ -253,6 +255,10 @@ struct FragmentData {
     get_lock: Mutex<()>,
     /// Held across a HEAD, as `get_lock` is for GETs.
     head_lock: Mutex<()>,
+    /// How a keyed cache turns this fragment's fetched bytes into plaintext.
+    /// A reader sets it before the first GET of the fragment.
+    #[cfg(feature = "encryption")]
+    role: OnceLock<FragmentRole>,
 }
 
 impl FragmentData {
@@ -263,6 +269,8 @@ impl FragmentData {
             probed_size: OnceLock::new(),
             get_lock: Mutex::new(()),
             head_lock: Mutex::new(()),
+            #[cfg(feature = "encryption")]
+            role: OnceLock::new(),
         }
     }
 
@@ -284,9 +292,14 @@ impl FragmentData {
 ///
 /// Use this to share caches across multiple readers that read the same stream,
 /// such as a reader rebuilt after a seek.
+///
+/// With the `encryption` feature, [`Self::with_keys`] makes the cache decrypt
+/// Common Encryption before storing each body, so it holds only plaintext.
 pub struct FragmentCache {
     transport: Arc<dyn Transport>,
     fragments: Mutex<HashMap<Fragment, Arc<FragmentData>>>,
+    #[cfg(feature = "encryption")]
+    keys: Option<Arc<ContentKeys>>,
 }
 
 impl FragmentCache {
@@ -295,10 +308,35 @@ impl FragmentCache {
         Self {
             transport,
             fragments: Mutex::default(),
+            #[cfg(feature = "encryption")]
+            keys: None,
         }
     }
 
-    /// The body of `fragment`, if it has been fetched.
+    /// Decrypts `cenc` and `cbcs` Common Encryption with `keys` before
+    /// caching each body, so readers and [`Self::cached`] see plaintext.
+    ///
+    /// Each reader parses its representation's protection from the
+    /// initialization segment, and fails with
+    /// [`Error::MissingContentKey`] before any media GET if `keys` lacks
+    /// its KID. Unprotected representations pass through unchanged.
+    #[cfg(feature = "encryption")]
+    pub fn with_keys(mut self, keys: ContentKeys) -> Self {
+        self.keys = Some(Arc::new(keys));
+        self
+    }
+
+    /// Whether this cache decrypts Common Encryption; see `with_keys`
+    /// (requires the `encryption` feature).
+    pub fn decrypts(&self) -> bool {
+        #[cfg(feature = "encryption")]
+        return self.keys.is_some();
+        #[cfg(not(feature = "encryption"))]
+        false
+    }
+
+    /// The body of `fragment`, if it has been fetched. On a cache with
+    /// content keys, this is the decrypted body.
     pub fn cached(&self, fragment: &Fragment) -> Option<Arc<[u8]>> {
         self.lock().get(fragment)?.body().cloned()
     }
@@ -350,7 +388,63 @@ impl FragmentCache {
                 actual: body.len() as u64,
             });
         }
+        #[cfg(feature = "encryption")]
+        let body = self.decrypt(data, body)?;
         Ok(data.body.get_or_init(|| body).clone())
+    }
+
+    /// Decrypts `body` in place according to `data`'s role. Same length out
+    /// as in, so ranges, HEAD sizes and byte seeks are unaffected.
+    #[cfg(feature = "encryption")]
+    fn decrypt(&self, data: &FragmentData, mut body: Arc<[u8]>) -> Result<Arc<[u8]>, Error> {
+        let Some(keys) = &self.keys else {
+            return Ok(body);
+        };
+        let role = match data.role.get() {
+            Some(FragmentRole::Media(tracks)) if tracks.is_empty() => return Ok(body),
+            Some(role) => role,
+            None => {
+                debug_assert!(
+                    false,
+                    "keyed cache fetched {} before a reader set its role",
+                    data.fragment
+                );
+                return Ok(body);
+            }
+        };
+        // ureq's `Vec -> Arc` body is already unique; only shared bodies copy.
+        if Arc::get_mut(&mut body).is_none() {
+            body = Arc::from(&*body);
+        }
+        let bytes = Arc::get_mut(&mut body).expect("body was just made unique");
+        match role {
+            FragmentRole::Init => cenc::clear_sample_entries(bytes),
+            FragmentRole::Media(tracks) => cenc::decrypt_fragment(bytes, tracks, keys),
+        }
+        .map_err(|problem| problem.at(&data.fragment))?;
+        Ok(body)
+    }
+
+    /// Tags `fragments[1..]` with the protection parsed from the already
+    /// fetched and cleared init body. Fails before any media GET if a
+    /// protected track's KID has no key.
+    #[cfg(feature = "encryption")]
+    fn assign_media_roles(&self, fragments: &[Arc<FragmentData>]) -> Result<(), Error> {
+        let Some(keys) = &self.keys else {
+            return Ok(());
+        };
+        let init = &fragments[0];
+        let body = init.body().expect("init fetched before media roles");
+        let tracks = cenc::track_protection(body).map_err(|problem| problem.at(&init.fragment))?;
+        if let Some(track) = tracks.iter().find(|track| !keys.contains(&track.kid)) {
+            return Err(Error::MissingContentKey(cenc::hex(&track.kid)));
+        }
+        let tracks: Arc<[_]> = tracks.into();
+        for data in &fragments[1..] {
+            // Already set if another reader of this cache got here first.
+            let _ = data.role.set(FragmentRole::Media(tracks.clone()));
+        }
+        Ok(())
     }
 
     /// HEADs `data` unless its size is already known or another reader is
@@ -382,6 +476,7 @@ impl fmt::Debug for FragmentCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FragmentCache")
             .field("fragments", &self.lock().len())
+            .field("decrypts", &self.decrypts())
             .finish_non_exhaustive()
     }
 }
@@ -615,7 +710,11 @@ impl MpegStreamReader {
             .into_iter()
             .map(|fragment| cache.data(fragment))
             .collect();
+        #[cfg(feature = "encryption")]
+        let _ = fragments[0].role.set(FragmentRole::Init);
         cache.get(&fragments[0])?;
+        #[cfg(feature = "encryption")]
+        cache.assign_media_roles(&fragments)?;
         let complete = fragments.iter().all(|data| data.body().is_some());
 
         let shared = Arc::new(ReaderShared {

@@ -100,8 +100,39 @@ pub enum Error {
     #[error("Audio decoder initialization failed: {0}")]
     RodioDecoder(#[from] ::rodio::decoder::DecoderError),
 
-    /// The rodio adapter was asked to decode a protected representation.
+    /// The rodio adapter was asked to decode a protected representation
+    /// without content keys.
     #[cfg(feature = "rodio")]
-    #[error("Rodio playback does not support {0}-protected MPEG-DASH content")]
+    #[error("Rodio playback of {0}-protected MPEG-DASH content needs content keys")]
     RodioProtectedContent(String),
+
+    /// A content key or key ID was not 32 hexadecimal digits
+    #[cfg(feature = "encryption")]
+    #[error("Invalid content key or KID: {0}")]
+    InvalidContentKey(String),
+
+    /// Protected media needs a key for this KID (hexadecimal) that was not supplied
+    #[cfg(feature = "encryption")]
+    #[error("No content key for KID {0}")]
+    MissingContentKey(String),
+
+    /// A fragment uses Common Encryption features this crate does not decrypt
+    #[cfg(feature = "encryption")]
+    #[error("Fragment {fragment} uses unsupported content protection: {reason}")]
+    UnsupportedProtection {
+        /// The fragment URL and range
+        fragment: String,
+        /// What is unsupported
+        reason: String,
+    },
+
+    /// A fragment's Common Encryption boxes are truncated or inconsistent
+    #[cfg(feature = "encryption")]
+    #[error("Fragment {fragment} has malformed content protection: {reason}")]
+    MalformedProtection {
+        /// The fragment URL and range
+        fragment: String,
+        /// What is malformed
+        reason: String,
+    },
 }

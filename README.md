@@ -13,7 +13,8 @@ rodio = { version = "0.22", default-features = false, features = ["playback"] }
 ```
 
 `DashSource` is included by default: a ready-to-use rodio source for rodio and symphonia.
-It supports unprotected streams; DRM-protected `cenc` and `cbcs` streams are not yet supported.
+It plays unprotected streams, and `cenc` or `cbcs` encrypted streams when you have the content
+keys (see [Encrypted streams](#encrypted-streams)).
 
 ## Rodio playback
 
@@ -65,6 +66,34 @@ and never downloads a fragment twice, even while another reader's download is in
 `DashSource` does this internally; use `DashSource::new_with_cache` to share a cache or to
 supply your own `Transport` through `FragmentCache::new`.
 
+## Encrypted streams
+
+The `encryption` feature decrypts ISO Common Encryption (`cenc` and `cbcs`) in pure Rust, given
+content keys you already hold. It does not talk to a DRM licence server or CDM.
+
+```toml
+[dependencies]
+tidal_dash = { version = "0.1", features = ["encryption"] }
+```
+
+```rust,ignore
+use tidal_dash::{ContentKeys, DashManifest, DashSource};
+
+let mut keys = ContentKeys::new();
+// KID and key as 32 hex digits; a UUID-form KID from `cenc:default_KID` also works.
+keys.insert_hex("0123456789abcdef0123456789abcdef", "00112233445566778899aabbccddeeff")?;
+
+let manifest = DashManifest::new(dash_xml)?;
+let source = DashSource::new_with_keys(&manifest, "FLAC", keys)?;
+```
+
+For the lower-level API, pass `FragmentCache::default().with_keys(keys)` to
+`DashManifest::stream_with_cache`. Fragments are decrypted once as they arrive and cached as
+plaintext of the same length, so seeking and shared caches work as for unprotected streams.
+A missing key fails with `Error::MissingContentKey` before any media is downloaded.
+Key rotation (`seig` sample groups), the `cens` and `cbc1` schemes, and sample encryption data
+outside a `senc` box are not supported.
+
 ## Caveats
 
 `SegmentBase` and multi-period playback and live (`type="dynamic"`) manifests are not yet supported. Contributions
@@ -83,6 +112,4 @@ path, or omitted to read stdin. Arrow keys jump 1 second or 1 minute.
 
 ## Contributing
 
-Contributions are welcome.  I would be particularily grateful for contributions that:
-
-1. Add support for encrypted stream
+Contributions are welcome.

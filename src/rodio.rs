@@ -1,5 +1,7 @@
-//! Rodio source support for progressive, unprotected MPEG-DASH playback.
+//! Rodio source support for progressive MPEG-DASH playback.
 
+#[cfg(feature = "encryption")]
+use crate::ContentKeys;
 use crate::{DashManifest, Error, Fragment, FragmentCache, MediaTimeline, MpegStreamReader};
 use ::rodio::{Decoder, Source, source::SeekError};
 use std::sync::Arc;
@@ -14,8 +16,10 @@ use std::time::Duration;
 /// Every rebuild shares one [`FragmentCache`], so seeks reuse pooled
 /// connections and never re-download the initialization segment or fragments
 /// that already arrived.
-/// Common-encryption schemes such as `cenc` and `cbcs` are rejected because
-/// rodio and Symphonia do not provide DRM decryption.
+/// Common-encryption schemes such as `cenc` and `cbcs` need content keys:
+/// with the `encryption` feature, use [`DashSource::new_with_keys`] or a
+/// cache from `FragmentCache::with_keys`. Otherwise they are rejected,
+/// because rodio and Symphonia do not decrypt.
 pub struct DashSource {
     fragments: Vec<Fragment>,
     cache: Arc<FragmentCache>,
@@ -34,16 +38,35 @@ impl DashSource {
         Self::new_with_cache(manifest, id, Arc::default())
     }
 
+    /// Like [`DashSource::new`], but decrypts `cenc` or `cbcs` Common
+    /// Encryption with `keys`.
+    ///
+    /// Fails with [`Error::MissingContentKey`] if the initialization segment
+    /// names a KID that `keys` lacks. Unprotected representations play as
+    /// with [`DashSource::new`].
+    #[cfg(feature = "encryption")]
+    pub fn new_with_keys(
+        manifest: &DashManifest,
+        id: impl AsRef<str>,
+        keys: ContentKeys,
+    ) -> Result<Self, Error> {
+        let cache = FragmentCache::default().with_keys(keys);
+        Self::new_with_cache(manifest, id, Arc::new(cache))
+    }
+
     /// Like [`DashSource::new`], but fetches through `cache`, for a custom
-    /// [`crate::Transport`] or to share connections and downloaded fragments
-    /// with other sources.
+    /// [`crate::Transport`], content keys, or to share connections and
+    /// downloaded fragments with other sources. A protected representation
+    /// is rejected unless `cache` decrypts.
     pub fn new_with_cache(
         manifest: &DashManifest,
         id: impl AsRef<str>,
         cache: Arc<FragmentCache>,
     ) -> Result<Self, Error> {
         let id = id.as_ref();
-        if let Some(scheme) = manifest.protection_scheme(id)? {
+        if let Some(scheme) = manifest.protection_scheme(id)?
+            && !cache.decrypts()
+        {
             return Err(Error::RodioProtectedContent(scheme));
         }
         let fragments = manifest.fragments(id)?;

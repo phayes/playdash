@@ -13,7 +13,9 @@ keywords = ["tidal", "dash", "mpeg-dash", "streaming", "audio"]
 categories = ["multimedia::audio", "parser-implementations"]
 
 [dependencies]
+aes = { version = "0.9", optional = true }
 base64 = "0.23"
+ctr = { version = "0.10", optional = true }
 # The `log` feature is only needed because dash-mpd-core 0.1.0 fails to build without it
 # (fixed upstream in e3d85a3, unreleased). Drop it once a newer release is out.
 dash-mpd-core = { version = "0.1", default-features = false, features = ["log"], path = "/opt/dash-mpd-core" }
@@ -28,6 +30,8 @@ url = "2.5"
 [features]
 default = ["rodio"]
 rodio = ["dep:rodio"]
+# Decrypt `cenc` and `cbcs` Common Encryption with caller-supplied content keys.
+encryption = ["dep:aes", "dep:ctr"]
 
 [dev-dependencies]
 crossterm = "0.29"
