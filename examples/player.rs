@@ -36,9 +36,8 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use rodio::{DeviceSinkBuilder, Player};
-use playdash::dash_mpd_core::Representation;
 use playdash::{DashManifest, DashSource};
+use rodio::{DeviceSinkBuilder, Player};
 
 fn main() {
     if let Err(error) = run() {
@@ -60,7 +59,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(url) if is_http_url(url) => DashManifest::new_from_url(url)?,
         input => parse_manifest(&load_input(input)?)?,
     };
-    let representation = select_representation(&manifest, args.id.as_deref())?;
+    let representation = match args.id.as_deref() {
+        Some(id) => manifest
+            .representation(id)
+            .ok_or_else(|| format!("MPEG-DASH representation not found: {id}"))?,
+        None => manifest
+            .representations()
+            .next()
+            .ok_or("MPEG-DASH manifest contains no representations")?,
+    };
     let id = representation.id.as_deref().unwrap_or_default();
     let bitrate = representation
         .bandwidth
@@ -147,21 +154,6 @@ fn parse_manifest(input: &str) -> Result<DashManifest, Box<dyn Error>> {
         Ok(DashManifest::new_from_data_url(input.trim())?)
     } else {
         Ok(DashManifest::new(input)?)
-    }
-}
-
-fn select_representation<'a>(
-    manifest: &'a DashManifest,
-    id: Option<&str>,
-) -> Result<&'a Representation, Box<dyn Error>> {
-    match id {
-        Some(id) => manifest
-            .representation(id)
-            .ok_or_else(|| format!("MPEG-DASH representation not found: {id}").into()),
-        None => manifest
-            .representations()
-            .next()
-            .ok_or_else(|| "MPEG-DASH manifest contains no representations".into()),
     }
 }
 

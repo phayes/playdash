@@ -25,6 +25,21 @@ const BLOCK: usize = 16;
 /// Content keys for decrypting Common Encryption, by 128-bit key ID (KID).
 ///
 /// `Debug` lists key IDs but never keys.
+///
+/// # Examples
+///
+/// ```
+/// use playdash::ContentKeys;
+///
+/// let mut keys = ContentKeys::new();
+/// keys.insert_hex(
+///     "01234567-89ab-cdef-0123-456789abcdef",
+///     "00112233445566778899aabbccddeeff",
+/// )?;
+///
+/// assert_eq!(keys.len(), 1);
+/// # Ok::<(), playdash::Error>(())
+/// ```
 #[derive(Clone, Default)]
 pub struct ContentKeys {
     keys: HashMap<[u8; 16], [u8; 16]>,

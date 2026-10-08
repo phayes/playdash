@@ -2,15 +2,14 @@
 //! and checks they decode to the same samples as the unencrypted source.
 #![cfg(all(feature = "encryption", feature = "rodio"))]
 
+use playdash::{
+    ContentKeys, DashManifest, DashSource, Error, Fragment, FragmentCache, StreamReader, Transport,
+};
 use rodio::{Decoder, Source};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use playdash::{
-    ContentKeys, DashManifest, DashSource, Error, Fragment, FragmentCache, MpegStreamReader,
-    Transport,
-};
 
 const KID: &str = "0123456789abcdef0123456789abcdef";
 const KEY: &str = "00112233445566778899aabbccddeeff";
@@ -90,12 +89,12 @@ fn split_fragments(file: &[u8]) -> Vec<std::ops::RangeInclusive<u64>> {
     ranges
 }
 
-fn ranged_reader(name: &str, cache: Arc<FragmentCache>) -> MpegStreamReader {
+fn ranged_reader(name: &str, cache: Arc<FragmentCache>) -> StreamReader {
     let fragments = split_fragments(&fixture(name))
         .into_iter()
         .map(|range| Fragment::with_range(format!("{BASE}{name}"), range))
         .collect();
-    MpegStreamReader::new_with_cache(fragments, None, false, cache).unwrap()
+    StreamReader::new_with_cache(fragments, None, false, cache).unwrap()
 }
 
 #[test]

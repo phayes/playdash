@@ -2,30 +2,39 @@
 
 #[cfg(feature = "encryption")]
 use crate::ContentKeys;
-use crate::{DashManifest, Error, Fragment, FragmentCache, MediaTimeline, MpegStreamReader};
+use crate::{DashManifest, Error, Fragment, FragmentCache, MediaTimeline, StreamReader};
 use ::rodio::{Decoder, Source, source::SeekError};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A progressive rodio source that seeks using MPEG-DASH media fragments.
+/// A seekable rodio [`Source`] for an MPEG-DASH representation.
 ///
-/// The underlying Symphonia decoder is opened as a non-seekable fragmented MP4
-/// stream, so it does not require a total byte length. Seeking rebuilds the
-/// decoder with the initialization fragment followed by the media fragment
-/// containing the requested timestamp and the remaining media fragments.
-/// Every rebuild shares one [`FragmentCache`], so seeks reuse pooled
-/// connections and never re-download the initialization segment or fragments
-/// that already arrived.
-/// Common-encryption schemes such as `cenc` and `cbcs` need content keys:
-/// with the `encryption` feature, use [`DashSource::new_with_keys`] or a
-/// cache from `FragmentCache::with_keys`. Otherwise they are rejected,
-/// because rodio and Symphonia do not decrypt.
+/// Use [`DashSource::new`] for unprotected media. Common-encrypted media needs
+/// the `encryption` feature and [`DashSource::new_with_keys`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use playdash::{DashManifest, DashSource};
+/// use rodio::{DeviceSinkBuilder, Player};
+///
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
+/// let source = DashSource::new(&manifest, "audio")?;
+///
+/// let device = DeviceSinkBuilder::open_default_sink()?;
+/// let player = Player::connect_new(device.mixer());
+/// player.append(source);
+/// player.sleep_until_end();
+/// # Ok(())
+/// # }
+/// ```
 pub struct DashSource {
     fragments: Vec<Fragment>,
     cache: Arc<FragmentCache>,
     timeline: MediaTimeline,
     mime_type: String,
-    decoder: Decoder<MpegStreamReader>,
+    decoder: Decoder<StreamReader>,
 }
 
 impl DashSource {
@@ -94,7 +103,7 @@ impl DashSource {
         timeline: &MediaTimeline,
         mime_type: &str,
         media_index: usize,
-    ) -> Result<Decoder<MpegStreamReader>, Error> {
+    ) -> Result<Decoder<StreamReader>, Error> {
         let mut selected = Vec::with_capacity(fragments.len() - media_index);
         selected.push(fragments[0].clone());
         selected.extend_from_slice(&fragments[media_index + 1..]);
@@ -105,12 +114,8 @@ impl DashSource {
         };
         // The decoder is unseekable and seeks rebuild by timeline, so byte
         // sizes from eager HEADs would go unused.
-        let reader = MpegStreamReader::new_with_cache(
-            selected,
-            Some(selected_timeline),
-            false,
-            cache.clone(),
-        )?;
+        let reader =
+            StreamReader::new_with_cache(selected, Some(selected_timeline), false, cache.clone())?;
 
         Ok(Decoder::builder()
             .with_data(reader)

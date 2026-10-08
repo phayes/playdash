@@ -1,6 +1,6 @@
 # playdash
 
-Parse MPEG-DASH manifests and set them up for progressive streaming playback.
+Parse MPEG-DASH manifests for progressive, seekable streaming playback.
 
 This crate lets you play MPEG-DASH streams with seeking.
 
@@ -13,15 +13,16 @@ playdash = "0.1"
 
 ## Streaming
 
-`DashManifest::stream` returns an `MpegStreamReader` that implements `std::io::Read` and
-`std::io::Seek`, so you can hand it to any MP4 demuxer or playback system.
+`DashManifest::stream` returns a `StreamReader` that implements `std::io::Read` and
+`std::io::Seek`, so it can feed an MP4 demuxer or playback system.
 
-```rust,ignore
+```rust,no_run
 use std::io::Read;
 use std::time::Duration;
 use playdash::DashManifest;
 
-let manifest = DashManifest::new(dash_xml)?;
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
+let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 let mut reader = manifest.stream("FLAC", true)?;
 
 let mut mpeg_buffer = [0u8; 4096];
@@ -30,6 +31,8 @@ reader.read(&mut mpeg_buffer)?;
 // Seek to a specific timestamp. Lands at the start of the containing fragment.
 reader.seek_time_coarse(Duration::from_secs(90))?;
 reader.read(&mut mpeg_buffer)?;
+# Ok(())
+# }
 ```
 
 ## Rodio playback
@@ -42,17 +45,20 @@ playdash = { version = "0.1", features = ["rodio"] }
 rodio = { version = "0.22", default-features = false, features = ["playback"] }
 ```
 
-```rust,ignore
+```rust,no_run
 use rodio::{DeviceSinkBuilder, Player};
 use playdash::{DashManifest, DashSource};
 
-let manifest = DashManifest::new(dash_xml)?;
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
+let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 let source = DashSource::new(&manifest, "FLAC")?;
 
 let device = DeviceSinkBuilder::open_default_sink()?;
 let player = Player::connect_new(device.mixer());
 player.append(source);
 player.sleep_until_end();
+# Ok(())
+# }
 ```
 
 ## Encrypted streams
@@ -65,32 +71,40 @@ content keys you already hold. It does not talk to a DRM licence server or CDM.
 playdash = { version = "0.1", features = ["encryption", "rodio"] }
 ```
 
-```rust,ignore
+```rust,no_run
 use playdash::{ContentKeys, DashManifest, DashSource};
 
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
 let mut keys = ContentKeys::new();
 // KID and key as 32 hex digits; a UUID-form KID from `cenc:default_KID` also works.
 keys.insert_hex("0123456789abcdef0123456789abcdef", "00112233445566778899aabbccddeeff")?;
 
-let manifest = DashManifest::new(dash_xml)?;
+let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 let source = DashSource::new_with_keys(&manifest, "FLAC", keys)?;
+# Ok(())
+# }
 ```
 
-## Limitations:
+## Limitations
 
-1.  Hierarchical `sidx` indexes are not supported.
+1. Hierarchical `sidx` indexes are not supported.
 
-2. Multi-period playback and live (`type="dynamic"`) manifests are not yet supported. 
+2. Multi-period playback and live (`type="dynamic"`) manifests are not yet supported.
 
-3. Widevine and fairplay are not yet supported. (Support is planned).
+3. DRM systems such as Widevine and FairPlay are not supported. The encryption feature accepts
+   content keys supplied by the caller; it does not acquire licenses. Widevine support is planned.
 
 ## Example player
+
+See the [example player source on GitHub](https://github.com/phayes/playdash/blob/main/examples/player.rs).
+
+Example Usage:
 
 ```bash
 # Big Buck Bunny, HE-AAC, SegmentTemplate with $Number$
 cargo run --example player -- --id bbb_a64k https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd
 
-Envivio, AAC-LC, 48 kHz, SegmentTemplate with $Number$
+# Envivio, AAC-LC, 48 kHz, SegmentTemplate with $Number$
 cargo run --example player -- --id v4_258 https://dash.akamaized.net/envivio/EnvivioDash3/manifest.mpd
 
 # Shaka Player's "Angel One", AAC-LC, SegmentBase (sidx index)

@@ -11,7 +11,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-/// Media-segment durations used to map playback time onto downloaded fragments.
+/// Media-segment timing used to map playback positions to fragments.
+///
+/// Durations are expressed in `timescale` ticks. For example, a timescale of
+/// `1_000` makes a duration of `2_500` equal to 2.5 seconds.
+///
+/// # Examples
+///
+/// ```
+/// use playdash::MediaTimeline;
+///
+/// let timeline = MediaTimeline {
+///     timescale: 1_000,
+///     media_durations: vec![2_500, 2_500],
+/// };
+///
+/// // Estimate storage for a 128 kbit/s, five-second stream.
+/// assert!(timeline.estimate_len(1_024, 128_000).is_some());
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaTimeline {
     /// DASH timescale: ticks per second.
@@ -53,11 +70,10 @@ impl MediaTimeline {
         self.ticks_to_duration(self.media_durations.iter().copied().sum())
     }
 
-    /// Oversized guess at concatenated init + media bytes.
+    /// Returns a conservative stream-length estimate for a demuxer that needs
+    /// a length before all fragments have been downloaded.
     ///
-    /// Uses four times the advertised bitrate over the timeline, plus the
-    /// known initialization segment and 64 KiB per media fragment. Intended
-    /// for demuxers that need a length before every fragment size is known.
+    /// Returns `None` when the bitrate, timescale, or media durations are empty.
     pub fn estimate_len(&self, init_len: u64, bitrate_bps: u32) -> Option<u64> {
         if bitrate_bps == 0 || self.timescale == 0 || self.media_durations.is_empty() {
             return None;
@@ -119,7 +135,19 @@ pub(crate) fn parse_byte_range(value: &str) -> Result<RangeInclusive<u64>, Error
         .ok_or_else(|| Error::InvalidByteRange(value.to_owned()))
 }
 
-/// One piece of the concatenated stream: a URL, optionally narrowed to a byte range.
+/// A media resource, optionally limited to an inclusive byte range.
+///
+/// # Examples
+///
+/// ```
+/// use playdash::Fragment;
+///
+/// let whole = Fragment::new("https://media.example/init.mp4");
+/// assert_eq!(whole.known_size(), None);
+///
+/// let range = Fragment::with_range("https://media.example/audio.mp4", 100..=599);
+/// assert_eq!(range.known_size(), Some(500));
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Fragment {
     /// Absolute URL of the resource.
@@ -178,6 +206,30 @@ impl fmt::Display for Fragment {
 /// Fetches fragment bodies and sizes for a [`FragmentCache`].
 ///
 /// [`ureq::Agent`] implements this with its connection pool.
+/// Implement this trait to load fragments from another HTTP client, local
+/// storage, or an application-specific source.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use playdash::{Error, Fragment, FragmentCache, Transport};
+///
+/// struct MemoryTransport;
+///
+/// impl Transport for MemoryTransport {
+///     fn get(&self, fragment: &Fragment, _: Option<u64>) -> Result<Arc<[u8]>, Error> {
+///         let bytes: &[u8] = match fragment.url.as_str() {
+///             "memory://init" => b"initialization data",
+///             _ => b"media data",
+///         };
+///         Ok(Arc::from(bytes))
+///     }
+/// }
+///
+/// let cache = FragmentCache::new(Arc::new(MemoryTransport));
+/// assert!(cache.cached(&Fragment::new("memory://init")).is_none());
+/// ```
 pub trait Transport: Send + Sync {
     /// Body of `fragment`.
     ///
@@ -289,14 +341,26 @@ impl FragmentData {
     }
 }
 
-/// Fragment bodies and lengths, keyed by [`Fragment`], and the [`Transport`]
-/// that fetches them.
+/// Downloaded fragment data that can be shared by multiple readers.
 ///
-/// Use this to share caches across multiple readers that read the same stream,
-/// such as a reader rebuilt after a seek.
+/// With the `encryption` feature, `with_keys` makes the cache decrypt
+/// Common Encryption before making fragment data available.
 ///
-/// With the `encryption` feature, [`Self::with_keys`] makes the cache decrypt
-/// Common Encryption before storing each body, so it holds only plaintext.
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use playdash::{DashManifest, FragmentCache};
+///
+/// # fn example(manifest: &DashManifest) -> Result<(), playdash::Error> {
+/// let cache = Arc::new(FragmentCache::default());
+/// let first = manifest.stream_with_cache("audio", false, cache.clone())?;
+/// let second = manifest.stream_with_cache("audio", false, cache)?;
+/// // Both readers reuse fragment bodies that either reader downloads.
+/// # drop((first, second));
+/// # Ok(())
+/// # }
+/// ```
 pub struct FragmentCache {
     transport: Arc<dyn Transport>,
     fragments: Mutex<HashMap<Fragment, Arc<FragmentData>>>,
@@ -504,29 +568,33 @@ fn slice_range<'a>(body: &'a [u8], range: &RangeInclusive<u64>) -> Option<&'a [u
     body.get(start..=end)
 }
 
-/// Progressive in-memory reader over MPEG-DASH fragments.
+/// A progressive [`Read`] and [`Seek`] view of MPEG-DASH fragments.
 ///
-/// Bodies live in a [`FragmentCache`], which can be shared across readers. The
-/// initialization segment is index `0`, followed by media segments in
-/// timeline order.
-/// Ranged fragments have known sizes up front and are fetched with HTTP
-/// `Range` requests. [`Read`] blocks until the current fragment slot is filled.
+/// The reader presents the initialization segment followed by media segments
+/// as one byte stream. Use [`Self::seek_bytes`] for byte offsets or
+/// [`Self::seek_time_coarse`] to seek to the start of the fragment containing
+/// a timestamp. [`Read`] may block while the requested fragment downloads.
 ///
-/// Use [`Self::seek_bytes`] for exact offsets in the concatenated byte
-/// stream. When HEAD probes are available, `seek_bytes` discovers fragment
-/// lengths without downloading skipped bodies; if HEAD fails or disagrees
-/// with a later GET, the reader falls back to waiting on downloads. After
-/// the initialization GET, an optional HEAD worker fills remaining sizes
-/// on a second HTTP connection while the GET worker downloads bodies; see
-/// [`Self::start_eager_head`] and [`Self::stop_eager_head`].
-/// Use [`Self::seek_time_coarse`] to jump to the beginning of the media
-/// fragment containing a timestamp — the GET worker fills from the playhead
-/// forward, then backfills earlier holes. Returned [`Position`] values include
-/// both the known absolute byte offset and an exact or coarse media timestamp.
-/// Enable [`Self::set_symphonia_compat`] so [`SeekFrom::End`]`(0)` can
-/// return an oversized length estimate without waiting for every fragment.
+/// # Examples
+///
+/// ```no_run
+/// use std::io::Read;
+/// use std::time::Duration;
+/// use playdash::DashManifest;
+///
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
+/// let mut stream = manifest.stream("audio", true)?;
+///
+/// stream.seek_time_coarse(Duration::from_secs(30))?;
+/// let mut bytes = [0; 4096];
+/// let count = stream.read(&mut bytes)?;
+/// # let _ = count;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
-pub struct MpegStreamReader {
+pub struct StreamReader {
     shared: Arc<ReaderShared>,
     byte_position: Option<u64>,
     fragment_index: usize,
@@ -656,20 +724,12 @@ impl ReaderState {
     }
 }
 
-impl MpegStreamReader {
-    /// Downloads the first fragment with a new ureq agent, then fills
-    /// remaining slots on background threads.
+impl StreamReader {
+    /// Creates a reader using the default HTTP transport.
     ///
-    /// The initialization GET runs first so its TLS session is established
-    /// before any other request. A GET worker then downloads bodies at or
-    /// ahead of the read cursor, and only backfills earlier holes when the
-    /// suffix is complete. When `eager_head` is set, a HEAD worker fills the
-    /// size list on its own pooled connection; otherwise prefetch starts
-    /// stopped (see [`Self::start_eager_head`]). If HEAD fails or later
-    /// disagrees with GET, HEAD probing is disabled. See
-    /// [`Self::new_with_transport`] for a custom [`Transport`], and
-    /// [`Self::new_with_cache`] to share connections and downloaded bodies
-    /// across readers.
+    /// `fragments` must contain the initialization fragment first, followed by
+    /// media fragments in playback order. Set `eager_head` to discover unknown
+    /// fragment sizes in the background for faster byte seeking.
     pub fn new(
         fragments: Vec<Fragment>,
         timeline: Option<MediaTimeline>,
@@ -690,16 +750,11 @@ impl MpegStreamReader {
         Self::new_with_cache(fragments, timeline, eager_head, Arc::new(cache))
     }
 
-    /// Creates a reader that fetches through `cache`.
+    /// Creates a reader that reuses data from `cache`.
     ///
-    /// The initialization fragment is fetched before returning. After that, a
-    /// dedicated HEAD worker rips through unknown sizes if `eager_head` is
-    /// set; otherwise no worker is spawned until [`Self::start_eager_head`].
-    /// On-demand HEADs from byte seeks run either way. If HEAD fails or later
-    /// disagrees with GET, HEAD probing is disabled for the rest of the stream.
-    /// Sizes known from a fragment's range or from `cache` are never HEADed.
-    /// GETs receive a fragment's length as `size_hint` when one of those or a
-    /// prior HEAD established it.
+    /// The first item in `fragments` is treated as the initialization fragment
+    /// and is fetched before this method returns. Set `eager_head` to discover
+    /// unknown fragment sizes in the background.
     pub fn new_with_cache(
         fragments: Vec<Fragment>,
         timeline: Option<MediaTimeline>,
@@ -758,8 +813,8 @@ impl MpegStreamReader {
 
     /// Starts background HEAD prefetch of unknown fragment sizes.
     ///
-    /// Spawns the HEAD worker if none is running. No-op once every size is
-    /// known or HEAD probing has been disabled.
+    /// This is a no-op when all sizes are known or the server does not support
+    /// usable `HEAD` responses.
     pub fn start_eager_head(&self) {
         let mut inner = self.shared.lock();
         inner.eager_head = true;
@@ -778,21 +833,17 @@ impl MpegStreamReader {
 
     /// Stops background HEAD prefetch.
     ///
-    /// An in-flight HEAD still completes and records its size; no further
-    /// prefetch HEADs are issued. On-demand HEADs from byte seeks are
-    /// unaffected.
+    /// A request already in progress may still complete. Byte seeks can still
+    /// request sizes when needed.
     pub fn stop_eager_head(&self) {
         self.shared.lock().eager_head = false;
     }
 
-    /// Treat [`SeekFrom::End`]`(0)` as a length query for demuxers such as
-    /// Symphonia's ISO-BMFF reader, which seek to EOF to learn the file size.
+    /// Allows demuxers such as Symphonia to query an estimated stream length
+    /// with [`SeekFrom::End`]`(0)` before every fragment size is known.
     ///
-    /// While any fragment size is still unknown, `End(0)` returns an oversized
-    /// estimate (`bitrate_bps` × timeline duration × 4, plus init and 64 KiB
-    /// per media fragment) and does not move the download playhead. Once every
-    /// size is known, `End(0)` reports the exact total. Non-zero
-    /// [`SeekFrom::End`] offsets still wait for real sizes.
+    /// Once all sizes are known, the exact length is returned. Other
+    /// [`SeekFrom::End`] offsets always wait for exact sizes.
     ///
     /// Requires a [`MediaTimeline`] and a non-zero bitrate.
     pub fn set_symphonia_compat(&mut self, enabled: bool, bitrate_bps: u32) -> Result<(), Error> {
@@ -1189,7 +1240,7 @@ fn spawn_head_worker(shared: Arc<ReaderShared>) {
     });
 }
 
-impl Read for MpegStreamReader {
+impl Read for StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -1246,7 +1297,7 @@ impl Read for MpegStreamReader {
     }
 }
 
-impl Seek for MpegStreamReader {
+impl Seek for StreamReader {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
         self.seek_bytes(from)?
             .byte
@@ -1254,7 +1305,7 @@ impl Seek for MpegStreamReader {
     }
 }
 
-impl Drop for MpegStreamReader {
+impl Drop for StreamReader {
     fn drop(&mut self) {
         self.shared.cancelled.store(true, Ordering::SeqCst);
         self.shared.condvar.notify_all();
@@ -1295,13 +1346,13 @@ mod tests {
         eager_head: bool,
         get: G,
         head: H,
-    ) -> Result<MpegStreamReader, Error>
+    ) -> Result<StreamReader, Error>
     where
         G: Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync + 'static,
         H: Fn(&Fragment) -> Result<u64, Error> + Send + Sync + 'static,
     {
         let transport = Arc::new(FnTransport { get, head });
-        MpegStreamReader::new_with_transport(fragments, timeline, eager_head, transport)
+        StreamReader::new_with_transport(fragments, timeline, eager_head, transport)
     }
 
     fn position(byte: Option<u64>, time: Option<(Duration, TimeAccuracy)>) -> Position {
@@ -1347,7 +1398,7 @@ mod tests {
     fn start_instant(
         urls: Vec<Fragment>,
         payloads: &'static [(&'static str, &'static [u8])],
-    ) -> Result<MpegStreamReader, Error> {
+    ) -> Result<StreamReader, Error> {
         closure_reader(
             urls,
             None,
@@ -2617,7 +2668,7 @@ mod tests {
     #[test]
     fn default_transport_sends_range_and_slices_ignored_ranges() {
         let base = spawn_range_server(3);
-        let mut reader = MpegStreamReader::new(
+        let mut reader = StreamReader::new(
             vec![
                 ranged(&format!("{base}/ranged"), 0, 3),
                 ranged(&format!("{base}/plain"), 8, 13),
@@ -2698,7 +2749,7 @@ mod tests {
     #[test]
     fn fragment_cache_reuses_bodies_across_readers() {
         let (cache, transport) = counting_cache(&[]);
-        let mut first = MpegStreamReader::new_with_cache(
+        let mut first = StreamReader::new_with_cache(
             vec!["init".into(), "a".into(), "b".into()],
             None,
             false,
@@ -2710,7 +2761,7 @@ mod tests {
         assert_eq!(bytes, b"initab");
 
         // A rebuilt reader, as after a seek, gets everything from memory.
-        let mut second = MpegStreamReader::new_with_cache(
+        let mut second = StreamReader::new_with_cache(
             vec!["init".into(), "b".into()],
             None,
             true,
@@ -2728,7 +2779,7 @@ mod tests {
     #[test]
     fn fragment_cache_keeps_in_flight_bodies_after_reader_drop() {
         let (cache, transport) = counting_cache(&["b"]);
-        let first = MpegStreamReader::new_with_cache(
+        let first = StreamReader::new_with_cache(
             vec!["init".into(), "a".into(), "b".into()],
             None,
             false,
@@ -2741,7 +2792,7 @@ mod tests {
         transport.released.store(true, Ordering::SeqCst);
         wait_for(|| cache.cached(&"b".into()).is_some());
 
-        let mut second = MpegStreamReader::new_with_cache(
+        let mut second = StreamReader::new_with_cache(
             vec!["init".into(), "b".into()],
             None,
             false,
@@ -2757,7 +2808,7 @@ mod tests {
     #[test]
     fn fragment_cache_joins_a_get_already_in_flight() {
         let (cache, transport) = counting_cache(&["b"]);
-        let first = MpegStreamReader::new_with_cache(
+        let first = StreamReader::new_with_cache(
             vec!["init".into(), "a".into(), "b".into()],
             None,
             false,
@@ -2768,7 +2819,7 @@ mod tests {
         drop(first);
 
         // The rebuilt reader waits on the dropped reader's GET of "b".
-        let mut second = MpegStreamReader::new_with_cache(
+        let mut second = StreamReader::new_with_cache(
             vec!["init".into(), "b".into()],
             None,
             false,
@@ -2851,7 +2902,7 @@ mod tests {
                 .map(|path| format!("{base}/{path}").into())
                 .collect()
         };
-        let read_all = |mut reader: MpegStreamReader| {
+        let read_all = |mut reader: StreamReader| {
             let mut bytes = Vec::new();
             reader.read_to_end(&mut bytes).unwrap();
             bytes
@@ -2859,17 +2910,17 @@ mod tests {
 
         let cache = Arc::new(FragmentCache::default());
         let first =
-            MpegStreamReader::new_with_cache(fragments(&["init", "a"]), None, false, cache.clone())
+            StreamReader::new_with_cache(fragments(&["init", "a"]), None, false, cache.clone())
                 .unwrap();
         assert_eq!(read_all(first), b"inita");
         let second =
-            MpegStreamReader::new_with_cache(fragments(&["init", "b"]), None, false, cache.clone())
+            StreamReader::new_with_cache(fragments(&["init", "b"]), None, false, cache.clone())
                 .unwrap();
         assert_eq!(read_all(second), b"initb");
         assert_eq!(connections.load(Ordering::SeqCst), 1);
 
         // Separate agents cannot share the connection.
-        let third = MpegStreamReader::new(fragments(&["init", "c"]), None, false).unwrap();
+        let third = StreamReader::new(fragments(&["init", "c"]), None, false).unwrap();
         assert_eq!(read_all(third), b"initc");
         assert_eq!(connections.load(Ordering::SeqCst), 2);
     }
@@ -2878,14 +2929,13 @@ mod tests {
     fn fragment_cache_remembers_head_lengths_across_readers() {
         let (cache, transport) = counting_cache(&["a", "bb"]);
         let fragments = || vec!["init".into(), "a".into(), "bb".into()];
-        let first =
-            MpegStreamReader::new_with_cache(fragments(), None, true, cache.clone()).unwrap();
+        let first = StreamReader::new_with_cache(fragments(), None, true, cache.clone()).unwrap();
         wait_for(|| cache.known_size(&"bb".into()).is_some());
         drop(first);
 
         // The rebuilt reader starts with every size and sends no HEAD at all.
         let mut second =
-            MpegStreamReader::new_with_cache(fragments(), None, true, cache.clone()).unwrap();
+            StreamReader::new_with_cache(fragments(), None, true, cache.clone()).unwrap();
         assert!(second.shared.lock().all_sizes_known());
         assert_eq!(second.seek_bytes(SeekFrom::End(0)).unwrap().byte, Some(7));
         assert_eq!(transport.heads(), ["a", "bb"]);

@@ -6,7 +6,7 @@ use crate::error::Error;
 use crate::manifest_segment_base::BaseChain;
 use crate::manifest_segment_list::ListChain;
 use crate::manifest_template::{Segments, TemplateChain, TemplateValues};
-use crate::stream::{Fragment, FragmentCache, MediaTimeline, MpegStreamReader, Transport};
+use crate::stream::{Fragment, FragmentCache, MediaTimeline, StreamReader, Transport};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use dash_mpd_core::{
     AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation, SegmentList,
@@ -16,11 +16,42 @@ use std::sync::Arc;
 use ureq::ResponseExt;
 use url::Url;
 
-/// A parsed MPEG-DASH manifest.
+/// A parsed MPEG-DASH manifest and the entry point for selecting and streaming
+/// its representations.
+///
+/// Load remote manifests with [`DashManifest::new_from_url`]. When parsing XML
+/// obtained another way, use [`DashManifest::new`] and set its source URL with
+/// [`DashManifest::with_base_url`] if it contains relative URLs.
+///
+/// # Examples
+///
+/// ```
+/// use playdash::DashManifest;
+///
+/// let xml = r#"
+///     <MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+///          mediaPresentationDuration="PT4S">
+///       <Period>
+///         <AdaptationSet mimeType="audio/mp4">
+///           <Representation id="audio" bandwidth="128000">
+///             <SegmentTemplate initialization="init.mp4" media="$Number$.m4s"
+///                              duration="2" timescale="1" startNumber="1" />
+///           </Representation>
+///         </AdaptationSet>
+///       </Period>
+///     </MPD>
+/// "#;
+///
+/// let manifest = DashManifest::new(xml)?
+///     .with_base_url("https://media.example/stream.mpd")?;
+/// let audio = manifest.representation("audio").unwrap();
+/// assert_eq!(audio.bandwidth, Some(128_000));
+/// assert_eq!(manifest.fragments("audio")?.len(), 3); // init + two media segments
+/// # Ok::<(), playdash::Error>(())
+/// ```
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct DashManifest {
-    /// The full manifest as parsed by [`dash_mpd_core`].
-    pub mpd: MPD,
+    mpd: MPD,
     /// Where the manifest was fetched from; the root of `BaseURL` resolution.
     base_url: Option<Url>,
     /// Why each `SegmentBase` index that failed to load did so, by
@@ -243,18 +274,16 @@ fn resolve_url(base: Option<&Url>, reference: &str) -> Result<Url, Error> {
 }
 
 impl DashManifest {
-    /// Parses an MPEG-DASH manifest.
+    /// Parses MPEG-DASH XML.
     ///
     /// Relative segment and `BaseURL` references cannot be resolved without
     /// knowing where the manifest came from; use [`DashManifest::new_from_url`]
     /// or [`DashManifest::with_base_url`] for those manifests.
     ///
-    /// Representations addressed only by `SegmentBase` have their `sidx`
-    /// index fetched over HTTP and rewritten as an equivalent `SegmentList`.
-    /// Those with relative URLs are fetched by [`DashManifest::with_base_url`]
-    /// instead. An index that fails to load is logged and does not fail the
-    /// manifest; streaming that representation returns
-    /// [`Error::DashManifestSegmentIndex`].
+    /// A representation that needs its source URL to locate its segment index
+    /// becomes streamable after [`DashManifest::with_base_url`] is called.
+    /// Failure to load one representation's index does not prevent callers
+    /// from using other representations.
     pub fn new(dash_xml: impl AsRef<str>) -> Result<Self, Error> {
         let mut manifest = Self {
             mpd: dash_mpd_core::parse(dash_xml.as_ref())?,
@@ -365,27 +394,51 @@ impl DashManifest {
         self.base_url.as_ref().map(Url::as_str)
     }
 
-    /// Starts a progressive in-memory reader over fragmented MPEG-DASH bytes.
+    /// Opens a representation as a progressive [`std::io::Read`] and
+    /// [`std::io::Seek`] stream.
     ///
-    /// `id` uses the same full-ID or format-token matching as
+    /// Use [`DashManifest::representations`] to inspect the available choices,
+    /// then pass the selected representation's ID as `representation_id`. It
+    /// uses the same full-ID or format-token matching as
     /// [`DashManifest::representation`].
     ///
-    /// The initialization fragment is fetched before returning (and establishes
-    /// the GET connection). Remaining media fragments download on a GET worker
-    /// (from the playhead forward, then earlier holes). When `eager_head` is set,
-    /// a second connection HEADs remaining URLs to fill fragment sizes; toggle it
-    /// later with [`MpegStreamReader::start_eager_head`] and
-    /// [`MpegStreamReader::stop_eager_head`]. [`MpegStreamReader::seek_bytes`]
-    /// may also HEAD to map offsets without downloading skipped bodies; if HEAD
-    /// is unusable, it falls back to waiting on GETs. Call
-    /// [`MpegStreamReader::set_symphonia_compat`] before handing the reader to
-    /// a demuxer that seeks to EOF for the file length. Media timestamps use
-    /// [`MpegStreamReader::seek_time_coarse`], which lands at the beginning of
-    /// the containing fMP4 fragment and returns a
-    /// [`crate::stream::Position`].
-    pub fn stream(&self, id: impl AsRef<str>, eager_head: bool) -> Result<MpegStreamReader, Error> {
-        let (fragments, timeline) = self.stream_parts(id.as_ref())?;
-        MpegStreamReader::new(fragments, Some(timeline), eager_head)
+    /// Set `eager_head` to discover fragment sizes in the background, which can
+    /// make byte seeking faster on servers that support `HEAD`. Timestamp
+    /// seeking is available through [`StreamReader::seek_time_coarse`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use playdash::DashManifest;
+    ///
+    /// # fn example() -> Result<(), playdash::Error> {
+    /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
+    ///
+    /// for representation in manifest.representations() {
+    ///     println!(
+    ///         "{}: {:?} bps",
+    ///         representation.id.as_deref().unwrap_or("<unnamed>"),
+    ///         representation.bandwidth,
+    ///     );
+    /// }
+    ///
+    /// let representation = manifest
+    ///     .representations()
+    ///     .find(|representation| representation.bandwidth.is_some())
+    ///     .expect("manifest has no streamable representation");
+    /// let representation_id = representation.id.as_deref().expect("IDs are validated");
+    /// let stream = manifest.stream(representation_id, true)?;
+    /// # drop(stream);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn stream(
+        &self,
+        representation_id: impl AsRef<str>,
+        eager_head: bool,
+    ) -> Result<StreamReader, Error> {
+        let (fragments, timeline) = self.stream_parts(representation_id.as_ref())?;
+        StreamReader::new(fragments, Some(timeline), eager_head)
     }
 
     /// Like [`DashManifest::stream`], but fetches through `cache`.
@@ -395,33 +448,41 @@ impl DashManifest {
     /// seek.
     pub fn stream_with_cache(
         &self,
-        id: impl AsRef<str>,
+        representation_id: impl AsRef<str>,
         eager_head: bool,
         cache: Arc<FragmentCache>,
-    ) -> Result<MpegStreamReader, Error> {
-        let (fragments, timeline) = self.stream_parts(id.as_ref())?;
-        MpegStreamReader::new_with_cache(fragments, Some(timeline), eager_head, cache)
+    ) -> Result<StreamReader, Error> {
+        let (fragments, timeline) = self.stream_parts(representation_id.as_ref())?;
+        StreamReader::new_with_cache(fragments, Some(timeline), eager_head, cache)
     }
 
-    fn stream_parts(&self, id: &str) -> Result<(Vec<Fragment>, MediaTimeline), Error> {
-        let (selected, segments) = self.select_segments(id)?;
+    fn stream_parts(
+        &self,
+        representation_id: &str,
+    ) -> Result<(Vec<Fragment>, MediaTimeline), Error> {
+        let (selected, segments) = self.select_segments(representation_id)?;
         let fragments = selected.fragments(self.base_url.as_ref(), &segments)?;
         Ok((fragments, segments.media_timeline()))
     }
 
-    /// Representations in document order, across all periods and adaptation sets.
+    /// Lists representations in document order, across all periods and
+    /// adaptation sets.
+    ///
+    /// Use this to inspect the available IDs, codecs, and bitrates before
+    /// selecting one with [`DashManifest::stream`] or
+    /// [`DashManifest::representation`].
     pub fn representations(&self) -> impl Iterator<Item = &Representation> {
         self.selections().map(|selected| selected.representation)
     }
 
     /// Finds a representation by ID.
     ///
-    /// The first pass matches `id` against the full representation ID. If that
-    /// misses, a second pass matches the format token before the first comma.
-    /// Both comparisons are case-insensitive. The first match in document order
-    /// wins.
-    pub fn representation(&self, id: impl AsRef<str>) -> Option<&Representation> {
-        self.find(id.as_ref())
+    /// The first pass matches `representation_id` against the full
+    /// representation ID. If that misses, a second pass matches the format
+    /// token before the first comma. Both comparisons are case-insensitive. The
+    /// first match in document order wins.
+    pub fn representation(&self, representation_id: impl AsRef<str>) -> Option<&Representation> {
+        self.find(representation_id.as_ref())
             .map(|selected| selected.representation)
     }
 
@@ -430,25 +491,34 @@ impl DashManifest {
     /// Fragments come from the representation's `SegmentTemplate` or
     /// `SegmentList` (whose entries may carry byte ranges), with URLs resolved
     /// against the `BaseURL` chain and [`DashManifest::base_url`].
-    pub fn fragments(&self, id: impl AsRef<str>) -> Result<Vec<Fragment>, Error> {
-        let (selected, segments) = self.select_segments(id.as_ref())?;
+    pub fn fragments(&self, representation_id: impl AsRef<str>) -> Result<Vec<Fragment>, Error> {
+        let (selected, segments) = self.select_segments(representation_id.as_ref())?;
         selected.fragments(self.base_url.as_ref(), &segments)
     }
 
     /// Media-segment durations in timeline order, with the DASH timescale.
-    pub fn media_timeline(&self, id: impl AsRef<str>) -> Result<MediaTimeline, Error> {
-        Ok(self.select_segments(id.as_ref())?.1.media_timeline())
+    pub fn media_timeline(
+        &self,
+        representation_id: impl AsRef<str>,
+    ) -> Result<MediaTimeline, Error> {
+        Ok(self
+            .select_segments(representation_id.as_ref())?
+            .1
+            .media_timeline())
     }
 
     /// MIME type of a representation, inherited from its adaptation set if absent.
-    pub fn mime_type(&self, id: impl AsRef<str>) -> Result<Option<&str>, Error> {
-        Ok(self.select(id.as_ref())?.mime_type())
+    pub fn mime_type(&self, representation_id: impl AsRef<str>) -> Result<Option<&str>, Error> {
+        Ok(self.select(representation_id.as_ref())?.mime_type())
     }
 
     /// Common-encryption scheme protecting a representation, such as `cenc` or
     /// `cbcs`, inherited from its adaptation set if absent.
-    pub fn protection_scheme(&self, id: impl AsRef<str>) -> Result<Option<String>, Error> {
-        Ok(self.select(id.as_ref())?.protection_scheme())
+    pub fn protection_scheme(
+        &self,
+        representation_id: impl AsRef<str>,
+    ) -> Result<Option<String>, Error> {
+        Ok(self.select(representation_id.as_ref())?.protection_scheme())
     }
 
     fn selections(&self) -> impl Iterator<Item = Selected<'_>> {

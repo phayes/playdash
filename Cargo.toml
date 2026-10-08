@@ -18,7 +18,7 @@ base64 = "0.23"
 ctr = { version = "0.10", optional = true }
 # dash-mpd-core 0.1.0 fails to build without its `log` feature; the local patch below
 # includes the upstream fix (e3d85a3, unreleased), so our `log` feature can turn it off.
-dash-mpd-core = { version = "0.1", default-features = false, path = "/opt/dash-mpd-core" }
+dash-mpd-core = { version = "0.1", default-features = false, git = "https://github.com/phayes/dash-mpd-core" }
 log = { version = "^0.4", optional = true }
 rodio = { version = "0.22", optional = true, default-features = false, features = [
     "symphonia-isomp4",
@@ -30,10 +30,7 @@ url = "2.5"
 [features]
 default = ["log"]
 rodio = ["dep:rodio"]
-# Report recoverable problems, such as a SegmentBase index that failed to load, through `log`,
-# and enable dash-mpd-core's parser diagnostics (emitted through `tracing`).
 log = ["dep:log", "dash-mpd-core/log"]
-# Decrypt `cenc` and `cbcs` Common Encryption with caller-supplied content keys.
 encryption = ["dep:aes", "dep:ctr"]
 
 [dev-dependencies]
@@ -53,4 +50,4 @@ required-features = ["rodio"]
 # Local-only: picks up the lenient AdaptationSet@group fix in /opt/dash-mpd-core.
 # Remove once a dash-mpd-core release includes it.
 [patch.crates-io]
-dash-mpd-core = { path = "/opt/dash-mpd-core" }
+dash-mpd-core = { git = "https://github.com/phayes/dash-mpd-core" }
