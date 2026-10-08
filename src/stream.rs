@@ -125,8 +125,9 @@ fn ureq_agent() -> ureq::Agent {
 /// stream. When HEAD probes are available, `seek_bytes` discovers fragment
 /// lengths without downloading skipped bodies; if HEAD fails or disagrees
 /// with a later GET, the reader falls back to waiting on downloads. After
-/// the initialization GET, a dedicated HEAD worker fills remaining sizes
-/// on a second HTTP connection while the GET worker downloads bodies.
+/// the initialization GET, an optional HEAD worker fills remaining sizes
+/// on a second HTTP connection while the GET worker downloads bodies; see
+/// [`Self::start_eager_head`] and [`Self::stop_eager_head`].
 /// Use [`Self::seek_time_coarse`] to jump to the beginning of the media
 /// fragment containing a timestamp — the GET worker fills from the playhead
 /// forward, then backfills earlier holes. Returned [`Position`] values include
@@ -169,6 +170,10 @@ struct MpegCacheInner {
     sizes: Vec<Option<u64>>,
     /// When false, byte seeks wait on downloaded bodies instead of HEAD.
     head_available: bool,
+    /// Background HEAD prefetch is wanted. Does not gate on-demand seek HEADs.
+    eager_head: bool,
+    /// A HEAD worker thread is alive, possibly finishing an in-flight request.
+    head_worker_running: bool,
     /// Read/seek playhead. The GET worker fills at or after this index first.
     cursor_fragment: usize,
     priority: Option<usize>,
@@ -285,15 +290,21 @@ impl MpegStreamReader {
     /// The initialization GET runs first so its TLS session is established
     /// before any other request. A GET worker then downloads bodies at or
     /// ahead of the read cursor, and only backfills earlier holes when the
-    /// suffix is complete. A second ureq agent HEADs remaining URLs on its
-    /// own connection to fill the size list. If HEAD fails or later
-    /// disagrees with GET, HEAD probing is disabled.
-    pub fn new(urls: Vec<String>, timeline: Option<MediaTimeline>) -> Result<Self, Error> {
+    /// suffix is complete. When `eager_head` is set, a second ureq agent
+    /// HEADs remaining URLs on its own connection to fill the size list;
+    /// otherwise prefetch starts stopped (see [`Self::start_eager_head`]).
+    /// If HEAD fails or later disagrees with GET, HEAD probing is disabled.
+    pub fn new(
+        urls: Vec<String>,
+        timeline: Option<MediaTimeline>,
+        eager_head: bool,
+    ) -> Result<Self, Error> {
         let get_agent = ureq_agent();
         let head_agent = ureq_agent();
         Self::new_with_get_head(
             urls,
             timeline,
+            eager_head,
             move |url, expected_len| {
                 let mut bytes = expected_len
                     .and_then(|len| usize::try_from(len).ok())
@@ -327,7 +338,9 @@ impl MpegStreamReader {
     ///
     /// `head` should return the fragment byte length (typically from
     /// `Content-Length`). After the initialization GET, a dedicated HEAD
-    /// worker rips through unknown sizes. If HEAD fails or later disagrees
+    /// worker rips through unknown sizes if `eager_head` is set; otherwise no
+    /// worker is spawned until [`Self::start_eager_head`]. On-demand HEADs
+    /// from byte seeks run either way. If HEAD fails or later disagrees
     /// with GET, HEAD probing is disabled for the rest of the stream.
     ///
     /// `get` receives that known length as `Some` when a prior HEAD already
@@ -335,6 +348,7 @@ impl MpegStreamReader {
     pub fn new_with_get_head<G, H>(
         urls: Vec<String>,
         timeline: Option<MediaTimeline>,
+        eager_head: bool,
         get: G,
         head: H,
     ) -> Result<Self, Error>
@@ -362,6 +376,8 @@ impl MpegStreamReader {
                 fragments,
                 sizes,
                 head_available: true,
+                eager_head: false,
+                head_worker_running: false,
                 cursor_fragment: 0,
                 priority: None,
                 complete,
@@ -374,10 +390,9 @@ impl MpegStreamReader {
 
         if !complete {
             spawn_get_worker(cache.clone(), get);
-            spawn_head_worker(cache.clone());
         }
 
-        Ok(Self {
+        let reader = Self {
             cache,
             byte_position: Some(0),
             fragment_index: 0,
@@ -385,7 +400,40 @@ impl MpegStreamReader {
             timeline,
             symphonia_compat: false,
             length_estimate: None,
-        })
+        };
+        if eager_head {
+            reader.start_eager_head();
+        }
+        Ok(reader)
+    }
+
+    /// Starts background HEAD prefetch of unknown fragment sizes.
+    ///
+    /// Spawns the HEAD worker if none is running. No-op once every size is
+    /// known or HEAD probing has been disabled.
+    pub fn start_eager_head(&self) {
+        let mut inner = self.cache.lock();
+        inner.eager_head = true;
+        if inner.head_worker_running
+            || inner.error.is_some()
+            || inner.next_head().is_none()
+            || self.cache.cancelled.load(Ordering::SeqCst)
+        {
+            // A running worker sees `eager_head` on its next check and continues.
+            return;
+        }
+        inner.head_worker_running = true;
+        drop(inner);
+        spawn_head_worker(self.cache.clone());
+    }
+
+    /// Stops background HEAD prefetch.
+    ///
+    /// An in-flight HEAD still completes and records its size; no further
+    /// prefetch HEADs are issued. On-demand HEADs from byte seeks are
+    /// unaffected.
+    pub fn stop_eager_head(&self) {
+        self.cache.lock().eager_head = false;
     }
 
     /// Treat [`SeekFrom::End`]`(0)` as a length query for demuxers such as
@@ -892,12 +940,19 @@ fn spawn_head_worker(cache: Arc<MpegCache>) {
                 return;
             }
 
+            // Exit and spawn decisions share the lock so start/stop cannot
+            // leave zero or two workers.
             let Some((index, url)) = ({
-                let inner = cache.lock();
-                if inner.error.is_some() {
-                    return;
+                let mut inner = cache.lock();
+                let next = if inner.eager_head && inner.error.is_none() {
+                    inner.next_head()
+                } else {
+                    None
+                };
+                if next.is_none() {
+                    inner.head_worker_running = false;
                 }
-                inner.next_head()
+                next
             }) else {
                 return;
             };
@@ -913,6 +968,7 @@ fn spawn_head_worker(cache: Arc<MpegCache>) {
                 Err(error) => {
                     let mut inner = cache.lock();
                     inner.disable_head(&format!("HEAD failed for fragment {index}: {error}"));
+                    inner.head_worker_running = false;
                     cache.condvar.notify_all();
                     return;
                 }
@@ -1051,6 +1107,7 @@ mod tests {
         MpegStreamReader::new_with_get_head(
             urls,
             None,
+            true,
             instant_get(payloads),
             instant_head(payloads),
         )
@@ -1089,6 +1146,7 @@ mod tests {
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "more".into()],
             None,
+            true,
             gated_get(allow_rest.clone(), |url| url.as_bytes().to_vec()),
             failing_head(),
         )
@@ -1144,6 +1202,7 @@ mod tests {
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "tail".into()],
             None,
+            true,
             gated_get(allow_rest.clone(), |url| vec![url.as_bytes()[0]; 4]),
             failing_head(),
         )
@@ -1171,6 +1230,7 @@ mod tests {
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "a".into(), "b".into()],
             None,
+            true,
             {
                 let allow_get = allow_get.clone();
                 let get_order = get_order.clone();
@@ -1220,6 +1280,7 @@ mod tests {
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "a".into(), "b".into()],
             None,
+            true,
             {
                 let allow_get = allow_get.clone();
                 move |url: String, _expected_len: Option<u64>| {
@@ -1275,6 +1336,7 @@ mod tests {
                 timescale: 1,
                 media_durations: vec![1, 1, 1],
             }),
+            true,
             {
                 let allow_a = allow_a.clone();
                 let allow_b = allow_b.clone();
@@ -1343,6 +1405,7 @@ mod tests {
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "a".into(), "b".into()],
             Some(timeline),
+            true,
             instant_get(&[("init", b"INIT"), ("a", b"AAAA"), ("b", b"BBBB")]),
             instant_head(&[("init", b"INIT"), ("a", b"AAAA"), ("b", b"BBBB")]),
         )
@@ -1387,6 +1450,7 @@ mod tests {
                 timescale: 1,
                 media_durations: vec![1, 1, 1],
             }),
+            true,
             {
                 let allow_a = allow_a.clone();
                 let allow_b = allow_b.clone();
@@ -1469,6 +1533,7 @@ mod tests {
                 timescale: 1,
                 media_durations: vec![1, 1, 1, 1],
             }),
+            true,
             {
                 let release_media = release_media.clone();
                 let order = order.clone();
@@ -1519,6 +1584,7 @@ mod tests {
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "a".into(), "b".into()],
             Some(timeline),
+            true,
             instant_get(&[("init", b"INIT"), ("a", b"AAAA"), ("b", b"BBBB")]),
             instant_head(&[("init", b"INIT"), ("a", b"AAAA"), ("b", b"BBBB")]),
         )
@@ -1537,6 +1603,7 @@ mod tests {
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "aaaa".into(), "bbbb".into()],
             None,
+            true,
             gated_get(allow_rest.clone(), |url| vec![url.as_bytes()[0]; 4]),
             failing_head(),
         )
@@ -1592,6 +1659,7 @@ mod tests {
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "bad".into()],
             None,
+            true,
             get,
             failing_head(),
         )
@@ -1613,8 +1681,13 @@ mod tests {
 
     #[test]
     fn empty_url_list_is_rejected() {
-        let result =
-            MpegStreamReader::new_with_get_head(Vec::new(), None, instant_get(&[]), failing_head());
+        let result = MpegStreamReader::new_with_get_head(
+            Vec::new(),
+            None,
+            true,
+            instant_get(&[]),
+            failing_head(),
+        );
         assert!(matches!(result, Err(Error::DashManifestMissingUrls)));
     }
 
@@ -1633,6 +1706,7 @@ mod tests {
                 "e".into(),
             ],
             None,
+            true,
             {
                 let allow_late = allow_late.clone();
                 let get_expected = get_expected.clone();
@@ -1690,6 +1764,7 @@ mod tests {
         let reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "a".into(), "b".into(), "c".into()],
             None,
+            true,
             {
                 let allow_get = allow_get.clone();
                 move |url: String, _expected_len: Option<u64>| {
@@ -1733,6 +1808,7 @@ mod tests {
         let reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "a".into(), "b".into(), "c".into()],
             None,
+            true,
             instant_get(&[
                 ("init", b"INIT"),
                 ("a", b"AAAA"),
@@ -1768,6 +1844,7 @@ mod tests {
                 "d".into(),
             ],
             None,
+            true,
             {
                 let allow_get = allow_get.clone();
                 move |url: String, _expected_len: Option<u64>| {
@@ -1799,6 +1876,221 @@ mod tests {
         let _inner = reader.wait_until(|inner| inner.all_filled()).unwrap();
     }
 
+    fn recording_head(
+        calls: Arc<Mutex<Vec<String>>>,
+    ) -> impl Fn(String) -> Result<u64, Error> + Send + Sync {
+        move |url: String| {
+            calls.lock().unwrap().push(url);
+            Ok(4)
+        }
+    }
+
+    #[test]
+    fn stopped_eager_head_spawns_no_worker() {
+        let head_calls = Arc::new(Mutex::new(Vec::new()));
+        let reader = MpegStreamReader::new_with_get_head(
+            vec!["init".into(), "a".into(), "b".into()],
+            None,
+            false,
+            instant_get(&[("init", b"INIT"), ("a", b"AAAA"), ("b", b"BBBB")]),
+            recording_head(head_calls.clone()),
+        )
+        .unwrap();
+
+        let inner = reader.wait_until(|inner| inner.complete).unwrap();
+        assert!(!inner.eager_head && !inner.head_worker_running);
+        drop(inner);
+        assert!(head_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn start_eager_head_fills_sizes_after_stopped_construction() {
+        let allow_get = Arc::new(AtomicBool::new(false));
+        let head_calls = Arc::new(Mutex::new(Vec::new()));
+        let reader = MpegStreamReader::new_with_get_head(
+            vec!["init".into(), "a".into(), "b".into(), "c".into()],
+            None,
+            false,
+            {
+                let allow_get = allow_get.clone();
+                move |url: String, _expected_len: Option<u64>| {
+                    if url != "init" {
+                        while !allow_get.load(Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    Ok(vec![url.as_bytes()[0]; 4])
+                }
+            },
+            recording_head(head_calls.clone()),
+        )
+        .unwrap();
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(head_calls.lock().unwrap().is_empty());
+
+        reader.start_eager_head();
+        let inner = reader.wait_until(|inner| inner.all_sizes_known()).unwrap();
+        assert!(inner.fragments[1..].iter().all(Option::is_none));
+        drop(inner);
+        let _inner = reader
+            .wait_until(|inner| !inner.head_worker_running)
+            .unwrap();
+        assert_eq!(head_calls.lock().unwrap().as_slice(), &["a", "b", "c"]);
+
+        allow_get.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn stop_eager_head_halts_after_in_flight_request() {
+        let allow_get = Arc::new(AtomicBool::new(false));
+        let head_entered = Arc::new(AtomicUsize::new(0));
+        let release_head = Arc::new(AtomicBool::new(false));
+        let reader = MpegStreamReader::new_with_get_head(
+            vec![
+                "init".into(),
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "d".into(),
+            ],
+            None,
+            true,
+            {
+                let allow_get = allow_get.clone();
+                move |url: String, _expected_len: Option<u64>| {
+                    if url != "init" {
+                        while !allow_get.load(Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    Ok(vec![url.as_bytes()[0]; 4])
+                }
+            },
+            {
+                let head_entered = head_entered.clone();
+                let release_head = release_head.clone();
+                move |_url: String| {
+                    head_entered.fetch_add(1, Ordering::SeqCst);
+                    while !release_head.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(4)
+                }
+            },
+        )
+        .unwrap();
+
+        while head_entered.load(Ordering::SeqCst) == 0 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        reader.stop_eager_head();
+        release_head.store(true, Ordering::SeqCst);
+
+        let inner = reader
+            .wait_until(|inner| !inner.head_worker_running)
+            .unwrap();
+        assert_eq!(head_entered.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.sizes[1], Some(4), "in-flight HEAD should be kept");
+        assert!(inner.sizes[2..].iter().all(Option::is_none));
+        drop(inner);
+
+        allow_get.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn restart_during_in_flight_head_reuses_worker() {
+        let allow_get = Arc::new(AtomicBool::new(false));
+        let release_head = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let reader = MpegStreamReader::new_with_get_head(
+            vec!["init".into(), "a".into(), "b".into(), "c".into()],
+            None,
+            true,
+            {
+                let allow_get = allow_get.clone();
+                move |url: String, _expected_len: Option<u64>| {
+                    if url != "init" {
+                        while !allow_get.load(Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    Ok(vec![url.as_bytes()[0]; 4])
+                }
+            },
+            {
+                let release_head = release_head.clone();
+                let active = active.clone();
+                let max_active = max_active.clone();
+                move |_url: String| {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    while !release_head.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(4)
+                }
+            },
+        )
+        .unwrap();
+
+        while active.load(Ordering::SeqCst) == 0 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        for _ in 0..5 {
+            reader.stop_eager_head();
+            reader.start_eager_head();
+        }
+        release_head.store(true, Ordering::SeqCst);
+
+        let _inner = reader.wait_until(|inner| inner.all_sizes_known()).unwrap();
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+
+        allow_get.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn start_eager_head_is_noop_when_head_disabled() {
+        let head_calls = Arc::new(Mutex::new(Vec::new()));
+        let reader = MpegStreamReader::new_with_get_head(
+            vec!["init".into(), "a".into()],
+            None,
+            false,
+            gated_get(Arc::new(AtomicBool::new(false)), |url| {
+                url.as_bytes().to_vec()
+            }),
+            recording_head(head_calls.clone()),
+        )
+        .unwrap();
+
+        reader.cache.lock().disable_head("test");
+        reader.start_eager_head();
+        assert!(!reader.cache.lock().head_worker_running);
+        assert!(head_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stopped_eager_head_still_heads_on_demand_for_seeks() {
+        let head_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = MpegStreamReader::new_with_get_head(
+            vec!["init".into(), "a".into(), "b".into()],
+            None,
+            false,
+            gated_get(Arc::new(AtomicBool::new(false)), |url| {
+                url.as_bytes().to_vec()
+            }),
+            recording_head(head_calls.clone()),
+        )
+        .unwrap();
+
+        let position = reader.seek_bytes(SeekFrom::End(0)).unwrap();
+        assert_eq!(position.byte, Some(4 + 4 + 4));
+        assert_eq!(head_calls.lock().unwrap().as_slice(), &["a", "b"]);
+        assert!(!reader.cache.lock().head_worker_running);
+    }
+
     fn two_second_timeline() -> MediaTimeline {
         MediaTimeline {
             timescale: 44_100,
@@ -1826,6 +2118,7 @@ mod tests {
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "a".into(), "b".into()],
             Some(two_second_timeline()),
+            true,
             gated_get(allow_rest.clone(), |url| vec![url.as_bytes()[0]; 4]),
             failing_head(),
         )
@@ -1859,6 +2152,7 @@ mod tests {
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "a".into()],
             Some(two_second_timeline()),
+            true,
             instant_get(&[("init", b"INIT"), ("a", b"AAAA")]),
             instant_head(&[("init", b"INIT"), ("a", b"AAAA")]),
         )

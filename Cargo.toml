@@ -14,26 +14,36 @@ categories = ["multimedia::audio", "parser-implementations"]
 
 [dependencies]
 base64 = "0.23"
+# The `log` feature is only needed because dash-mpd-core 0.1.0 fails to build without it
+# (fixed upstream in e3d85a3, unreleased). Drop it once a newer release is out.
+dash-mpd-core = { version = "0.1", default-features = false, features = ["log"], path = "/opt/dash-mpd-core" }
 log = "^0.4"
-quick-xml = "0.42.0"
 rodio = { version = "0.22", optional = true, default-features = false, features = [
-    "symphonia-aac",
-    "symphonia-flac",
     "symphonia-isomp4",
 ] }
-serde = { version = "^1.0", features = ["derive"] }
 thiserror = "^2.0"
 ureq = { version = "3.1", default-features = false, features = ["rustls"] }
+url = "2.5"
 
 [features]
-default = []
+default = ["rodio"]
 rodio = ["dep:rodio"]
 
 [dev-dependencies]
 crossterm = "0.29"
 env_logger = "0.11"
-rodio = { version = "0.22", default-features = false, features = ["playback"] }
+rodio = { version = "0.22", default-features = false, features = [
+    "symphonia-aac",
+    "symphonia-flac",
+    "symphonia-isomp4",
+    "playback",
+] }
 
 [[example]]
 name = "player"
 required-features = ["rodio"]
+
+# Local-only: picks up the lenient AdaptationSet@group fix in /opt/dash-mpd-core.
+# Remove once a dash-mpd-core release includes it.
+[patch.crates-io]
+dash-mpd-core = { path = "/opt/dash-mpd-core" }

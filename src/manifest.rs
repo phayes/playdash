@@ -1,67 +1,33 @@
 //! Parsed TIDAL MPEG-DASH manifests.
 
+use std::time::Duration;
+
 use crate::error::Error;
+use crate::manifest_template::{Segments, TemplateChain, TemplateValues};
 use crate::stream::MediaTimeline;
 use crate::stream::MpegStreamReader;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use quick_xml::{
-    Reader,
-    events::{BytesStart, Event},
-};
-use serde::{Deserialize, Serialize};
+use dash_mpd_core::{AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation};
+use ureq::ResponseExt;
+use url::Url;
 
-/// Decoded streaming information from an MPEG-DASH manifest.
-#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
+/// A parsed MPEG-DASH manifest.
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct DashManifest {
-    /// Original MPEG-DASH manifest XML.
-    pub dash_xml: String,
-    /// Representations in MPEG-DASH document order.
-    pub representations: Vec<DashRepresentation>,
+    /// The full manifest as parsed by [`dash_mpd_core`].
+    pub mpd: MPD,
+    /// Where the manifest was fetched from; the root of `BaseURL` resolution.
+    base_url: Option<Url>,
 }
 
-/// A playable representation within a TIDAL MPEG-DASH manifest.
-#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct DashRepresentation {
-    /// TIDAL audio format identifier from the DASH representation.
-    pub id: String,
-    /// MIME type inherited from the DASH adaptation set.
-    pub mime_type: String,
-    /// Codec declared by the DASH representation.
-    pub codecs: String,
-    /// Common-encryption scheme inherited from the adaptation set, such as `cenc` or `cbcs`.
-    pub protection_scheme: Option<String>,
-    /// URLs and URL templates present in the manifest.
-    pub urls: Vec<String>,
-    /// Representation bitrate in bits per second.
-    pub bitrate: Option<u32>,
-    /// Initialization segment URL or template.
-    pub initialization_url: Option<String>,
-    /// Media segment URL template.
-    pub media_url_template: Option<String>,
-    /// Units per second used by the segment timeline.
-    pub timescale: Option<u32>,
-    /// Duration of each segment in timescale units.
-    pub duration: Option<u32>,
-    /// Number assigned to the first media segment.
-    pub start_number: Option<u32>,
-    /// Timeline entries that enumerate media segments.
-    pub timeline: Vec<DashSegment>,
-}
-
-/// One `<S>` entry from a DASH `SegmentTimeline`.
-#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct DashSegment {
-    /// Segment duration in timescale units.
-    pub duration: u64,
-    /// Additional repeats of this duration. The segment is emitted `repeat + 1` times.
-    pub repeat: u64,
-}
-
-fn unescape_attribute(attribute: &quick_xml::events::attributes::Attribute<'_>) -> String {
-    attribute
-        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-        .map(|value| value.into_owned())
-        .unwrap_or_else(|_| attribute.value.as_ref().to_owned())
+/// A representation together with the elements it inherits attributes from.
+#[derive(Clone, Copy)]
+struct Selected<'a> {
+    mpd: &'a MPD,
+    period: &'a Period,
+    next_period: Option<&'a Period>,
+    adaptation: &'a AdaptationSet,
+    representation: &'a Representation,
 }
 
 fn decode_data_url(data_url: &str) -> Result<String, Error> {
@@ -82,132 +48,116 @@ fn decode_data_url(data_url: &str) -> Result<String, Error> {
     Ok(String::from_utf8(bytes)?)
 }
 
-impl DashRepresentation {
-    fn parse(
-        element: &BytesStart<'_>,
-        mime_type: &str,
-        protection_scheme: Option<&str>,
-    ) -> Result<Self, Error> {
-        let mut representation = Self {
-            mime_type: mime_type.to_owned(),
-            protection_scheme: protection_scheme.map(str::to_owned),
-            ..Default::default()
+impl<'a> Selected<'a> {
+    fn id(self) -> &'a str {
+        self.representation.id.as_deref().unwrap_or("")
+    }
+
+    /// Segment templates from the most to the least specific level.
+    fn templates(self) -> TemplateChain<'a> {
+        TemplateChain::new([
+            self.representation.SegmentTemplate.as_ref(),
+            self.adaptation.SegmentTemplate.as_ref(),
+            self.period.SegmentTemplate.as_ref(),
+        ])
+    }
+
+    fn mime_type(self) -> Option<&'a str> {
+        self.representation
+            .mimeType
+            .as_deref()
+            .or(self.adaptation.mimeType.as_deref())
+    }
+
+    fn protection_scheme(self) -> Option<String> {
+        common_encryption_scheme(&self.representation.ContentProtection)
+            .or_else(|| common_encryption_scheme(&self.adaptation.ContentProtection))
+    }
+
+    /// Period length: `Period@duration`, else up to the next `Period@start`,
+    /// else up to the end of `MPD@mediaPresentationDuration`.
+    fn period_duration(self) -> Option<Duration> {
+        if let Some(duration) = self.period.duration {
+            return Some(duration);
+        }
+        let end = match self.next_period {
+            Some(next) => next.start,
+            None => self.mpd.mediaPresentationDuration,
+        }?;
+        end.checked_sub(self.period.start.unwrap_or_default())
+    }
+
+    fn segments(self) -> Result<Segments, Error> {
+        self.templates().segments(self.period_duration())
+    }
+
+    fn fragment_urls(
+        self,
+        manifest_url: Option<&Url>,
+        segments: &Segments,
+    ) -> Result<Vec<String>, Error> {
+        let values = TemplateValues {
+            representation_id: self.id(),
+            bandwidth: self.representation.bandwidth,
+            ..TemplateValues::default()
         };
-
-        for attribute in element.attributes().flatten() {
-            match attribute.key.as_ref() {
-                "id" => representation.id = attribute.value.as_ref().to_owned(),
-                "codecs" => representation.codecs = attribute.value.as_ref().to_owned(),
-                "bandwidth" => representation.bitrate = attribute.value.as_ref().parse().ok(),
-                _ => {}
-            }
-        }
-
-        if representation.id.is_empty() {
-            return Err(Error::DashManifestMissingRepresentationId);
-        }
-
-        Ok(representation)
+        let urls = self.templates().fragment_urls(values, segments)?;
+        let base = self.base_url(manifest_url)?;
+        urls.iter()
+            .map(|url| resolve_url(base.as_ref(), url).map(String::from))
+            .collect()
     }
 
-    fn parse_segment_template(&mut self, element: &BytesStart<'_>) {
-        for attribute in element.attributes().flatten() {
-            match attribute.key.as_ref() {
-                "initialization" => self.initialization_url = Some(unescape_attribute(&attribute)),
-                "media" => self.media_url_template = Some(unescape_attribute(&attribute)),
-                "timescale" => self.timescale = unescape_attribute(&attribute).parse().ok(),
-                "duration" => self.duration = unescape_attribute(&attribute).parse().ok(),
-                "startNumber" => self.start_number = unescape_attribute(&attribute).parse().ok(),
-                _ => {}
-            }
+    /// Resolves the first `BaseURL` of each level (MPD, Period, AdaptationSet,
+    /// Representation) against the one above it, starting at the manifest URL.
+    fn base_url(self, manifest_url: Option<&Url>) -> Result<Option<Url>, Error> {
+        let levels: [&[BaseURL]; 4] = [
+            &self.mpd.base_url,
+            &self.period.BaseURL,
+            &self.adaptation.BaseURL,
+            &self.representation.BaseURL,
+        ];
+        let mut base = manifest_url.cloned();
+        for element in levels.into_iter().filter_map(<[BaseURL]>::first) {
+            base = Some(resolve_url(base.as_ref(), &element.base)?);
         }
-    }
-
-    fn parse_timeline_s(&mut self, element: &BytesStart<'_>) -> Result<(), Error> {
-        let mut duration = None;
-        let mut repeat = 0;
-        for attribute in element.attributes().flatten() {
-            match attribute.key.as_ref() {
-                "d" => {
-                    duration = unescape_attribute(&attribute).parse().ok();
-                }
-                "r" => {
-                    repeat = unescape_attribute(&attribute).parse().unwrap_or(0);
-                }
-                _ => {}
-            }
-        }
-        self.timeline.push(DashSegment {
-            duration: duration.ok_or(Error::DashManifestInvalidTimeline)?,
-            repeat,
-        });
-        Ok(())
-    }
-
-    /// Initialization URL followed by media segment URLs in timeline order.
-    pub fn fragment_urls(&self) -> Result<Vec<String>, Error> {
-        let initialization = self
-            .initialization_url
-            .clone()
-            .ok_or(Error::DashManifestMissingUrls)?;
-        let template = self
-            .media_url_template
-            .as_ref()
-            .ok_or(Error::DashManifestMissingMediaTemplate)?;
-        if self.timeline.is_empty() {
-            return Err(Error::DashManifestMissingTimeline);
-        }
-
-        let mut urls = vec![initialization];
-        let mut number = u64::from(self.start_number.unwrap_or(1));
-        for entry in &self.timeline {
-            for _ in 0..=entry.repeat {
-                urls.push(template.replace("$Number$", &number.to_string()));
-                number += 1;
-            }
-        }
-        Ok(urls)
-    }
-
-    /// Media-segment durations in timeline order, with the DASH timescale.
-    pub fn media_timeline(&self) -> Result<MediaTimeline, Error> {
-        let timescale = self.timescale.ok_or(Error::DashManifestMissingTimescale)?;
-        if self.timeline.is_empty() {
-            return Err(Error::DashManifestMissingTimeline);
-        }
-
-        let mut media_durations = Vec::new();
-        for entry in &self.timeline {
-            for _ in 0..=entry.repeat {
-                media_durations.push(entry.duration);
-            }
-        }
-
-        Ok(MediaTimeline {
-            timescale,
-            media_durations,
-        })
-    }
-
-    fn finish(mut self) -> Result<Self, Error> {
-        if let Some(url) = &self.initialization_url {
-            self.urls.push(url.clone());
-        }
-        if let Some(url) = &self.media_url_template {
-            self.urls.push(url.clone());
-        }
-        if self.urls.is_empty() {
-            return Err(Error::DashManifestMissingUrls);
-        }
-
-        Ok(self)
+        Ok(base)
     }
 }
 
+/// Resolves `reference` (RFC 3986) against `base`; without a base it must be absolute.
+fn resolve_url(base: Option<&Url>, reference: &str) -> Result<Url, Error> {
+    let reference = reference.trim();
+    match base {
+        Some(base) => base.join(reference),
+        None => Url::parse(reference),
+    }
+    .map_err(|error| Error::DashManifestUrl(reference.to_owned(), error))
+}
+
 impl DashManifest {
-    /// Parses an MPEG-DASH manifest into streaming information.
-    pub fn new(dash_xml: String) -> Result<Self, Error> {
-        Self::parse_dash_manifest(dash_xml)
+    /// Parses an MPEG-DASH manifest.
+    ///
+    /// Relative segment and `BaseURL` references cannot be resolved without
+    /// knowing where the manifest came from; use [`DashManifest::new_from_url`]
+    /// or [`DashManifest::with_base_url`] for those manifests.
+    pub fn new(dash_xml: impl AsRef<str>) -> Result<Self, Error> {
+        let manifest = Self {
+            mpd: dash_mpd_core::parse(dash_xml.as_ref())?,
+            base_url: None,
+        };
+
+        if manifest.selections().next().is_none() {
+            return Err(Error::DashManifestMissingRepresentations);
+        }
+        if manifest
+            .representations()
+            .any(|representation| representation.id.as_deref().is_none_or(str::is_empty))
+        {
+            return Err(Error::DashManifestMissingRepresentationId);
+        }
+
+        Ok(manifest)
     }
 
     /// Decodes a base64 `data:` URL and parses the embedded MPEG-DASH XML.
@@ -216,16 +166,48 @@ impl DashManifest {
         Self::new(dash_xml)
     }
 
+    /// Fetches and parses an MPEG-DASH manifest.
+    ///
+    /// The final URL, after redirects, becomes the [`DashManifest::base_url`]
+    /// that relative `BaseURL` and segment references resolve against. `data:`
+    /// URLs are decoded as with [`DashManifest::new_from_data_url`].
+    pub fn new_from_url(url: &str) -> Result<Self, Error> {
+        if url.trim_start().starts_with("data:") {
+            return Self::new_from_data_url(url.trim());
+        }
+        let response = ureq::get(url).call().map_err(Error::DashManifestFetch)?;
+        let final_url = response.get_uri().to_string();
+        let dash_xml = response
+            .into_body()
+            .read_to_string()
+            .map_err(Error::DashManifestFetch)?;
+        Self::new(dash_xml)?.with_base_url(&final_url)
+    }
+
+    /// Sets the absolute URL the manifest was loaded from.
+    ///
+    /// Relative `BaseURL` and segment references resolve against it.
+    pub fn with_base_url(mut self, url: &str) -> Result<Self, Error> {
+        self.base_url = Some(resolve_url(None, url)?);
+        Ok(self)
+    }
+
+    /// The URL the manifest was loaded from, if known.
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_ref().map(Url::as_str)
+    }
+
     /// Starts a progressive in-memory reader over fragmented MPEG-DASH bytes.
     ///
-    /// `id` is matched case-insensitively against a representation's full ID,
-    /// then against the format token before the first comma. The first match
-    /// in document order wins.
+    /// `id` uses the same full-ID or format-token matching as
+    /// [`DashManifest::representation`].
     ///
     /// The initialization fragment is fetched before returning (and establishes
     /// the GET connection). Remaining media fragments download on a GET worker
-    /// (from the playhead forward, then earlier holes). A second connection HEADs
-    /// remaining URLs to fill fragment sizes. [`MpegStreamReader::seek_bytes`]
+    /// (from the playhead forward, then earlier holes). When `eager_head` is set,
+    /// a second connection HEADs remaining URLs to fill fragment sizes; toggle it
+    /// later with [`MpegStreamReader::start_eager_head`] and
+    /// [`MpegStreamReader::stop_eager_head`]. [`MpegStreamReader::seek_bytes`]
     /// may also HEAD to map offsets without downloading skipped bodies; if HEAD
     /// is unusable, it falls back to waiting on GETs. Call
     /// [`MpegStreamReader::set_symphonia_compat`] before handing the reader to
@@ -233,14 +215,16 @@ impl DashManifest {
     /// [`MpegStreamReader::seek_time_coarse`], which lands at the beginning of
     /// the containing fMP4 fragment and returns a
     /// [`crate::stream::Position`].
-    pub fn stream(&self, id: impl AsRef<str>) -> Result<MpegStreamReader, Error> {
-        let id = id.as_ref();
-        let representation = self
-            .representation(id)
-            .ok_or_else(|| Error::DashManifestMissingRepresentation(id.to_owned()))?;
-        let urls = representation.fragment_urls()?;
-        let timeline = representation.media_timeline().ok();
-        MpegStreamReader::new(urls, timeline)
+    pub fn stream(&self, id: impl AsRef<str>, eager_head: bool) -> Result<MpegStreamReader, Error> {
+        let selected = self.select(id.as_ref())?;
+        let segments = selected.segments()?;
+        let urls = selected.fragment_urls(self.base_url.as_ref(), &segments)?;
+        MpegStreamReader::new(urls, Some(segments.media_timeline()), eager_head)
+    }
+
+    /// Representations in document order, across all periods and adaptation sets.
+    pub fn representations(&self) -> impl Iterator<Item = &Representation> {
+        self.selections().map(|selected| selected.representation)
     }
 
     /// Finds a representation by ID.
@@ -249,123 +233,70 @@ impl DashManifest {
     /// misses, a second pass matches the format token before the first comma.
     /// Both comparisons are case-insensitive. The first match in document order
     /// wins.
-    pub fn representation(&self, id: impl AsRef<str>) -> Option<&DashRepresentation> {
-        let id = id.as_ref();
-        self.representations
+    pub fn representation(&self, id: impl AsRef<str>) -> Option<&Representation> {
+        self.find(id.as_ref())
+            .map(|selected| selected.representation)
+    }
+
+    /// Initialization URL followed by media segment URLs in timeline order.
+    ///
+    /// URLs are expanded from the representation's `SegmentTemplate` and
+    /// resolved against the `BaseURL` chain and [`DashManifest::base_url`].
+    pub fn fragment_urls(&self, id: impl AsRef<str>) -> Result<Vec<String>, Error> {
+        let selected = self.select(id.as_ref())?;
+        selected.fragment_urls(self.base_url.as_ref(), &selected.segments()?)
+    }
+
+    /// Media-segment durations in timeline order, with the DASH timescale.
+    pub fn media_timeline(&self, id: impl AsRef<str>) -> Result<MediaTimeline, Error> {
+        Ok(self.select(id.as_ref())?.segments()?.media_timeline())
+    }
+
+    /// MIME type of a representation, inherited from its adaptation set if absent.
+    pub fn mime_type(&self, id: impl AsRef<str>) -> Result<Option<&str>, Error> {
+        Ok(self.select(id.as_ref())?.mime_type())
+    }
+
+    /// Common-encryption scheme protecting a representation, such as `cenc` or
+    /// `cbcs`, inherited from its adaptation set if absent.
+    pub fn protection_scheme(&self, id: impl AsRef<str>) -> Result<Option<String>, Error> {
+        Ok(self.select(id.as_ref())?.protection_scheme())
+    }
+
+    fn selections(&self) -> impl Iterator<Item = Selected<'_>> {
+        let mpd = &self.mpd;
+        mpd.periods
             .iter()
-            .find(|representation| representation.id.eq_ignore_ascii_case(id))
-            .or_else(|| {
-                self.representations.iter().find(|representation| {
-                    representation_token(&representation.id).eq_ignore_ascii_case(id)
+            .enumerate()
+            .flat_map(move |(index, period)| {
+                let next_period = mpd.periods.get(index + 1);
+                period.adaptations.iter().flat_map(move |adaptation| {
+                    adaptation
+                        .representations
+                        .iter()
+                        .map(move |representation| Selected {
+                            mpd,
+                            period,
+                            next_period,
+                            adaptation,
+                            representation,
+                        })
                 })
             })
     }
 
-    /// Parses MPEG-DASH XML and extracts its representation and segment details.
-    pub fn parse_dash_manifest(dash_xml: String) -> Result<Self, Error> {
-        let mut reader = Reader::from_str(&dash_xml);
-        reader.config_mut().trim_text(true);
+    fn find(&self, id: &str) -> Option<Selected<'_>> {
+        self.selections()
+            .find(|selected| selected.id().eq_ignore_ascii_case(id))
+            .or_else(|| {
+                self.selections()
+                    .find(|selected| representation_token(selected.id()).eq_ignore_ascii_case(id))
+            })
+    }
 
-        let mut adaptation_mime_type = String::new();
-        let mut adaptation_protection_scheme = None;
-        let mut representations = Vec::new();
-        let mut current_representation = None;
-        let mut buffer = Vec::new();
-
-        loop {
-            match reader.read_event_into(&mut buffer)? {
-                Event::Start(element) => match element.name().as_ref() {
-                    "AdaptationSet" => {
-                        adaptation_protection_scheme = None;
-                        for attribute in element.attributes().flatten() {
-                            if attribute.key.as_ref() == "mimeType" {
-                                adaptation_mime_type = attribute.value.as_ref().to_owned();
-                            }
-                        }
-                    }
-                    "Representation" => {
-                        current_representation = Some(DashRepresentation::parse(
-                            &element,
-                            &adaptation_mime_type,
-                            adaptation_protection_scheme.as_deref(),
-                        )?);
-                    }
-                    "ContentProtection" => {
-                        if let Some(scheme) = common_encryption_scheme(&element) {
-                            if let Some(representation) = &mut current_representation {
-                                representation.protection_scheme = Some(scheme);
-                            } else {
-                                adaptation_protection_scheme = Some(scheme);
-                            }
-                        }
-                    }
-                    "SegmentTemplate" => {
-                        if let Some(representation) = &mut current_representation {
-                            representation.parse_segment_template(&element);
-                        }
-                    }
-                    "S" => {
-                        if let Some(representation) = &mut current_representation {
-                            representation.parse_timeline_s(&element)?;
-                        }
-                    }
-                    "BaseURL" => {
-                        if let Event::Text(text) = reader.read_event_into(&mut buffer)? {
-                            let url = quick_xml::escape::unescape(text.as_ref())
-                                .map(|value| value.into_owned())
-                                .unwrap_or_else(|_| text.as_ref().to_owned());
-                            if !url.is_empty()
-                                && let Some(representation) = &mut current_representation
-                            {
-                                representation.urls.push(url);
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                Event::Empty(element) => match element.name().as_ref() {
-                    "ContentProtection" => {
-                        if let Some(scheme) = common_encryption_scheme(&element) {
-                            if let Some(representation) = &mut current_representation {
-                                representation.protection_scheme = Some(scheme);
-                            } else {
-                                adaptation_protection_scheme = Some(scheme);
-                            }
-                        }
-                    }
-                    "SegmentTemplate" => {
-                        if let Some(representation) = &mut current_representation {
-                            representation.parse_segment_template(&element);
-                        }
-                    }
-                    "S" => {
-                        if let Some(representation) = &mut current_representation {
-                            representation.parse_timeline_s(&element)?;
-                        }
-                    }
-                    _ => {}
-                },
-                Event::End(element) if element.name().as_ref() == "Representation" => {
-                    let representation = current_representation
-                        .take()
-                        .ok_or(Error::DashManifestMissingRepresentationId)?
-                        .finish()?;
-                    representations.push(representation);
-                }
-                Event::Eof => break,
-                _ => {}
-            }
-            buffer.clear();
-        }
-
-        if representations.is_empty() {
-            return Err(Error::DashManifestMissingRepresentations);
-        }
-
-        Ok(Self {
-            dash_xml,
-            representations,
-        })
+    fn select(&self, id: &str) -> Result<Selected<'_>, Error> {
+        self.find(id)
+            .ok_or_else(|| Error::DashManifestMissingRepresentation(id.to_owned()))
     }
 }
 
@@ -373,21 +304,20 @@ fn representation_token(id: &str) -> &str {
     id.split(',').next().unwrap_or(id)
 }
 
-fn common_encryption_scheme(element: &BytesStart<'_>) -> Option<String> {
-    let mut scheme_id_uri = None;
-    let mut value = None;
-
-    for attribute in element.attributes().flatten() {
-        match attribute.key.as_ref() {
-            "schemeIdUri" => scheme_id_uri = Some(unescape_attribute(&attribute)),
-            "value" => value = Some(unescape_attribute(&attribute)),
-            _ => {}
-        }
-    }
-
-    scheme_id_uri
-        .is_some_and(|uri| uri.eq_ignore_ascii_case("urn:mpeg:dash:mp4protection:2011"))
-        .then(|| value.unwrap_or_else(|| "common encryption".to_owned()))
+fn common_encryption_scheme(protections: &[ContentProtection]) -> Option<String> {
+    protections
+        .iter()
+        .find(|protection| {
+            protection
+                .schemeIdUri
+                .eq_ignore_ascii_case("urn:mpeg:dash:mp4protection:2011")
+        })
+        .map(|protection| {
+            protection
+                .value
+                .clone()
+                .unwrap_or_else(|| "common encryption".to_owned())
+        })
 }
 
 #[cfg(test)]
@@ -423,45 +353,36 @@ mod tests {
             </MPD>
         "#;
 
-        let stream = DashManifest::new(xml.to_owned()).unwrap();
+        let manifest = DashManifest::new(xml).unwrap();
+        assert_eq!(manifest.representations().count(), 2);
 
-        assert_eq!(stream.dash_xml, xml);
-        assert_eq!(stream.representations.len(), 2);
+        let flac = manifest.representation("FLAC").unwrap();
+        assert_eq!(flac.id.as_deref(), Some("FLAC,44100,16"));
+        assert_eq!(flac.codecs.as_deref(), Some("flac"));
+        assert_eq!(flac.bandwidth, Some(1_411_200));
+        assert_eq!(flac.BaseURL[0].base, "https://media.example/audio/");
+        assert_eq!(manifest.mime_type("FLAC").unwrap(), Some("audio/mp4"));
 
-        let flac = stream.representation("FLAC").unwrap();
-        assert_eq!(flac.id, "FLAC,44100,16");
-        assert_eq!(flac.mime_type, "audio/mp4");
-        assert_eq!(flac.codecs, "flac");
-        assert_eq!(flac.bitrate, Some(1_411_200));
-        assert_eq!(flac.initialization_url.as_deref(), Some("init.mp4"));
-        assert_eq!(
-            flac.media_url_template.as_deref(),
-            Some("segment_$Number$.m4s")
-        );
-        assert_eq!(flac.timescale, Some(48_000));
-        assert_eq!(flac.duration, Some(192_000));
-        assert_eq!(flac.start_number, Some(1));
-        assert_eq!(
-            flac.urls,
-            [
-                "https://media.example/audio/",
-                "init.mp4",
-                "segment_$Number$.m4s"
-            ]
-        );
+        let template = flac.SegmentTemplate.as_ref().unwrap();
+        assert_eq!(template.initialization.as_deref(), Some("init.mp4"));
+        assert_eq!(template.media.as_deref(), Some("segment_$Number$.m4s"));
+        assert_eq!(template.timescale, Some(48_000));
+        assert_eq!(template.duration, Some(192_000.0));
+        assert_eq!(template.startNumber, Some(1));
 
-        let aac = stream.representation("AACLC").unwrap();
-        assert_eq!(aac.id, "AACLC");
-        assert_eq!(aac.codecs, "mp4a.40.2");
-        assert_eq!(aac.bitrate, Some(320_000));
-        assert_eq!(aac.timescale, Some(44_100));
-        assert!(aac.timeline.is_empty());
+        let aac = manifest.representation("AACLC").unwrap();
+        assert_eq!(aac.codecs.as_deref(), Some("mp4a.40.2"));
+        assert_eq!(aac.bandwidth, Some(320_000));
         assert!(matches!(
-            aac.fragment_urls(),
+            manifest.fragment_urls("FLAC"),
+            Err(Error::DashManifestMissingDuration)
+        ));
+        assert!(matches!(
+            manifest.fragment_urls("AACLC"),
             Err(Error::DashManifestMissingTimeline)
         ));
         assert!(matches!(
-            aac.media_timeline(),
+            manifest.media_timeline("AACLC"),
             Err(Error::DashManifestMissingTimeline)
         ));
     }
@@ -490,31 +411,9 @@ mod tests {
             </MPD>
         "#;
 
-        let stream = DashManifest::new(xml.to_owned()).unwrap();
-        let aac = stream.representation("AACLC").unwrap();
+        let manifest = DashManifest::new(xml).unwrap();
         assert_eq!(
-            aac.initialization_url.as_deref(),
-            Some("https://cdn.example/0.mp4?token=abc&info=init")
-        );
-        assert_eq!(
-            aac.media_url_template.as_deref(),
-            Some("https://cdn.example/$Number$.mp4?token=abc&info=media")
-        );
-        assert_eq!(
-            aac.timeline,
-            [
-                DashSegment {
-                    duration: 176_128,
-                    repeat: 2,
-                },
-                DashSegment {
-                    duration: 108_735,
-                    repeat: 0,
-                }
-            ]
-        );
-        assert_eq!(
-            aac.fragment_urls().unwrap(),
+            manifest.fragment_urls("AACLC").unwrap(),
             [
                 "https://cdn.example/0.mp4?token=abc&info=init",
                 "https://cdn.example/1.mp4?token=abc&info=media",
@@ -524,10 +423,48 @@ mod tests {
             ]
         );
         assert_eq!(
-            aac.media_timeline().unwrap(),
+            manifest.media_timeline("AACLC").unwrap(),
             MediaTimeline {
                 timescale: 44_100,
                 media_durations: vec![176_128, 176_128, 176_128, 108_735],
+            }
+        );
+    }
+
+    #[test]
+    fn inherits_segment_template_from_adaptation_set() {
+        let xml = r#"
+            <MPD>
+                <Period>
+                    <AdaptationSet mimeType="audio/mp4">
+                        <SegmentTemplate timescale="1000" initialization="init.mp4" media="$Number$.mp4">
+                            <SegmentTimeline><S d="2000" r="1"/></SegmentTimeline>
+                        </SegmentTemplate>
+                        <Representation id="FLAC" codecs="flac">
+                            <SegmentTemplate startNumber="5"/>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+        "#;
+
+        let manifest = DashManifest::new(xml)
+            .unwrap()
+            .with_base_url("https://cdn.example/track/manifest.mpd")
+            .unwrap();
+        assert_eq!(
+            manifest.fragment_urls("FLAC").unwrap(),
+            [
+                "https://cdn.example/track/init.mp4",
+                "https://cdn.example/track/5.mp4",
+                "https://cdn.example/track/6.mp4",
+            ]
+        );
+        assert_eq!(
+            manifest.media_timeline("FLAC").unwrap(),
+            MediaTimeline {
+                timescale: 1000,
+                media_durations: vec![2000, 2000],
             }
         );
     }
@@ -552,13 +489,9 @@ mod tests {
             </MPD>
         "#;
 
-        let manifest = DashManifest::new(xml.to_owned()).unwrap();
+        let manifest = DashManifest::new(xml).unwrap();
         assert_eq!(
-            manifest
-                .representation("FLAC")
-                .unwrap()
-                .protection_scheme
-                .as_deref(),
+            manifest.protection_scheme("FLAC").unwrap().as_deref(),
             Some("cbcs")
         );
     }
@@ -584,8 +517,8 @@ mod tests {
                 </Period>
             </MPD>
         "#;
-        let stream = DashManifest::new(xml.to_owned()).unwrap();
-        let error = stream.stream("FLAC").unwrap_err();
+        let manifest = DashManifest::new(xml).unwrap();
+        let error = manifest.stream("FLAC", true).unwrap_err();
         assert!(matches!(
             error,
             Error::DashManifestMissingRepresentation(id) if id == "FLAC"
@@ -611,29 +544,21 @@ mod tests {
                 </Period>
             </MPD>
         "#;
-        let stream = DashManifest::new(xml.to_owned()).unwrap();
+        let manifest = DashManifest::new(xml).unwrap();
+        let id_of = |id: &str| manifest.representation(id).unwrap().id.as_deref().unwrap();
 
-        assert_eq!(
-            stream.representation("FLAC_HIRES,48000,24").unwrap().id,
-            "FLAC_HIRES,48000,24"
-        );
-        assert_eq!(
-            stream.representation("flac,44100,16").unwrap().id,
-            "FLAC,44100,16"
-        );
-        assert_eq!(stream.representation("FLAC").unwrap().id, "FLAC,44100,16");
-        assert_eq!(
-            stream.representation("flac_hires").unwrap().id,
-            "FLAC_HIRES,48000,24"
-        );
-        assert_eq!(stream.representation("aaclc").unwrap().id, "AACLC");
-        assert!(stream.representation("MP3").is_none());
+        assert_eq!(id_of("FLAC_HIRES,48000,24"), "FLAC_HIRES,48000,24");
+        assert_eq!(id_of("flac,44100,16"), "FLAC,44100,16");
+        assert_eq!(id_of("FLAC"), "FLAC,44100,16");
+        assert_eq!(id_of("flac_hires"), "FLAC_HIRES,48000,24");
+        assert_eq!(id_of("aaclc"), "AACLC");
+        assert!(manifest.representation("MP3").is_none());
     }
 
     #[test]
     fn rejects_dash_manifest_without_representations() {
         assert!(matches!(
-            DashManifest::new("<MPD/>".to_owned()),
+            DashManifest::new("<MPD/>"),
             Err(Error::DashManifestMissingRepresentations)
         ));
     }
@@ -653,9 +578,25 @@ mod tests {
         "#;
 
         assert!(matches!(
-            DashManifest::new(xml.to_owned()),
+            DashManifest::new(xml),
             Err(Error::DashManifestMissingRepresentationId)
         ));
+    }
+
+    #[test]
+    fn rejects_malformed_xml() {
+        assert!(matches!(
+            DashManifest::new("<MPD><Period>"),
+            Err(Error::DashManifestParse(_))
+        ));
+    }
+
+    #[test]
+    fn parses_sample_tidal_manifest() {
+        let manifest = DashManifest::new(include_str!("../test_files/manifest.xml")).unwrap();
+        assert_eq!(manifest.fragment_urls("FLAC").unwrap().len(), 86);
+        assert_eq!(manifest.mime_type("FLAC").unwrap(), Some("audio/mp4"));
+        assert_eq!(manifest.protection_scheme("FLAC").unwrap(), None);
     }
 
     #[test]
@@ -684,5 +625,196 @@ mod tests {
             DashManifest::new_from_data_url("https://example.com/manifest.mpd"),
             Err(Error::InvalidDataUrl)
         ));
+    }
+
+    #[test]
+    fn resolves_base_url_chain_and_duration_template() {
+        let xml = r#"
+            <MPD mediaPresentationDuration="PT9S">
+                <BaseURL>../media/</BaseURL>
+                <Period>
+                    <BaseURL>audio/</BaseURL>
+                    <AdaptationSet mimeType="audio/mp4">
+                        <Representation id="FLAC" codecs="flac" bandwidth="1411200">
+                            <BaseURL>flac/</BaseURL>
+                            <SegmentTemplate
+                                timescale="1000"
+                                duration="4000"
+                                initialization="$RepresentationID$-init.mp4"
+                                media="$Bandwidth$/$Number%03d$.m4s"
+                            />
+                        </Representation>
+                        <Representation id="AACLC" codecs="mp4a.40.2">
+                            <BaseURL>https://other.example/aac/</BaseURL>
+                            <SegmentTemplate timescale="1000" duration="9000" initialization="i.mp4" media="$Time$.m4s"/>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+        "#;
+        let manifest = DashManifest::new(xml)
+            .unwrap()
+            .with_base_url("https://cdn.example/manifests/track.mpd?sig=1")
+            .unwrap();
+        assert_eq!(
+            manifest.base_url(),
+            Some("https://cdn.example/manifests/track.mpd?sig=1")
+        );
+        assert_eq!(
+            manifest.fragment_urls("FLAC").unwrap(),
+            [
+                "https://cdn.example/media/audio/flac/FLAC-init.mp4",
+                "https://cdn.example/media/audio/flac/1411200/001.m4s",
+                "https://cdn.example/media/audio/flac/1411200/002.m4s",
+                "https://cdn.example/media/audio/flac/1411200/003.m4s",
+            ]
+        );
+        assert_eq!(
+            manifest.media_timeline("FLAC").unwrap(),
+            MediaTimeline {
+                timescale: 1000,
+                media_durations: vec![4000, 4000, 1000],
+            }
+        );
+        assert_eq!(
+            manifest.fragment_urls("AACLC").unwrap(),
+            [
+                "https://other.example/aac/i.mp4",
+                "https://other.example/aac/0.m4s"
+            ]
+        );
+    }
+
+    #[test]
+    fn relative_urls_need_a_base_url() {
+        let xml = r#"
+            <MPD>
+                <Period>
+                    <AdaptationSet mimeType="audio/mp4">
+                        <Representation id="FLAC" codecs="flac">
+                            <SegmentTemplate initialization="init.mp4" media="$Number$.mp4">
+                                <SegmentTimeline><S d="1000"/></SegmentTimeline>
+                            </SegmentTemplate>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+        "#;
+        let manifest = DashManifest::new(xml).unwrap();
+        assert!(matches!(
+            manifest.fragment_urls("FLAC"),
+            Err(Error::DashManifestUrl(url, url::ParseError::RelativeUrlWithoutBase)) if url == "init.mp4"
+        ));
+        assert!(matches!(
+            manifest.with_base_url("manifest.mpd"),
+            Err(Error::DashManifestUrl(
+                _,
+                url::ParseError::RelativeUrlWithoutBase
+            ))
+        ));
+    }
+
+    #[test]
+    fn period_duration_runs_to_next_period_start() {
+        let xml = r#"
+            <MPD mediaPresentationDuration="PT20S">
+                <Period start="PT2S">
+                    <AdaptationSet mimeType="audio/mp4">
+                        <Representation id="FIRST" codecs="flac">
+                            <SegmentTemplate timescale="1" initialization="https://cdn.example/i.mp4"
+                                media="https://cdn.example/$Time$.mp4">
+                                <SegmentTimeline><S d="2" r="-1"/></SegmentTimeline>
+                            </SegmentTemplate>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+                <Period start="PT7S">
+                    <AdaptationSet mimeType="audio/mp4">
+                        <Representation id="SECOND" codecs="flac">
+                            <SegmentTemplate timescale="1" duration="10" initialization="https://cdn.example/i.mp4"
+                                media="https://cdn.example/$Number$.mp4"/>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+        "#;
+        let manifest = DashManifest::new(xml).unwrap();
+        assert_eq!(
+            manifest.media_timeline("FIRST").unwrap().media_durations,
+            [2, 2, 2]
+        );
+        assert_eq!(
+            manifest.media_timeline("SECOND").unwrap().media_durations,
+            [10, 3]
+        );
+    }
+
+    #[test]
+    fn new_from_url_resolves_against_redirected_url() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let xml = r#"<MPD>
+            <Period>
+                <AdaptationSet mimeType="audio/mp4">
+                    <Representation id="FLAC" codecs="flac">
+                        <SegmentTemplate initialization="init.mp4" media="$Number$.mp4">
+                            <SegmentTimeline><S d="1000"/></SegmentTimeline>
+                        </SegmentTemplate>
+                    </Representation>
+                </AdaptationSet>
+            </Period>
+        </MPD>"#;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut header = String::new();
+                while reader.read_line(&mut header).unwrap() > 2 {
+                    header.clear();
+                }
+                let response = if request_line.starts_with("GET /start ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /tracks/7/manifest.mpd\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/dash+xml\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                        xml.len()
+                    )
+                };
+                reader.get_mut().write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let manifest = DashManifest::new_from_url(&format!("http://{address}/start")).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            manifest.base_url(),
+            Some(format!("http://{address}/tracks/7/manifest.mpd").as_str())
+        );
+        assert_eq!(
+            manifest.fragment_urls("FLAC").unwrap(),
+            [
+                format!("http://{address}/tracks/7/init.mp4"),
+                format!("http://{address}/tracks/7/1.mp4"),
+            ]
+        );
+    }
+
+    #[test]
+    fn new_from_url_accepts_data_urls() {
+        let xml = r#"<MPD><Period><AdaptationSet><Representation id="AACLC"/></AdaptationSet></Period></MPD>"#;
+        let encoded = STANDARD.encode(xml);
+        let manifest =
+            DashManifest::new_from_url(&format!("data:application/dash+xml;base64,{encoded}"))
+                .unwrap();
+        assert!(manifest.representation("AACLC").is_some());
+        assert_eq!(manifest.base_url(), None);
     }
 }

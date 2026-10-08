@@ -4,7 +4,8 @@
 //! cargo run --example player -- [--id FORMAT] [MANIFEST]
 //! ```
 //!
-//! `MANIFEST` is MPEG-DASH XML, a `data:` URL, a file path, or omitted to read stdin.
+//! `MANIFEST` is an `http(s)` URL, MPEG-DASH XML, a `data:` URL, a file path, or
+//! omitted to read stdin.
 
 use std::error::Error;
 use std::fs;
@@ -15,7 +16,8 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use rodio::{DeviceSinkBuilder, Player};
-use tidal_dash::{DashManifest, DashRepresentation, DashSource};
+use tidal_dash::dash_mpd_core::Representation;
+use tidal_dash::{DashManifest, DashSource};
 
 fn main() {
     if let Err(error) = run() {
@@ -33,20 +35,25 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let xml = load_input(args.manifest.as_deref())?;
-    let manifest = parse_manifest(&xml)?;
+    let manifest = match args.manifest.as_deref() {
+        Some(url) if is_http_url(url) => DashManifest::new_from_url(url)?,
+        input => parse_manifest(&load_input(input)?)?,
+    };
     let representation = select_representation(&manifest, args.id.as_deref())?;
+    let id = representation.id.as_deref().unwrap_or_default();
     let bitrate = representation
-        .bitrate
-        .ok_or_else(|| format!("representation {} has no bandwidth", representation.id))?;
+        .bandwidth
+        .ok_or_else(|| format!("representation {id} has no bandwidth"))?;
 
     println!(
         "playing {} ({}, {} bps)",
-        representation.id, representation.codecs, bitrate
+        id,
+        representation.codecs.as_deref().unwrap_or("unknown codec"),
+        bitrate
     );
     print_keys();
 
-    let source = DashSource::from_representation(representation)?;
+    let source = DashSource::new(&manifest, id)?;
 
     let device = DeviceSinkBuilder::open_default_sink()?;
     let player = Player::connect_new(device.mixer());
@@ -106,6 +113,10 @@ fn load_input(manifest: Option<&str>) -> Result<String, Box<dyn Error>> {
     }
 }
 
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
 fn looks_like_xml(value: &str) -> bool {
     value.trim_start().starts_with('<')
 }
@@ -114,21 +125,21 @@ fn parse_manifest(input: &str) -> Result<DashManifest, Box<dyn Error>> {
     if input.trim_start().starts_with("data:") {
         Ok(DashManifest::new_from_data_url(input.trim())?)
     } else {
-        Ok(DashManifest::new(input.to_owned())?)
+        Ok(DashManifest::new(input)?)
     }
 }
 
 fn select_representation<'a>(
     manifest: &'a DashManifest,
     id: Option<&str>,
-) -> Result<&'a DashRepresentation, Box<dyn Error>> {
+) -> Result<&'a Representation, Box<dyn Error>> {
     match id {
         Some(id) => manifest
             .representation(id)
             .ok_or_else(|| format!("MPEG-DASH representation not found: {id}").into()),
         None => manifest
-            .representations
-            .first()
+            .representations()
+            .next()
             .ok_or_else(|| "MPEG-DASH manifest contains no representations".into()),
     }
 }
@@ -189,7 +200,8 @@ Usage: player [--id FORMAT] [MANIFEST]
 
 Play a TIDAL MPEG-DASH manifest through rodio's Symphonia decoder.
 
-MANIFEST is MPEG-DASH XML, a data: URL, a file path, or omitted to read stdin."
+MANIFEST is an http(s) URL, MPEG-DASH XML, a data: URL, a file path, or omitted
+to read stdin."
     );
     print_keys();
 }

@@ -16,11 +16,11 @@ pub enum Error {
     DataUrlUtf8(#[from] std::string::FromUtf8Error),
 
     /// MPEG-DASH manifest XML could not be parsed
-    #[error("MPEG-DASH manifest XML parsing failed: {0}")]
-    DashManifestXml(#[from] quick_xml::Error),
+    #[error("MPEG-DASH manifest parsing failed: {0}")]
+    DashManifestParse(#[from] dash_mpd_core::DashMpdError),
 
-    /// MPEG-DASH manifest did not contain any stream URLs
-    #[error("MPEG-DASH manifest contains no stream URLs")]
+    /// A TIDAL MPEG-DASH representation did not include an initialization URL
+    #[error("MPEG-DASH representation is missing an initialization URL")]
     DashManifestMissingUrls,
 
     /// MPEG-DASH manifest did not contain any representations
@@ -35,20 +35,37 @@ pub enum Error {
     #[error("MPEG-DASH representation not found: {0}")]
     DashManifestMissingRepresentation(String),
 
-    /// A TIDAL MPEG-DASH representation did not include a SegmentTimeline
-    #[error("MPEG-DASH representation is missing a SegmentTimeline")]
+    /// A MPEG-DASH representation had neither a SegmentTimeline nor a
+    /// SegmentTemplate@duration, or its SegmentTimeline was empty
+    #[error(
+        "MPEG-DASH representation has neither a SegmentTimeline nor a SegmentTemplate@duration"
+    )]
     DashManifestMissingTimeline,
+
+    /// The segment count depends on the Period length, but the manifest gives
+    /// no Period@duration, next Period@start, MPD@mediaPresentationDuration or
+    /// SegmentTemplate@endNumber
+    #[error("MPEG-DASH segment count needs a Period duration, presentation duration or endNumber")]
+    DashManifestMissingDuration,
+
+    /// A MPEG-DASH SegmentTemplate URL or attribute could not be expanded
+    #[error("Invalid MPEG-DASH segment template: {0}")]
+    DashManifestInvalidTemplate(String),
+
+    /// A MPEG-DASH URL could not be parsed or resolved against its BaseURL chain
+    #[error("Cannot resolve MPEG-DASH URL {0}: {1}")]
+    DashManifestUrl(String, #[source] url::ParseError),
+
+    /// HTTP request for the MPEG-DASH manifest failed
+    #[error("Fetching MPEG-DASH manifest failed: {0}")]
+    DashManifestFetch(#[source] ureq::Error),
 
     /// A TIDAL MPEG-DASH representation did not include a media URL template
     #[error("MPEG-DASH representation is missing a media URL template")]
     DashManifestMissingMediaTemplate,
 
-    /// A TIDAL MPEG-DASH SegmentTimeline entry was missing a duration
-    #[error("MPEG-DASH SegmentTimeline entry is missing a duration")]
-    DashManifestInvalidTimeline,
-
-    /// A TIDAL MPEG-DASH representation did not include a timescale
-    #[error("MPEG-DASH representation is missing a timescale")]
+    /// A MPEG-DASH representation had a zero or out-of-range timescale
+    #[error("MPEG-DASH representation has an invalid timescale")]
     DashManifestMissingTimescale,
 
     /// Failed to initialize audio stream

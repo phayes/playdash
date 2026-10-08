@@ -1,0 +1,7 @@
+[
+    "https://standards.iso.org/ittf/PubliclyAvailableStandards/MPEG-DASH_schema_files/DASH-MPD-edition1.xsd",
+    "https://standards.iso.org/ittf/PubliclyAvailableStandards/MPEG-DASH_schema_files/DASH-MPD-edition2-AMD1.xsd",
+    "https://standards.iso.org/ittf/PubliclyAvailableStandards/MPEG-DASH_schema_files/DASH-MPD-edition2.xsd",
+    "https://standards.iso.org/ittf/PubliclyAvailableStandards/MPEG-DASH_schema_files/DASH-MPD.xsd",
+    "https://standards.iso.org/ittf/PubliclyAvailableStandards/MPEG-DASH_schema_files/xlink.xsd"
+]

@@ -1,6 +1,6 @@
 //! Rodio source support for progressive, unprotected MPEG-DASH playback.
 
-use crate::{DashManifest, DashRepresentation, Error, MediaTimeline, MpegStreamReader};
+use crate::{DashManifest, Error, MediaTimeline, MpegStreamReader};
 use ::rodio::{Decoder, Source, source::SeekError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,25 +27,17 @@ impl DashSource {
     /// [`DashManifest::representation`].
     pub fn new(manifest: &DashManifest, id: impl AsRef<str>) -> Result<Self, Error> {
         let id = id.as_ref();
-        let representation = manifest
-            .representation(id)
-            .ok_or_else(|| Error::DashManifestMissingRepresentation(id.to_owned()))?;
-        Self::from_representation(representation)
-    }
-
-    /// Opens a parsed DASH representation for progressive rodio playback.
-    pub fn from_representation(representation: &DashRepresentation) -> Result<Self, Error> {
-        if let Some(scheme) = &representation.protection_scheme {
-            return Err(Error::RodioProtectedContent(scheme.clone()));
+        if let Some(scheme) = manifest.protection_scheme(id)? {
+            return Err(Error::RodioProtectedContent(scheme));
         }
-        let urls = representation.fragment_urls()?;
-        let timeline = representation.media_timeline()?;
+        let urls = manifest.fragment_urls(id)?;
+        let timeline = manifest.media_timeline(id)?;
         if timeline.timescale == 0 {
             return Err(Error::StreamInitializationError(
                 "rodio playback requires a non-zero DASH timescale".to_owned(),
             ));
         }
-        let mime_type = representation.mime_type.clone();
+        let mime_type = manifest.mime_type(id)?.unwrap_or_default().to_owned();
         let decoder = Self::build_decoder(&urls, &timeline, &mime_type, 0)?;
 
         Ok(Self {
@@ -70,7 +62,9 @@ impl DashSource {
             timescale: timeline.timescale,
             media_durations: timeline.media_durations[media_index..].to_vec(),
         };
-        let reader = MpegStreamReader::new(selected_urls, Some(selected_timeline))?;
+        // The decoder is unseekable and seeks rebuild by timeline, so byte
+        // sizes from eager HEADs would go unused.
+        let reader = MpegStreamReader::new(selected_urls, Some(selected_timeline), false)?;
 
         Ok(Decoder::builder()
             .with_data(reader)
@@ -225,13 +219,22 @@ mod tests {
 
     #[test]
     fn protected_representation_is_rejected_before_streaming() {
-        let representation = DashRepresentation {
-            protection_scheme: Some("cbcs".to_owned()),
-            ..Default::default()
-        };
+        let manifest = DashManifest::new(
+            r#"
+            <MPD>
+                <Period>
+                    <AdaptationSet mimeType="audio/mp4">
+                        <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cbcs"/>
+                        <Representation id="FLAC" codecs="flac"/>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+            "#,
+        )
+        .unwrap();
 
         assert!(matches!(
-            DashSource::from_representation(&representation),
+            DashSource::new(&manifest, "FLAC"),
             Err(Error::RodioProtectedContent(scheme)) if scheme == "cbcs"
         ));
     }
