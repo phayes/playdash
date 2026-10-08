@@ -121,7 +121,7 @@ let source = DashSource::new_with_keys(&manifest, "FLAC", keys)?;
 
 ## Example player
 
-See the [example player source on GitHub](https://github.com/phayes/playdash/blob/main/examples/player.rs).
+See the [example player source on GitHub](https://github.com/phayes/playdash/blob/master/examples/player.rs).
 
 Example Usage:
 
