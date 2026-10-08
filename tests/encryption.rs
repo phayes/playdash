@@ -7,7 +7,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tidal_dash::{
+use playdash::{
     ContentKeys, DashManifest, DashSource, Error, Fragment, FragmentCache, MpegStreamReader,
     Transport,
 };

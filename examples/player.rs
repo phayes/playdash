@@ -37,8 +37,8 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use rodio::{DeviceSinkBuilder, Player};
-use tidal_dash::dash_mpd_core::Representation;
-use tidal_dash::{DashManifest, DashSource};
+use playdash::dash_mpd_core::Representation;
+use playdash::{DashManifest, DashSource};
 
 fn main() {
     if let Err(error) = run() {
@@ -219,7 +219,7 @@ fn print_usage() {
         "\
 Usage: player [--id FORMAT] [MANIFEST]
 
-Play a TIDAL MPEG-DASH manifest through rodio's Symphonia decoder.
+Play an MPEG-DASH manifest through rodio's Symphonia decoder.
 
 MANIFEST is an http(s) URL, MPEG-DASH XML, a data: URL, a file path, or omitted
 to read stdin."

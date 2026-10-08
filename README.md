@@ -1,53 +1,25 @@
-# tidal_dash
+# playdash
 
-Parse TIDAL MPEG-DASH manifests and set them up for progressive streaming playback.
+Parse MPEG-DASH manifests and set them up for progressive streaming playback.
 
-This crate lets you play TIDAL MPEG-DASH streams with seeking.
+This crate lets you play MPEG-DASH streams with seeking.
 
 ## Installation
 
 ```toml
 [dependencies]
-tidal_dash = "0.1"
-rodio = { version = "0.22", default-features = false, features = ["playback"] }
+playdash = "0.1"
 ```
 
-`DashSource` is included by default: a ready-to-use rodio source for rodio and symphonia.
-It plays unprotected streams, and `cenc` or `cbcs` encrypted streams when you have the content
-keys (see [Encrypted streams](#encrypted-streams)).
+## Streaming
 
-## Rodio playback
-
-```rust,ignore
-use rodio::{DeviceSinkBuilder, Player};
-use tidal_dash::{DashManifest, DashSource};
-
-let manifest = DashManifest::new(dash_xml)?;
-let source = DashSource::new(&manifest, "FLAC")?;
-
-let device = DeviceSinkBuilder::open_default_sink()?;
-let player = Player::connect_new(device.mixer());
-player.append(source);
-player.sleep_until_end();
-```
-
-## Lower-level API
-
-For another playback system, `DashManifest::stream` returns an `MpegStreamReader`
-that implements `std::io::Read` and `std::io::Seek` over the concatenated
-initialization segment and media fragments.
-
-Skip the rodio integration with `default-features = false`:
-
-```toml
-[dependencies]
-tidal_dash = { version = "0.1", default-features = false }
-```
+`DashManifest::stream` returns an `MpegStreamReader` that implements `std::io::Read` and
+`std::io::Seek`, so you can hand it to any MP4 demuxer or playback system.
 
 ```rust,ignore
 use std::io::Read;
 use std::time::Duration;
-use tidal_dash::DashManifest;
+use playdash::DashManifest;
 
 let manifest = DashManifest::new(dash_xml)?;
 let mut reader = manifest.stream("FLAC", true)?;
@@ -60,11 +32,28 @@ reader.seek_time_coarse(Duration::from_secs(90))?;
 reader.read(&mut mpeg_buffer)?;
 ```
 
-If you create several readers for the same track, for example rebuilding one after a seek,
-`DashManifest::stream_with_cache` with a shared `FragmentCache` reuses pooled connections
-and never downloads a fragment twice, even while another reader's download is in flight.
-`DashSource` does this internally; use `DashSource::new_with_cache` to share a cache or to
-supply your own `Transport` through `FragmentCache::new`.
+## Rodio playback
+
+The `rodio` feature adds `DashSource`, a ready-to-use rodio source for rodio and symphonia.
+
+```toml
+[dependencies]
+playdash = { version = "0.1", features = ["rodio"] }
+rodio = { version = "0.22", default-features = false, features = ["playback"] }
+```
+
+```rust,ignore
+use rodio::{DeviceSinkBuilder, Player};
+use playdash::{DashManifest, DashSource};
+
+let manifest = DashManifest::new(dash_xml)?;
+let source = DashSource::new(&manifest, "FLAC")?;
+
+let device = DeviceSinkBuilder::open_default_sink()?;
+let player = Player::connect_new(device.mixer());
+player.append(source);
+player.sleep_until_end();
+```
 
 ## Encrypted streams
 
@@ -73,11 +62,11 @@ content keys you already hold. It does not talk to a DRM licence server or CDM.
 
 ```toml
 [dependencies]
-tidal_dash = { version = "0.1", features = ["encryption"] }
+playdash = { version = "0.1", features = ["encryption", "rodio"] }
 ```
 
 ```rust,ignore
-use tidal_dash::{ContentKeys, DashManifest, DashSource};
+use playdash::{ContentKeys, DashManifest, DashSource};
 
 let mut keys = ContentKeys::new();
 // KID and key as 32 hex digits; a UUID-form KID from `cenc:default_KID` also works.
@@ -87,34 +76,26 @@ let manifest = DashManifest::new(dash_xml)?;
 let source = DashSource::new_with_keys(&manifest, "FLAC", keys)?;
 ```
 
-For the lower-level API, pass `FragmentCache::default().with_keys(keys)` to
-`DashManifest::stream_with_cache`. Fragments are decrypted once as they arrive and cached as
-plaintext of the same length, so seeking and shared caches work as for unprotected streams.
-A missing key fails with `Error::MissingContentKey` before any media is downloaded.
-Key rotation (`seig` sample groups), the `cens` and `cbc1` schemes, and sample encryption data
-outside a `senc` box are not supported.
+## Limitations:
 
-## Caveats
+1.  Hierarchical `sidx` indexes are not supported.
 
-For `SegmentBase` representations, `DashManifest` fetches the `sidx` index with an HTTP `Range`
-request while parsing, or in `with_base_url` when the media URL is relative. An index that
-fails to load is logged (with the default `log` feature) and only reported when that representation is streamed. Hierarchical
-`sidx` indexes are not supported.
+2. Multi-period playback and live (`type="dynamic"`) manifests are not yet supported. 
 
-Multi-period playback and live (`type="dynamic"`) manifests are not yet supported. Contributions
-to improve this are very welcome.
+3. Widevine and fairplay are not yet supported. (Support is planned).
 
 ## Example player
 
-`examples/player` uses `DashSource`:
+```bash
+# Big Buck Bunny, HE-AAC, SegmentTemplate with $Number$
+cargo run --example player -- --id bbb_a64k https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd
 
-```text
-cargo run --example player -- manifest.xml
+Envivio, AAC-LC, 48 kHz, SegmentTemplate with $Number$
+cargo run --example player -- --id v4_258 https://dash.akamaized.net/envivio/EnvivioDash3/manifest.mpd
+
+# Shaka Player's "Angel One", AAC-LC, SegmentBase (sidx index)
+cargo run --example player -- --id 4 https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd
+
+# DASH-IF test vector, Elephants Dream, HE-AAC, SegmentBase; audio is listed first
+cargo run --example player -- https://dash.akamaized.net/dash264/TestCases/1a/netflix/exMPD_BIP_TC1.mpd
 ```
-
-The manifest argument is an `http(s)` URL, MPEG-DASH XML, a `data:` URL, a file
-path, or omitted to read stdin. Arrow keys jump 1 second or 1 minute.
-
-## Contributing
-
-Contributions are welcome.

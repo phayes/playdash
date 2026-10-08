@@ -19,7 +19,7 @@ pub enum Error {
     #[error("MPEG-DASH manifest parsing failed: {0}")]
     DashManifestParse(#[from] dash_mpd_core::DashMpdError),
 
-    /// A TIDAL MPEG-DASH representation did not include an initialization URL
+    /// An MPEG-DASH representation did not include an initialization URL
     #[error("MPEG-DASH representation is missing an initialization URL")]
     DashManifestMissingUrls,
 
@@ -27,8 +27,8 @@ pub enum Error {
     #[error("MPEG-DASH manifest contains no representations")]
     DashManifestMissingRepresentations,
 
-    /// A TIDAL MPEG-DASH representation did not have an ID
-    #[error("MPEG-DASH representation is missing its TIDAL format ID")]
+    /// An MPEG-DASH representation did not have an ID
+    #[error("MPEG-DASH representation is missing its ID")]
     DashManifestMissingRepresentationId,
 
     /// No MPEG-DASH representation matched the requested ID or format token
@@ -72,7 +72,7 @@ pub enum Error {
     #[error("Fetching MPEG-DASH manifest failed: {0}")]
     DashManifestFetch(#[source] ureq::Error),
 
-    /// A TIDAL MPEG-DASH representation did not include a media URL template
+    /// An MPEG-DASH representation did not include a media URL template
     #[error("MPEG-DASH representation is missing a media URL template")]
     DashManifestMissingMediaTemplate,
 

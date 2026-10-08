@@ -1,15 +1,15 @@
 [package]
-name = "tidal_dash"
+name = "playdash"
 version = "0.1.0"
 authors = ["Patrick Hayes <patrick.d.hayes@gmail.com>"]
-description = "Parse TIDAL MPEG-DASH manifests and set them up for progressive streaming playback"
+description = "Parse MPEG-DASH manifests and set them up for progressive streaming playback"
 license = "MIT"
 edition = "2024"
-repository = "https://github.com/phayes/tidal_dash"
-homepage = "https://github.com/phayes/tidal_dash"
-documentation = "https://docs.rs/tidal_dash"
+repository = "https://github.com/phayes/playdash"
+homepage = "https://github.com/phayes/playdash"
+documentation = "https://docs.rs/playdash"
 readme = "README.md"
-keywords = ["tidal", "dash", "mpeg-dash", "streaming", "audio"]
+keywords = ["dash", "mpeg-dash", "streaming", "audio"]
 categories = ["multimedia::audio", "parser-implementations"]
 
 [dependencies]
@@ -28,7 +28,7 @@ ureq = { version = "3.1", default-features = false, features = ["rustls"] }
 url = "2.5"
 
 [features]
-default = ["rodio", "log"]
+default = ["log"]
 rodio = ["dep:rodio"]
 # Report recoverable problems, such as a SegmentBase index that failed to load, through `log`,
 # and enable dash-mpd-core's parser diagnostics (emitted through `tracing`).

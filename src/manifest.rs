@@ -1,4 +1,4 @@
-//! Parsed TIDAL MPEG-DASH manifests.
+//! Parsed MPEG-DASH manifests.
 
 use std::time::Duration;
 
@@ -603,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_tidal_segment_timeline_and_unescapes_urls() {
+    fn parses_segment_timeline_and_unescapes_urls() {
         let xml = r#"
             <MPD>
                 <Period>
@@ -807,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_sample_tidal_manifest() {
+    fn parses_sample_manifest() {
         let manifest = DashManifest::new(include_str!("../test_files/manifest.xml")).unwrap();
         assert_eq!(urls(&manifest, "FLAC").len(), 86);
         assert_eq!(manifest.mime_type("FLAC").unwrap(), Some("audio/mp4"));
