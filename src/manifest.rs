@@ -899,7 +899,7 @@ mod tests {
     }
 
     fn ranged(url: &str, start: u64, end: u64) -> Fragment {
-        Fragment::with_range(url, crate::ByteRange::new(start, end).unwrap())
+        Fragment::with_range(url, start..=end)
     }
 
     #[test]

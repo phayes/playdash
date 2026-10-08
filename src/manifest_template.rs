@@ -10,7 +10,7 @@ use std::time::Duration;
 use dash_mpd_core::{Initialization, S, SegmentTemplate, SegmentTimeline};
 
 use crate::error::Error;
-use crate::stream::{Fragment, MediaTimeline};
+use crate::stream::{Fragment, MediaTimeline, parse_byte_range};
 
 /// Values substituted for the `$...$` identifiers of a URL template.
 #[derive(Clone, Copy, Debug, Default)]
@@ -175,7 +175,7 @@ pub(crate) fn initialization_fragment(initialization: &Initialization) -> Result
         range: initialization
             .range
             .as_deref()
-            .map(str::parse)
+            .map(parse_byte_range)
             .transpose()?,
     })
 }

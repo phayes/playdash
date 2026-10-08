@@ -14,6 +14,6 @@ pub use manifest::DashManifest;
 #[cfg(feature = "rodio")]
 pub use rodio::DashSource;
 pub use stream::{
-    ByteRange, Fragment, FragmentCache, MediaTimeline, MpegStreamReader, Position, TimeAccuracy,
-    TimePosition, Transport,
+    Fragment, FragmentCache, MediaTimeline, MpegStreamReader, Position, TimeAccuracy, TimePosition,
+    Transport,
 };

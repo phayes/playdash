@@ -8,7 +8,7 @@ use log::warn;
 
 use crate::error::Error;
 use crate::manifest_template::{Addressing, Segments, Timing, initialization_fragment};
-use crate::stream::Fragment;
+use crate::stream::{Fragment, parse_byte_range};
 
 /// `SegmentList` elements a representation inherits from, most specific first
 /// (Representation, AdaptationSet, Period).
@@ -91,7 +91,7 @@ impl<'a> ListChain<'a> {
                 range: segment_url
                     .mediaRange
                     .as_deref()
-                    .map(str::parse)
+                    .map(parse_byte_range)
                     .transpose()?,
             });
         }

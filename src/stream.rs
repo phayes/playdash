@@ -5,7 +5,7 @@ use log::warn;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::str::FromStr;
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -22,6 +22,7 @@ pub struct MediaTimeline {
 /// Padding applied to advertised media bytes when guessing total length.
 /// AAC `bandwidth` is near the real rate; FLAC's is often uncompressed PCM.
 const SYMPHONIA_COMPAT_MEDIA_FACTOR: u128 = 4;
+
 /// Extra bytes reserved per media fragment for `moof` / box overhead.
 const SYMPHONIA_COMPAT_BYTES_PER_FRAGMENT: u128 = 64 * 1024;
 
@@ -63,7 +64,7 @@ impl MediaTimeline {
         let ticks: u128 = self.media_durations.iter().copied().map(u128::from).sum();
         let fragments = u128::from(self.media_durations.len() as u64);
         let denom = u128::from(self.timescale) * 8;
-        let media = (u128::from(bitrate_bps) * ticks + (denom - 1)) / denom;
+        let media = (u128::from(bitrate_bps) * ticks).div_ceil(denom);
         let padded = media
             .saturating_mul(SYMPHONIA_COMPAT_MEDIA_FACTOR)
             .saturating_add(fragments.saturating_mul(SYMPHONIA_COMPAT_BYTES_PER_FRAGMENT))
@@ -79,6 +80,7 @@ pub struct Position {
     ///
     /// This is `None` when preceding fragment sizes are not yet known.
     pub byte: Option<u64>,
+
     /// Media timestamp corresponding to the position, when a timeline applies.
     pub time: Option<TimePosition>,
 }
@@ -88,6 +90,7 @@ pub struct Position {
 pub struct TimePosition {
     /// Actual media timestamp at which reading begins.
     pub timestamp: Duration,
+
     /// Whether `timestamp` is exact or the start of a containing fragment.
     pub accuracy: TimeAccuracy,
 }
@@ -97,57 +100,22 @@ pub struct TimePosition {
 pub enum TimeAccuracy {
     /// The byte position is known to land exactly at this media timestamp.
     Exact,
+
     /// The timestamp is the start of the fragment containing the requested position.
     Coarse,
 }
 
-/// Inclusive byte range within a resource, as in an HTTP `Range` header or a
-/// DASH `@mediaRange` / `@range` attribute.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ByteRange {
-    start: u64,
-    end: u64,
-}
-
-impl ByteRange {
-    /// Range covering `start..=end`, or `None` if `end < start`.
-    pub fn new(start: u64, end: u64) -> Option<Self> {
-        (start <= end).then_some(Self { start, end })
-    }
-
-    /// First byte offset.
-    pub fn start(self) -> u64 {
-        self.start
-    }
-
-    /// Last byte offset (inclusive).
-    pub fn end(self) -> u64 {
-        self.end
-    }
-
-    /// Number of bytes covered. Ranges are never empty.
-    pub fn size(self) -> u64 {
-        self.end - self.start + 1
-    }
-}
-
-impl fmt::Display for ByteRange {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", self.start, self.end)
-    }
-}
-
-impl FromStr for ByteRange {
-    type Err = Error;
-
-    /// Parses the DASH and HTTP `first-last` form, such as `"0-837"`.
-    fn from_str(value: &str) -> Result<Self, Error> {
-        value
-            .trim()
-            .split_once('-')
-            .and_then(|(start, end)| Self::new(start.parse().ok()?, end.parse().ok()?))
-            .ok_or_else(|| Error::InvalidByteRange(value.to_owned()))
-    }
+/// Parses an inclusive byte range in the DASH `@mediaRange` / `@range` and
+/// HTTP `first-last` form, such as `"0-837"`.
+pub(crate) fn parse_byte_range(value: &str) -> Result<RangeInclusive<u64>, Error> {
+    value
+        .trim()
+        .split_once('-')
+        .and_then(|(start, end)| {
+            let (start, end) = (start.parse().ok()?, end.parse().ok()?);
+            (start <= end).then_some(start..=end)
+        })
+        .ok_or_else(|| Error::InvalidByteRange(value.to_owned()))
 }
 
 /// One piece of the concatenated stream: a URL, optionally narrowed to a byte range.
@@ -155,8 +123,9 @@ impl FromStr for ByteRange {
 pub struct Fragment {
     /// Absolute URL of the resource.
     pub url: String,
-    /// Byte range within the resource, or `None` for the whole body.
-    pub range: Option<ByteRange>,
+    /// Inclusive byte range within the resource, as in an HTTP `Range`
+    /// header, or `None` for the whole body. Must not be empty.
+    pub range: Option<RangeInclusive<u64>>,
 }
 
 impl Fragment {
@@ -169,7 +138,7 @@ impl Fragment {
     }
 
     /// The bytes of `url` covered by `range`.
-    pub fn with_range(url: impl Into<String>, range: ByteRange) -> Self {
+    pub fn with_range(url: impl Into<String>, range: RangeInclusive<u64>) -> Self {
         Self {
             url: url.into(),
             range: Some(range),
@@ -178,7 +147,9 @@ impl Fragment {
 
     /// Byte length, when the range makes it known in advance.
     pub fn known_size(&self) -> Option<u64> {
-        self.range.map(ByteRange::size)
+        self.range
+            .as_ref()
+            .and_then(|range| range.end().checked_sub(*range.start())?.checked_add(1))
     }
 }
 
@@ -196,8 +167,8 @@ impl From<&str> for Fragment {
 
 impl fmt::Display for Fragment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.range {
-            Some(range) => write!(f, "{} (bytes {range})", self.url),
+        match &self.range {
+            Some(range) => write!(f, "{} (bytes {}-{})", self.url, range.start(), range.end()),
             None => f.write_str(&self.url),
         }
     }
@@ -230,8 +201,11 @@ impl Transport for ureq::Agent {
     /// returns the whole body, the range is sliced out of that body.
     fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
         let mut request = ureq::Agent::get(self, &fragment.url);
-        if let Some(range) = fragment.range {
-            request = request.header(ureq::http::header::RANGE, format!("bytes={range}"));
+        if let Some(range) = &fragment.range {
+            request = request.header(
+                ureq::http::header::RANGE,
+                format!("bytes={}-{}", range.start(), range.end()),
+            );
         }
         let response = request.call()?;
         let partial = response.status() == ureq::http::StatusCode::PARTIAL_CONTENT;
@@ -240,7 +214,7 @@ impl Transport for ureq::Agent {
             .map(Vec::with_capacity)
             .unwrap_or_default();
         response.into_body().into_reader().read_to_end(&mut bytes)?;
-        match fragment.range {
+        match &fragment.range {
             Some(range) if !partial => {
                 warn!("server ignored the Range request for {fragment}; slicing the full body");
                 Ok(slice_range(&bytes, range).unwrap_or(&bytes).into())
@@ -277,6 +251,8 @@ struct FragmentData {
     /// Held across a GET so a second reader waits for that download instead
     /// of starting its own.
     get_lock: Mutex<()>,
+    /// Held across a HEAD, as `get_lock` is for GETs.
+    head_lock: Mutex<()>,
 }
 
 impl FragmentData {
@@ -286,6 +262,7 @@ impl FragmentData {
             body: OnceLock::new(),
             probed_size: OnceLock::new(),
             get_lock: Mutex::new(()),
+            head_lock: Mutex::new(()),
         }
     }
 
@@ -305,7 +282,7 @@ impl FragmentData {
 /// Fragment bodies and lengths, keyed by [`Fragment`], and the [`Transport`]
 /// that fetches them.
 ///
-/// Use this to share caches across multiple readers that read the same stream, 
+/// Use this to share caches across multiple readers that read the same stream,
 /// such as a reader rebuilt after a seek.
 pub struct FragmentCache {
     transport: Arc<dyn Transport>,
@@ -376,8 +353,16 @@ impl FragmentCache {
         Ok(data.body.get_or_init(|| body).clone())
     }
 
-    /// HEADs `data` unless its size is already known.
+    /// HEADs `data` unless its size is already known or another reader is
+    /// already probing it.
     fn probe(&self, data: &FragmentData) -> Result<(), Error> {
+        if data.size().is_some() {
+            return Ok(());
+        }
+        let _in_flight = data
+            .head_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if data.size().is_none() {
             let size = self.transport.head(&data.fragment)?;
             data.probed_size.get_or_init(|| size);
@@ -401,26 +386,6 @@ impl fmt::Debug for FragmentCache {
     }
 }
 
-/// Adapts GET and HEAD closures for [`MpegStreamReader::new_with_get_head`].
-struct FnTransport<G, H> {
-    get: G,
-    head: H,
-}
-
-impl<G, H> Transport for FnTransport<G, H>
-where
-    G: Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync,
-    H: Fn(&Fragment) -> Result<u64, Error> + Send + Sync,
-{
-    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
-        (self.get)(fragment, size_hint).map(Arc::from)
-    }
-
-    fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
-        (self.head)(fragment)
-    }
-}
-
 /// How long to keep an idle HTTP connection in the ureq pool.
 ///
 /// Fastly allows idle client reuse for up to 10 minutes. Stay well under
@@ -436,9 +401,9 @@ fn ureq_agent() -> ureq::Agent {
 }
 
 /// The `range` bytes of a full body, for servers that answer a Range request with 200.
-fn slice_range(body: &[u8], range: ByteRange) -> Option<&[u8]> {
-    let start = usize::try_from(range.start()).ok()?;
-    let end = usize::try_from(range.end()).ok()?;
+fn slice_range<'a>(body: &'a [u8], range: &RangeInclusive<u64>) -> Option<&'a [u8]> {
+    let start = usize::try_from(*range.start()).ok()?;
+    let end = usize::try_from(*range.end()).ok()?;
     body.get(start..=end)
 }
 
@@ -603,6 +568,7 @@ impl MpegStreamReader {
     /// size list on its own pooled connection; otherwise prefetch starts
     /// stopped (see [`Self::start_eager_head`]). If HEAD fails or later
     /// disagrees with GET, HEAD probing is disabled. See
+    /// [`Self::new_with_transport`] for a custom [`Transport`], and
     /// [`Self::new_with_cache`] to share connections and downloaded bodies
     /// across readers.
     pub fn new(
@@ -613,21 +579,15 @@ impl MpegStreamReader {
         Self::new_with_cache(fragments, timeline, eager_head, Arc::default())
     }
 
-    /// Creates a reader with custom GET and HEAD closures.
-    ///
-    /// The closures behave as [`Transport::get`] and [`Transport::head`].
-    pub fn new_with_get_head<G, H>(
+    /// Like [`Self::new`], but fetches through `transport` with a new
+    /// [`FragmentCache`] dedicated to this reader.
+    pub fn new_with_transport(
         fragments: Vec<Fragment>,
         timeline: Option<MediaTimeline>,
         eager_head: bool,
-        get: G,
-        head: H,
-    ) -> Result<Self, Error>
-    where
-        G: Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync + 'static,
-        H: Fn(&Fragment) -> Result<u64, Error> + Send + Sync + 'static,
-    {
-        let cache = FragmentCache::new(Arc::new(FnTransport { get, head }));
+        transport: Arc<dyn Transport>,
+    ) -> Result<Self, Error> {
+        let cache = FragmentCache::new(transport);
         Self::new_with_cache(fragments, timeline, eager_head, Arc::new(cache))
     }
 
@@ -1205,6 +1165,42 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// Adapts GET and HEAD closures to [`Transport`].
+    struct FnTransport<G, H> {
+        get: G,
+        head: H,
+    }
+
+    impl<G, H> Transport for FnTransport<G, H>
+    where
+        G: Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync,
+        H: Fn(&Fragment) -> Result<u64, Error> + Send + Sync,
+    {
+        fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
+            (self.get)(fragment, size_hint).map(Arc::from)
+        }
+
+        fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
+            (self.head)(fragment)
+        }
+    }
+
+    /// A reader fetching through GET and HEAD closures.
+    fn closure_reader<G, H>(
+        fragments: Vec<Fragment>,
+        timeline: Option<MediaTimeline>,
+        eager_head: bool,
+        get: G,
+        head: H,
+    ) -> Result<MpegStreamReader, Error>
+    where
+        G: Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync + 'static,
+        H: Fn(&Fragment) -> Result<u64, Error> + Send + Sync + 'static,
+    {
+        let transport = Arc::new(FnTransport { get, head });
+        MpegStreamReader::new_with_transport(fragments, timeline, eager_head, transport)
+    }
+
     fn position(byte: Option<u64>, time: Option<(Duration, TimeAccuracy)>) -> Position {
         Position {
             byte,
@@ -1249,7 +1245,7 @@ mod tests {
         urls: Vec<Fragment>,
         payloads: &'static [(&'static str, &'static [u8])],
     ) -> Result<MpegStreamReader, Error> {
-        MpegStreamReader::new_with_get_head(
+        closure_reader(
             urls,
             None,
             true,
@@ -1289,7 +1285,7 @@ mod tests {
     #[test]
     fn blocks_until_later_fragments_arrive() {
         let allow_rest = Arc::new(AtomicBool::new(false));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "more".into()],
             None,
             true,
@@ -1345,7 +1341,7 @@ mod tests {
     #[test]
     fn seek_bytes_from_end_falls_back_without_head() {
         let allow_rest = Arc::new(AtomicBool::new(false));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "tail".into()],
             None,
             true,
@@ -1373,7 +1369,7 @@ mod tests {
         let allow_get = Arc::new(AtomicBool::new(false));
         let get_order = Arc::new(Mutex::new(Vec::new()));
         let head_calls = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into()],
             None,
             true,
@@ -1425,7 +1421,7 @@ mod tests {
     #[test]
     fn seek_bytes_disables_head_on_length_mismatch() {
         let allow_get = Arc::new(AtomicBool::new(false));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into()],
             None,
             true,
@@ -1480,7 +1476,7 @@ mod tests {
         let allow_a = Arc::new(AtomicBool::new(false));
         let allow_b = Arc::new(AtomicBool::new(false));
         let allow_c = Arc::new(AtomicBool::new(false));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into(), "c".into()],
             Some(MediaTimeline {
                 timescale: 1,
@@ -1552,7 +1548,7 @@ mod tests {
             timescale: 100,
             media_durations: vec![100, 100],
         };
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into()],
             Some(timeline),
             true,
@@ -1595,7 +1591,7 @@ mod tests {
         let allow_c = Arc::new(AtomicBool::new(false));
         let a_started = Arc::new(AtomicBool::new(false));
         let order = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into(), "c".into()],
             Some(MediaTimeline {
                 timescale: 1,
@@ -1678,7 +1674,7 @@ mod tests {
     fn get_worker_fills_ahead_of_cursor_before_backfill() {
         let release_media = Arc::new(AtomicBool::new(false));
         let order = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec![
                 "init".into(),
                 "a".into(),
@@ -1739,7 +1735,7 @@ mod tests {
             timescale: 1,
             media_durations: vec![1, 1],
         };
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into()],
             Some(timeline),
             true,
@@ -1758,7 +1754,7 @@ mod tests {
     #[test]
     fn seek_bytes_backfills_leading_fragments_without_head() {
         let allow_rest = Arc::new(AtomicBool::new(false));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "aaaa".into(), "bbbb".into()],
             None,
             true,
@@ -1815,7 +1811,7 @@ mod tests {
             }
         };
 
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "bad".into()],
             None,
             true,
@@ -1840,13 +1836,7 @@ mod tests {
 
     #[test]
     fn empty_url_list_is_rejected() {
-        let result = MpegStreamReader::new_with_get_head(
-            Vec::new(),
-            None,
-            true,
-            instant_get(&[]),
-            failing_head(),
-        );
+        let result = closure_reader(Vec::new(), None, true, instant_get(&[]), failing_head());
         assert!(matches!(result, Err(Error::DashManifestMissingUrls)));
     }
 
@@ -1855,7 +1845,7 @@ mod tests {
         let allow_late = Arc::new(AtomicBool::new(false));
         let head_calls = Arc::new(Mutex::new(Vec::new()));
         let get_expected = Arc::new(Mutex::new(Vec::new()));
-        let reader = MpegStreamReader::new_with_get_head(
+        let reader = closure_reader(
             vec![
                 "init".into(),
                 "a".into(),
@@ -1924,7 +1914,7 @@ mod tests {
     fn head_worker_heads_immediately_without_body_buffer() {
         let allow_get = Arc::new(AtomicBool::new(false));
         let head_calls = Arc::new(Mutex::new(Vec::new()));
-        let reader = MpegStreamReader::new_with_get_head(
+        let reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into(), "c".into()],
             None,
             true,
@@ -1968,7 +1958,7 @@ mod tests {
     #[test]
     fn get_worker_proceeds_while_head_is_blocked() {
         let allow_heads = Arc::new(AtomicBool::new(false));
-        let reader = MpegStreamReader::new_with_get_head(
+        let reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into(), "c".into()],
             None,
             true,
@@ -1998,7 +1988,7 @@ mod tests {
     fn head_worker_failure_disables_head() {
         let allow_get = Arc::new(AtomicBool::new(false));
         let head_calls = Arc::new(AtomicUsize::new(0));
-        let reader = MpegStreamReader::new_with_get_head(
+        let reader = closure_reader(
             vec![
                 "init".into(),
                 "a".into(),
@@ -2053,7 +2043,7 @@ mod tests {
     #[test]
     fn stopped_eager_head_spawns_no_worker() {
         let head_calls = Arc::new(Mutex::new(Vec::new()));
-        let reader = MpegStreamReader::new_with_get_head(
+        let reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into()],
             None,
             false,
@@ -2072,7 +2062,7 @@ mod tests {
     fn start_eager_head_fills_sizes_after_stopped_construction() {
         let allow_get = Arc::new(AtomicBool::new(false));
         let head_calls = Arc::new(Mutex::new(Vec::new()));
-        let reader = MpegStreamReader::new_with_get_head(
+        let reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into(), "c".into()],
             None,
             false,
@@ -2116,7 +2106,7 @@ mod tests {
         let allow_get = Arc::new(AtomicBool::new(false));
         let head_entered = Arc::new(AtomicUsize::new(0));
         let release_head = Arc::new(AtomicBool::new(false));
-        let reader = MpegStreamReader::new_with_get_head(
+        let reader = closure_reader(
             vec![
                 "init".into(),
                 "a".into(),
@@ -2183,7 +2173,7 @@ mod tests {
         let release_head = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
-        let reader = MpegStreamReader::new_with_get_head(
+        let reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into(), "c".into()],
             None,
             true,
@@ -2234,7 +2224,7 @@ mod tests {
     #[test]
     fn start_eager_head_is_noop_when_head_disabled() {
         let head_calls = Arc::new(Mutex::new(Vec::new()));
-        let reader = MpegStreamReader::new_with_get_head(
+        let reader = closure_reader(
             vec!["init".into(), "a".into()],
             None,
             false,
@@ -2254,7 +2244,7 @@ mod tests {
     #[test]
     fn stopped_eager_head_still_heads_on_demand_for_seeks() {
         let head_calls = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into()],
             None,
             false,
@@ -2295,7 +2285,7 @@ mod tests {
     #[test]
     fn symphonia_compat_end_zero_does_not_wait_for_bodies() {
         let allow_rest = Arc::new(AtomicBool::new(false));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "a".into(), "b".into()],
             Some(two_second_timeline()),
             true,
@@ -2329,7 +2319,7 @@ mod tests {
 
     #[test]
     fn symphonia_compat_end_zero_uses_exact_len_once_known() {
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec!["init".into(), "a".into()],
             Some(two_second_timeline()),
             true,
@@ -2363,14 +2353,16 @@ mod tests {
 
     #[test]
     fn byte_range_parses_dash_form() {
-        let range: ByteRange = " 100-199 ".parse().unwrap();
-        assert_eq!((range.start(), range.end(), range.size()), (100, 199, 100));
-        assert_eq!(range.to_string(), "100-199");
-        assert_eq!(ByteRange::new(5, 5).map(ByteRange::size), Some(1));
-        assert_eq!(ByteRange::new(5, 4), None);
+        let range = parse_byte_range(" 100-199 ").unwrap();
+        assert_eq!(range, 100..=199);
+        assert_eq!(
+            Fragment::with_range("a", range.clone()).known_size(),
+            Some(100)
+        );
+        assert_eq!(Fragment::with_range("a", 5..=5).known_size(), Some(1));
         for invalid in ["", "5", "5-", "-5", "9-3", "a-b"] {
             assert!(
-                matches!(invalid.parse::<ByteRange>(), Err(Error::InvalidByteRange(value)) if value == invalid),
+                matches!(parse_byte_range(invalid), Err(Error::InvalidByteRange(value)) if value == invalid),
                 "{invalid:?} should be rejected"
             );
         }
@@ -2385,13 +2377,13 @@ mod tests {
         file: &'static [u8],
     ) -> impl Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync {
         move |fragment: &Fragment, _expected_len: Option<u64>| {
-            let range = fragment.range.expect("test fragments are ranged");
-            Ok(file[range.start() as usize..=range.end() as usize].to_vec())
+            let range = fragment.range.as_ref().expect("test fragments are ranged");
+            Ok(file[*range.start() as usize..=*range.end() as usize].to_vec())
         }
     }
 
     fn ranged(url: &str, start: u64, end: u64) -> Fragment {
-        Fragment::with_range(url, ByteRange::new(start, end).unwrap())
+        Fragment::with_range(url, start..=end)
     }
 
     #[test]
@@ -2399,7 +2391,7 @@ mod tests {
         const FILE: &[u8] = b"INITaaaaBBBBBBcc";
         let allow_media = Arc::new(AtomicBool::new(false));
         let head_calls = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec![
                 ranged("file", 0, 3),
                 ranged("file", 4, 7),
@@ -2413,7 +2405,7 @@ mod tests {
                 let get = ranged_get(FILE);
                 move |fragment: &Fragment, expected_len: Option<u64>| {
                     assert_eq!(expected_len, fragment.known_size());
-                    if fragment.range.unwrap().start() > 0 {
+                    if *fragment.range.as_ref().unwrap().start() > 0 {
                         while !allow_media.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(5));
                         }
@@ -2443,7 +2435,7 @@ mod tests {
 
     #[test]
     fn ranged_fragment_with_wrong_length_fails() {
-        let result = MpegStreamReader::new_with_get_head(
+        let result = closure_reader(
             vec![ranged("file", 0, 7)],
             None,
             false,
@@ -2456,11 +2448,15 @@ mod tests {
                 if fragment == "file (bytes 0-7)"
         ));
 
-        let mut reader = MpegStreamReader::new_with_get_head(
+        let mut reader = closure_reader(
             vec![ranged("file", 0, 3), ranged("file", 4, 7)],
             None,
             false,
-            |fragment: &Fragment, _expected_len: Option<u64>| match fragment.range.unwrap().start()
+            |fragment: &Fragment, _expected_len: Option<u64>| match *fragment
+                .range
+                .as_ref()
+                .unwrap()
+                .start()
             {
                 0 => Ok(b"INIT".to_vec()),
                 _ => Ok(b"short".to_vec()),
@@ -2492,14 +2488,14 @@ mod tests {
                 let mut header = String::new();
                 while reader.read_line(&mut header).unwrap() > 2 {
                     if let Some(value) = header.to_ascii_lowercase().strip_prefix("range: bytes=") {
-                        range = Some(value.trim().parse::<ByteRange>().unwrap());
+                        range = Some(parse_byte_range(value).unwrap());
                     }
                     header.clear();
                 }
                 let (status, body) = match range {
                     Some(range) if request_line.starts_with("GET /ranged ") => (
                         "206 Partial Content",
-                        &FILE[range.start() as usize..=range.end() as usize],
+                        &FILE[*range.start() as usize..=*range.end() as usize],
                     ),
                     _ => ("200 OK", FILE),
                 };
