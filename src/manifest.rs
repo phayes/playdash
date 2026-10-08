@@ -9,12 +9,47 @@ use crate::manifest_template::{Segments, TemplateChain, TemplateValues};
 use crate::stream::{Fragment, FragmentCache, MediaTimeline, StreamReader, Transport};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use dash_mpd_core::{
-    AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation, SegmentList,
+    AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation as CoreRepresentation,
+    SegmentList,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use ureq::ResponseExt;
 use url::Url;
+
+/// A representation available for streaming from a [`DashManifest`].
+///
+/// This is a lightweight view of the selection details applications commonly
+/// need. Use [`DashManifest::representations`] to list available
+/// representations and pass [`Self::id`] to [`DashManifest::stream`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use playdash::DashManifest;
+///
+/// # fn example() -> Result<(), playdash::Error> {
+/// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
+/// for representation in manifest.representations() {
+///     println!("{}: {:?}", representation.id, representation.codecs);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Representation<'a> {
+    /// ID accepted by [`DashManifest::stream`] and related selection methods.
+    pub id: &'a str,
+
+    /// Advertised bitrate in bits per second, when present.
+    pub bandwidth: Option<u64>,
+
+    /// Codec description, inherited from the adaptation set when necessary.
+    pub codecs: Option<&'a str>,
+
+    /// MIME type, inherited from the adaptation set when necessary.
+    pub mime_type: Option<&'a str>,
+}
 
 /// A parsed MPEG-DASH manifest and the entry point for selecting and streaming
 /// its representations.
@@ -66,7 +101,7 @@ struct Selected<'a> {
     period: &'a Period,
     next_period: Option<&'a Period>,
     adaptation: &'a AdaptationSet,
-    representation: &'a Representation,
+    representation: &'a CoreRepresentation,
 }
 
 fn decode_data_url(data_url: &str) -> Result<String, Error> {
@@ -186,6 +221,22 @@ impl<'a> Selected<'a> {
             .or(self.adaptation.mimeType.as_deref())
     }
 
+    fn codecs(self) -> Option<&'a str> {
+        self.representation
+            .codecs
+            .as_deref()
+            .or(self.adaptation.codecs.as_deref())
+    }
+
+    fn summary(self) -> Representation<'a> {
+        Representation {
+            id: self.id(),
+            bandwidth: self.representation.bandwidth,
+            codecs: self.codecs(),
+            mime_type: self.mime_type(),
+        }
+    }
+
     fn protection_scheme(self) -> Option<String> {
         common_encryption_scheme(&self.representation.ContentProtection)
             .or_else(|| common_encryption_scheme(&self.adaptation.ContentProtection))
@@ -296,7 +347,7 @@ impl DashManifest {
         }
         if manifest
             .representations()
-            .any(|representation| representation.id.as_deref().is_none_or(str::is_empty))
+            .any(|representation| representation.id.is_empty())
         {
             return Err(Error::DashManifestMissingRepresentationId);
         }
@@ -417,7 +468,7 @@ impl DashManifest {
     /// for representation in manifest.representations() {
     ///     println!(
     ///         "{}: {:?} bps",
-    ///         representation.id.as_deref().unwrap_or("<unnamed>"),
+    ///         representation.id,
     ///         representation.bandwidth,
     ///     );
     /// }
@@ -426,8 +477,7 @@ impl DashManifest {
     ///     .representations()
     ///     .find(|representation| representation.bandwidth.is_some())
     ///     .expect("manifest has no streamable representation");
-    /// let representation_id = representation.id.as_deref().expect("IDs are validated");
-    /// let stream = manifest.stream(representation_id, true)?;
+    /// let stream = manifest.stream(representation.id, true)?;
     /// # drop(stream);
     /// # Ok(())
     /// # }
@@ -471,8 +521,8 @@ impl DashManifest {
     /// Use this to inspect the available IDs, codecs, and bitrates before
     /// selecting one with [`DashManifest::stream`] or
     /// [`DashManifest::representation`].
-    pub fn representations(&self) -> impl Iterator<Item = &Representation> {
-        self.selections().map(|selected| selected.representation)
+    pub fn representations(&self) -> impl Iterator<Item = Representation<'_>> {
+        self.selections().map(Selected::summary)
     }
 
     /// Finds a representation by ID.
@@ -481,9 +531,8 @@ impl DashManifest {
     /// representation ID. If that misses, a second pass matches the format
     /// token before the first comma. Both comparisons are case-insensitive. The
     /// first match in document order wins.
-    pub fn representation(&self, representation_id: impl AsRef<str>) -> Option<&Representation> {
-        self.find(representation_id.as_ref())
-            .map(|selected| selected.representation)
+    pub fn representation(&self, representation_id: impl AsRef<str>) -> Option<Representation<'_>> {
+        self.find(representation_id.as_ref()).map(Selected::summary)
     }
 
     /// Initialization fragment followed by media segment fragments in timeline order.
@@ -642,13 +691,14 @@ mod tests {
         assert_eq!(manifest.representations().count(), 2);
 
         let flac = manifest.representation("FLAC").unwrap();
-        assert_eq!(flac.id.as_deref(), Some("FLAC,44100,16"));
-        assert_eq!(flac.codecs.as_deref(), Some("flac"));
+        assert_eq!(flac.id, "FLAC,44100,16");
+        assert_eq!(flac.codecs, Some("flac"));
         assert_eq!(flac.bandwidth, Some(1_411_200));
-        assert_eq!(flac.BaseURL[0].base, "https://media.example/audio/");
-        assert_eq!(manifest.mime_type("FLAC").unwrap(), Some("audio/mp4"));
+        assert_eq!(flac.mime_type, Some("audio/mp4"));
 
-        let template = flac.SegmentTemplate.as_ref().unwrap();
+        let core = manifest.find("FLAC").unwrap().representation;
+        assert_eq!(core.BaseURL[0].base, "https://media.example/audio/");
+        let template = core.SegmentTemplate.as_ref().unwrap();
         assert_eq!(template.initialization.as_deref(), Some("init.mp4"));
         assert_eq!(template.media.as_deref(), Some("segment_$Number$.m4s"));
         assert_eq!(template.timescale, Some(48_000));
@@ -656,7 +706,7 @@ mod tests {
         assert_eq!(template.startNumber, Some(1));
 
         let aac = manifest.representation("AACLC").unwrap();
-        assert_eq!(aac.codecs.as_deref(), Some("mp4a.40.2"));
+        assert_eq!(aac.codecs, Some("mp4a.40.2"));
         assert_eq!(aac.bandwidth, Some(320_000));
         assert!(matches!(
             manifest.fragments("FLAC"),
@@ -830,7 +880,7 @@ mod tests {
             </MPD>
         "#;
         let manifest = DashManifest::new(xml).unwrap();
-        let id_of = |id: &str| manifest.representation(id).unwrap().id.as_deref().unwrap();
+        let id_of = |id: &str| manifest.representation(id).unwrap().id;
 
         assert_eq!(id_of("FLAC_HIRES,48000,24"), "FLAC_HIRES,48000,24");
         assert_eq!(id_of("flac,44100,16"), "FLAC,44100,16");

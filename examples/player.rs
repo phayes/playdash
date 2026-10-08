@@ -68,7 +68,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             .next()
             .ok_or("MPEG-DASH manifest contains no representations")?,
     };
-    let id = representation.id.as_deref().unwrap_or_default();
+    let id = representation.id;
     let bitrate = representation
         .bandwidth
         .ok_or_else(|| format!("representation {id} has no bandwidth"))?;
@@ -76,7 +76,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!(
         "playing {} ({}, {} bps)",
         id,
-        representation.codecs.as_deref().unwrap_or("unknown codec"),
+        representation.codecs.unwrap_or("unknown codec"),
         bitrate
     );
     print_keys();

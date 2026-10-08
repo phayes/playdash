@@ -18,7 +18,7 @@ pub use cenc::ContentKeys;
 #[doc(inline)]
 pub use error::Error;
 #[doc(inline)]
-pub use manifest::DashManifest;
+pub use manifest::{DashManifest, Representation};
 #[cfg(feature = "rodio")]
 #[doc(inline)]
 pub use rodio::DashSource;
