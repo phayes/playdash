@@ -138,3 +138,18 @@ cargo run --example player -- --id 4 https://storage.googleapis.com/shaka-demo-a
 # DASH-IF test vector, Elephants Dream, HE-AAC, SegmentBase; audio is listed first
 cargo run --example player -- https://dash.akamaized.net/dash264/TestCases/1a/netflix/exMPD_BIP_TC1.mpd
 ```
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/phayes/playdash/blob/master/LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](https://github.com/phayes/playdash/blob/master/LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
+any additional terms or conditions.

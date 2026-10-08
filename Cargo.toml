@@ -3,14 +3,14 @@ name = "playdash"
 version = "0.1.0"
 authors = ["Patrick Hayes <patrick.d.hayes@gmail.com>"]
 description = "Parse MPEG-DASH manifests and set them up for progressive streaming playback"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 edition = "2024"
 repository = "https://github.com/phayes/playdash"
 homepage = "https://github.com/phayes/playdash"
 documentation = "https://docs.rs/playdash"
 readme = "README.md"
-keywords = ["dash", "mpeg-dash", "streaming", "audio"]
-categories = ["multimedia::audio", "parser-implementations"]
+keywords = ["dash", "mpeg-dash", "streaming", "rodio"]
+categories = ["multimedia::audio"]
 
 [dependencies]
 aes = { version = "0.9", optional = true }
