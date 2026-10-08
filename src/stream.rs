@@ -1,14 +1,15 @@
 //! Progressive in-memory reader over MPEG-DASH fragments.
 
+use crate::buffer::BufferHandle;
 #[cfg(feature = "encryption")]
 use crate::cenc::{self, ContentKeys, FragmentRole};
 use crate::error::Error;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 /// Media-segment timing used to map playback positions to fragments.
@@ -55,18 +56,28 @@ impl MediaTimeline {
         Some(Duration::new(seconds, nanos))
     }
 
-    fn fragment_start(&self, fragment_index: usize) -> Option<Duration> {
-        if fragment_index == 0 || fragment_index > self.media_durations.len() {
-            return None;
-        }
-        let ticks: u64 = self.media_durations[..fragment_index - 1]
+    /// Media time spanned by each media fragment, in playback order. Empty
+    /// if the timescale is zero.
+    pub(crate) fn spans(&self) -> Vec<Range<Duration>> {
+        let mut ticks = 0u64;
+        self.media_durations
             .iter()
-            .copied()
-            .sum();
-        self.ticks_to_duration(ticks)
+            .map_while(|&duration| {
+                let start = self.ticks_to_duration(ticks)?;
+                ticks = ticks.saturating_add(duration);
+                Some(start..self.ticks_to_duration(ticks)?)
+            })
+            .collect()
     }
 
-    fn total_duration(&self) -> Option<Duration> {
+    /// Start of the fragment at `fragment_index`, counting the
+    /// initialization fragment as index zero.
+    fn fragment_start(&self, fragment_index: usize) -> Option<Duration> {
+        let media_index = fragment_index.checked_sub(1)?;
+        Some(self.spans().get(media_index)?.start)
+    }
+
+    pub(crate) fn total_duration(&self) -> Option<Duration> {
         self.ticks_to_duration(self.media_durations.iter().copied().sum())
     }
 
@@ -299,7 +310,7 @@ impl Transport for ureq::Agent {
 /// length once a range, HEAD or GET establishes it. Shared by every reader of
 /// a [`FragmentCache`]; each value is set at most once.
 #[derive(Debug)]
-struct FragmentData {
+pub(crate) struct FragmentData {
     fragment: Fragment,
     body: OnceLock<Arc<[u8]>>,
     /// Length from HEAD, before the body arrives.
@@ -316,7 +327,7 @@ struct FragmentData {
 }
 
 impl FragmentData {
-    fn new(fragment: Fragment) -> Self {
+    pub(crate) fn new(fragment: Fragment) -> Self {
         Self {
             fragment,
             body: OnceLock::new(),
@@ -328,12 +339,17 @@ impl FragmentData {
         }
     }
 
-    fn body(&self) -> Option<&Arc<[u8]>> {
+    pub(crate) fn body(&self) -> Option<&Arc<[u8]>> {
         self.body.get()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_body(&self, body: &[u8]) {
+        self.body.set(body.into()).expect("body set once");
+    }
+
     /// Byte length from the range, else the body, else a probe.
-    fn size(&self) -> Option<u64> {
+    pub(crate) fn size(&self) -> Option<u64> {
         self.fragment
             .known_size()
             .or_else(|| self.body().map(|body| body.len() as u64))
@@ -364,6 +380,9 @@ impl FragmentData {
 pub struct FragmentCache {
     transport: Arc<dyn Transport>,
     fragments: Mutex<HashMap<Fragment, Arc<FragmentData>>>,
+    /// Called after a fragment's body or size becomes known. Held weakly, so
+    /// a listener lives as long as its subscriber keeps it.
+    listeners: Mutex<Vec<Weak<dyn CacheListener>>>,
     #[cfg(feature = "encryption")]
     keys: Option<Arc<ContentKeys>>,
 }
@@ -374,6 +393,7 @@ impl FragmentCache {
         Self {
             transport,
             fragments: Mutex::default(),
+            listeners: Mutex::default(),
             #[cfg(feature = "encryption")]
             keys: None,
         }
@@ -421,8 +441,31 @@ impl FragmentCache {
             .unwrap_or_else(|error| error.into_inner())
     }
 
+    /// Tells `listener` after any fragment's body or size becomes known, on
+    /// the thread that learned it, until `listener` is dropped.
+    pub(crate) fn subscribe(&self, listener: Weak<dyn CacheListener>) {
+        self.listeners
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(listener);
+    }
+
+    fn notify(&self, data: &FragmentData) {
+        let listeners: Vec<_> = {
+            let mut listeners = self
+                .listeners
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            listeners.retain(|listener| listener.strong_count() > 0);
+            listeners.iter().filter_map(Weak::upgrade).collect()
+        };
+        for listener in listeners {
+            listener.fragment_changed(data);
+        }
+    }
+
     /// The shared entry for `fragment`, created empty if new.
-    fn data(&self, fragment: Fragment) -> Arc<FragmentData> {
+    pub(crate) fn data(&self, fragment: Fragment) -> Arc<FragmentData> {
         self.lock()
             .entry(fragment)
             .or_insert_with_key(|fragment| Arc::new(FragmentData::new(fragment.clone())))
@@ -456,7 +499,9 @@ impl FragmentCache {
         }
         #[cfg(feature = "encryption")]
         let body = self.decrypt(data, body)?;
-        Ok(data.body.get_or_init(|| body).clone())
+        let body = data.body.get_or_init(|| body).clone();
+        self.notify(data);
+        Ok(body)
     }
 
     /// Decrypts `body` in place according to `data`'s role. Same length out
@@ -526,9 +571,16 @@ impl FragmentCache {
         if data.size().is_none() {
             let size = self.transport.head(&data.fragment)?;
             data.probed_size.get_or_init(|| size);
+            self.notify(data);
         }
         Ok(())
     }
+}
+
+/// Subscriber to a [`FragmentCache`]; see [`FragmentCache::subscribe`].
+pub(crate) trait CacheListener: Send + Sync {
+    /// `data`'s body or size has just become known.
+    fn fragment_changed(&self, data: &FragmentData);
 }
 
 impl Default for FragmentCache {
@@ -809,6 +861,14 @@ impl StreamReader {
             reader.start_eager_head();
         }
         Ok(reader)
+    }
+
+    /// A handle reporting how much of this reader's media its cache holds.
+    /// `None` if the reader has no timeline.
+    pub fn buffer(&self) -> Option<BufferHandle> {
+        let timeline = self.timeline.as_ref()?;
+        let media = self.shared.lock().fragments[1..].to_vec();
+        Some(BufferHandle::new(&self.shared.cache, media, timeline))
     }
 
     /// Starts background HEAD prefetch of unknown fragment sizes.
@@ -1315,6 +1375,7 @@ impl Drop for StreamReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BufferStatus;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
     use std::time::Duration;
@@ -2774,6 +2835,55 @@ mod tests {
         assert_eq!(transport.gets(), ["init", "a", "b"]);
         assert_eq!(cache.known_size(&"a".into()), Some(1));
         assert!(transport.heads().is_empty());
+    }
+
+    #[test]
+    fn buffer_reports_cache_changes() {
+        let (cache, transport) = counting_cache(&["bb"]);
+        let reader = StreamReader::new_with_cache(
+            vec!["init".into(), "aa".into(), "bb".into()],
+            Some(MediaTimeline {
+                timescale: 10,
+                media_durations: vec![10, 10],
+            }),
+            false,
+            cache,
+        )
+        .unwrap();
+        let buffer = reader.buffer().unwrap();
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        buffer.on_change({
+            let reported = reported.clone();
+            move |status: &BufferStatus| reported.lock().unwrap().push(status.clone())
+        });
+
+        // "bb" is held back, so only the first one-second fragment is here.
+        wait_for(|| buffer.status().downloaded.fragments == 1);
+        let status = buffer.status();
+        assert_eq!(status.total.fragments, 2);
+        assert_eq!(status.total.time, Duration::from_secs(2));
+        assert_eq!(status.ranges, [Duration::ZERO..Duration::from_secs(1)]);
+
+        transport.released.store(true, Ordering::SeqCst);
+        wait_for(|| {
+            reported
+                .lock()
+                .unwrap()
+                .iter()
+                .any(BufferStatus::is_complete)
+        });
+        let status = buffer.status();
+        assert_eq!(status.ranges, [Duration::ZERO..Duration::from_secs(2)]);
+        assert_eq!(status.downloaded.bytes, 4);
+    }
+
+    #[test]
+    fn buffer_needs_a_timeline() {
+        let (cache, _transport) = counting_cache(&[]);
+        let reader =
+            StreamReader::new_with_cache(vec!["init".into(), "a".into()], None, false, cache)
+                .unwrap();
+        assert!(reader.buffer().is_none());
     }
 
     #[test]

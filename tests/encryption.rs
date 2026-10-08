@@ -3,12 +3,13 @@
 #![cfg(all(feature = "encryption", feature = "rodio"))]
 
 use playdash::{
-    ContentKeys, DashManifest, DashSource, Error, Fragment, FragmentCache, StreamReader, Transport,
+    BufferStatus, ContentKeys, DashManifest, DashSource, Error, Fragment, FragmentCache,
+    StreamReader, Transport,
 };
 use rodio::{Decoder, Source};
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 const KID: &str = "0123456789abcdef0123456789abcdef";
@@ -31,6 +32,61 @@ impl Transport for Fixtures {
             Some(range) => body[*range.start() as usize..=*range.end() as usize].into(),
             None => body.into(),
         })
+    }
+}
+
+/// Serves fixtures like [`Fixtures`], but holds back the last media fragment
+/// until opened.
+#[derive(Default)]
+struct Gated {
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl Gated {
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+impl Transport for Gated {
+    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
+        if fragment.url.ends_with("_3.m4s") {
+            let open = self.open.lock().unwrap();
+            drop(self.opened.wait_while(open, |open| !*open).unwrap());
+        }
+        Fixtures.get(fragment, size_hint)
+    }
+}
+
+/// Collects the statuses a buffer handle reports.
+#[derive(Default)]
+struct Reports {
+    statuses: Mutex<Vec<BufferStatus>>,
+    reported: Condvar,
+}
+
+impl Reports {
+    fn push(&self, status: &BufferStatus) {
+        self.statuses.lock().unwrap().push(status.clone());
+        self.reported.notify_all();
+    }
+
+    /// The first report matching `ready`, waiting up to five seconds.
+    fn wait_for(&self, ready: impl Fn(&BufferStatus) -> bool) -> BufferStatus {
+        let statuses = self.statuses.lock().unwrap();
+        let (statuses, _) = self
+            .reported
+            .wait_timeout_while(statuses, Duration::from_secs(5), |statuses| {
+                !statuses.iter().any(&ready)
+            })
+            .unwrap();
+        statuses
+            .iter()
+            .find(|status| ready(status))
+            .expect("no matching buffer report")
+            .clone()
     }
 }
 
@@ -135,6 +191,37 @@ fn seeks_within_decrypted_stream() {
     let expected_start = 700 * 22_050 / 1000;
     assert!(tail.len().abs_diff(plain.len() - expected_start) <= 1);
     assert_eq!(tail, plain[plain.len() - tail.len()..]);
+}
+
+#[test]
+fn buffer_reports_downloads() {
+    let gated = Arc::new(Gated::default());
+    let cache = Arc::new(FragmentCache::new(gated.clone()).with_keys(keys()));
+    let source = DashSource::new_with_cache(&manifest("shaka_cbcs.mpd"), "0", cache).unwrap();
+    let buffer = source.buffer();
+    let reports = Arc::new(Reports::default());
+    buffer.on_change({
+        let reports = reports.clone();
+        move |status| reports.push(status)
+    });
+
+    // The last of three half-second fragments is held back.
+    let status = buffer.status();
+    assert_eq!(status.total.fragments, 3);
+    assert_eq!(status.total.time, Duration::from_millis(1500));
+    assert!(!status.is_complete());
+
+    gated.open();
+    let complete = reports.wait_for(BufferStatus::is_complete);
+    assert_eq!(
+        complete.ranges,
+        [Duration::ZERO..Duration::from_millis(1500)]
+    );
+    assert_eq!(complete.total.bytes, Some(complete.downloaded.bytes));
+    assert_eq!(
+        complete.buffered_until(Duration::from_millis(1200)),
+        Duration::from_millis(1500)
+    );
 }
 
 #[test]

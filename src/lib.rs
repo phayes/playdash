@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
+mod buffer;
 #[cfg(feature = "encryption")]
 mod cenc;
 mod error;
@@ -12,6 +13,8 @@ mod manifest_template;
 mod rodio;
 mod stream;
 
+#[doc(inline)]
+pub use buffer::{BufferAmount, BufferHandle, BufferStatus, BufferTotal};
 #[cfg(feature = "encryption")]
 #[doc(inline)]
 pub use cenc::ContentKeys;

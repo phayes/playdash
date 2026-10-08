@@ -2,7 +2,9 @@
 
 #[cfg(feature = "encryption")]
 use crate::ContentKeys;
-use crate::{DashManifest, Error, Fragment, FragmentCache, MediaTimeline, StreamReader};
+use crate::{
+    BufferHandle, DashManifest, Error, Fragment, FragmentCache, MediaTimeline, StreamReader,
+};
 use ::rodio::{Decoder, Source, source::SeekError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,6 +99,18 @@ impl DashSource {
         })
     }
 
+    /// A handle reporting how much of this source's stream its cache holds.
+    ///
+    /// Get it before handing the source to rodio; it stays usable from any
+    /// thread afterwards. Plays no part in playback.
+    pub fn buffer(&self) -> BufferHandle {
+        let media = self.fragments[1..]
+            .iter()
+            .map(|fragment| self.cache.data(fragment.clone()))
+            .collect();
+        BufferHandle::new(&self.cache, media, &self.timeline)
+    }
+
     fn build_decoder(
         fragments: &[Fragment],
         cache: &Arc<FragmentCache>,
@@ -124,7 +138,7 @@ impl DashSource {
     }
 
     fn total_duration_value(&self) -> Duration {
-        timeline_duration(&self.timeline)
+        self.timeline.total_duration().unwrap_or_default()
     }
 
     fn seek_target(&self, requested: Duration) -> (usize, Duration, Duration) {
@@ -200,50 +214,14 @@ impl Source for DashSource {
     }
 }
 
-fn duration_from_ticks(ticks: u64, timescale: u32) -> Duration {
-    let timescale = u64::from(timescale);
-    Duration::new(
-        ticks / timescale,
-        (u128::from(ticks % timescale) * 1_000_000_000 / u128::from(timescale)) as u32,
-    )
-}
-
-fn duration_to_ticks(duration: Duration, timescale: u32) -> u64 {
-    let ticks = duration.as_nanos().saturating_mul(u128::from(timescale)) / 1_000_000_000;
-    u64::try_from(ticks).unwrap_or(u64::MAX)
-}
-
-fn timeline_duration(timeline: &MediaTimeline) -> Duration {
-    duration_from_ticks(
-        timeline.media_durations.iter().copied().sum(),
-        timeline.timescale,
-    )
-}
-
 fn seek_target(timeline: &MediaTimeline, requested: Duration) -> (usize, Duration, Duration) {
-    let target = requested.min(timeline_duration(timeline));
-    let target_ticks = duration_to_ticks(target, timeline.timescale);
-    let total_ticks: u64 = timeline.media_durations.iter().copied().sum();
-    let mut start_ticks = 0u64;
-
-    for (index, duration) in timeline.media_durations.iter().copied().enumerate() {
-        let end_ticks = start_ticks.saturating_add(duration);
-        if target_ticks < end_ticks
-            || (target_ticks == total_ticks && index + 1 == timeline.media_durations.len())
-        {
-            let fragment_start = duration_from_ticks(start_ticks, timeline.timescale);
-            return (index, fragment_start, target);
-        }
-        start_ticks = end_ticks;
-    }
-
-    let last = timeline.media_durations.len() - 1;
-    let last_start: u64 = timeline.media_durations[..last].iter().copied().sum();
-    (
-        last,
-        duration_from_ticks(last_start, timeline.timescale),
-        target,
-    )
+    let spans = timeline.spans();
+    let target = requested.min(spans.last().map_or(Duration::ZERO, |span| span.end));
+    // The end of the stream seeks into the last fragment.
+    let index = spans
+        .partition_point(|span| span.end <= target)
+        .min(spans.len() - 1);
+    (index, spans[index].start, target)
 }
 
 #[cfg(test)]

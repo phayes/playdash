@@ -61,6 +61,31 @@ player.sleep_until_end();
 # }
 ```
 
+## Buffer progress
+
+`StreamReader::buffer` returns a handle that reports how much of the stream its cache holds, in fragments, bytes and media time. `DashSource::buffer` reports the same for a rodio source. 
+
+```rust,no_run
+use playdash::{DashManifest, DashSource};
+
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
+let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
+let source = DashSource::new(&manifest, "FLAC")?;
+
+// Called after each fragment downloads or has its size learned.
+source.buffer().on_change(|status| {
+    println!(
+        "{:.0}% downloaded, {} of {} fragments, in ranges {:?}",
+        status.downloaded_percent(),
+        status.downloaded.fragments,
+        status.total.fragments,
+        status.ranges,
+    );
+});
+# Ok(())
+# }
+```
+
 ## Encrypted streams
 
 The `encryption` feature decrypts ISO Common Encryption (`cenc` and `cbcs`) in pure Rust, given
