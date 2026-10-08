@@ -3,11 +3,15 @@
 use std::time::Duration;
 
 use crate::error::Error;
+use crate::manifest_segment_base::BaseChain;
 use crate::manifest_segment_list::ListChain;
 use crate::manifest_template::{Segments, TemplateChain, TemplateValues};
-use crate::stream::{Fragment, FragmentCache, MediaTimeline, MpegStreamReader};
+use crate::stream::{Fragment, FragmentCache, MediaTimeline, MpegStreamReader, Transport};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use dash_mpd_core::{AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation};
+use dash_mpd_core::{
+    AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation, SegmentList,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use ureq::ResponseExt;
 use url::Url;
@@ -19,6 +23,9 @@ pub struct DashManifest {
     pub mpd: MPD,
     /// Where the manifest was fetched from; the root of `BaseURL` resolution.
     base_url: Option<Url>,
+    /// Why each `SegmentBase` index that failed to load did so, by
+    /// representation ID; reported when that representation is streamed.
+    segment_index_errors: HashMap<String, String>,
 }
 
 /// A representation together with the elements it inherits attributes from.
@@ -72,6 +79,53 @@ impl<'a> Selected<'a> {
         ])
     }
 
+    /// Segment bases from the most to the least specific level.
+    fn bases(self) -> BaseChain<'a> {
+        BaseChain::new([
+            self.representation.SegmentBase.as_ref(),
+            self.adaptation.SegmentBase.as_ref(),
+            self.period.SegmentBase.as_ref(),
+        ])
+    }
+
+    /// Whether only `SegmentBase` addresses this representation, so its
+    /// segments must come from the `sidx` index in the media file.
+    fn needs_segment_index(self) -> bool {
+        let (representation, adaptation, period) =
+            (self.representation, self.adaptation, self.period);
+        let explicit = representation.SegmentList.is_some()
+            || representation.SegmentTemplate.is_some()
+            || adaptation.SegmentList.is_some()
+            || adaptation.SegmentTemplate.is_some()
+            || period.SegmentList.is_some()
+            || period.SegmentTemplate.is_some();
+        !explicit && self.bases().is_present()
+    }
+
+    /// The `SegmentList` equivalent of this representation's `SegmentBase`
+    /// index, or `None` if it does not need one or its URL is relative and
+    /// there is no manifest URL yet.
+    fn segment_index(
+        self,
+        manifest_url: Option<&Url>,
+        transport: &dyn Transport,
+    ) -> Result<Option<SegmentList>, Error> {
+        if !self.needs_segment_index() {
+            return Ok(None);
+        }
+        let url = match self.base_url(manifest_url) {
+            Ok(Some(url)) => url,
+            Ok(None) | Err(Error::DashManifestUrl(_, url::ParseError::RelativeUrlWithoutBase))
+                if manifest_url.is_none() =>
+            {
+                return Ok(None);
+            }
+            Ok(None) => return Err(Error::DashManifestMissingUrls),
+            Err(error) => return Err(error),
+        };
+        self.bases().segment_list(url.as_str(), transport).map(Some)
+    }
+
     /// Whether the most specific level with segment addressing uses a
     /// `SegmentList` rather than a `SegmentTemplate`.
     fn uses_segment_list(self) -> bool {
@@ -120,6 +174,12 @@ impl<'a> Selected<'a> {
     }
 
     fn segments(self) -> Result<Segments, Error> {
+        if self.needs_segment_index() {
+            return Err(Error::DashManifestInvalidSegments(
+                "SegmentBase index not loaded: its URL is relative and the manifest has no base URL"
+                    .to_owned(),
+            ));
+        }
         if self.uses_segment_list() {
             self.lists().segments(self.period_duration())
         } else {
@@ -188,10 +248,18 @@ impl DashManifest {
     /// Relative segment and `BaseURL` references cannot be resolved without
     /// knowing where the manifest came from; use [`DashManifest::new_from_url`]
     /// or [`DashManifest::with_base_url`] for those manifests.
+    ///
+    /// Representations addressed only by `SegmentBase` have their `sidx`
+    /// index fetched over HTTP and rewritten as an equivalent `SegmentList`.
+    /// Those with relative URLs are fetched by [`DashManifest::with_base_url`]
+    /// instead. An index that fails to load is logged and does not fail the
+    /// manifest; streaming that representation returns
+    /// [`Error::DashManifestSegmentIndex`].
     pub fn new(dash_xml: impl AsRef<str>) -> Result<Self, Error> {
-        let manifest = Self {
+        let mut manifest = Self {
             mpd: dash_mpd_core::parse(dash_xml.as_ref())?,
             base_url: None,
+            segment_index_errors: HashMap::new(),
         };
 
         if manifest.selections().next().is_none() {
@@ -204,7 +272,58 @@ impl DashManifest {
             return Err(Error::DashManifestMissingRepresentationId);
         }
 
+        manifest.load_segment_indexes();
         Ok(manifest)
+    }
+
+    /// Fetches the `sidx` of every `SegmentBase` representation whose URL
+    /// resolves, through a default [`ureq::Agent`].
+    fn load_segment_indexes(&mut self) {
+        if self.selections().any(Selected::needs_segment_index) {
+            self.load_segment_indexes_with(&ureq::Agent::new_with_defaults());
+        }
+    }
+
+    /// Rewrites each `SegmentBase` index fetched through `transport` as a
+    /// `SegmentList` on its representation.
+    ///
+    /// A representation whose index fails to load is left as it was, and the
+    /// error is kept to report if that representation is streamed, so one bad
+    /// index does not fail the whole manifest.
+    fn load_segment_indexes_with(&mut self, transport: &dyn Transport) {
+        let mut failures = Vec::new();
+        let lists: Vec<_> = self
+            .selections()
+            .map(|selected| {
+                selected
+                    .segment_index(self.base_url.as_ref(), transport)
+                    .unwrap_or_else(|error| {
+                        #[cfg(feature = "log")]
+                        log::warn!(
+                            "SegmentBase index for representation {} failed to load: {error}",
+                            selected.id()
+                        );
+                        failures.push((selected.id().to_owned(), error.to_string()));
+                        None
+                    })
+            })
+            .collect();
+        let representations = self
+            .mpd
+            .periods
+            .iter_mut()
+            .flat_map(|period| &mut period.adaptations)
+            .flat_map(|adaptation| &mut adaptation.representations);
+        // `selections` yields representations in this same document order.
+        for (representation, list) in representations.zip(lists) {
+            if list.is_some() {
+                if let Some(id) = &representation.id {
+                    self.segment_index_errors.remove(id);
+                }
+                representation.SegmentList = list;
+            }
+        }
+        self.segment_index_errors.extend(failures);
     }
 
     /// Decodes a base64 `data:` URL and parses the embedded MPEG-DASH XML.
@@ -233,9 +352,11 @@ impl DashManifest {
 
     /// Sets the absolute URL the manifest was loaded from.
     ///
-    /// Relative `BaseURL` and segment references resolve against it.
+    /// Relative `BaseURL` and segment references resolve against it, and any
+    /// `SegmentBase` index that needed it is fetched now.
     pub fn with_base_url(mut self, url: &str) -> Result<Self, Error> {
         self.base_url = Some(resolve_url(None, url)?);
+        self.load_segment_indexes();
         Ok(self)
     }
 
@@ -283,8 +404,7 @@ impl DashManifest {
     }
 
     fn stream_parts(&self, id: &str) -> Result<(Vec<Fragment>, MediaTimeline), Error> {
-        let selected = self.select(id)?;
-        let segments = selected.segments()?;
+        let (selected, segments) = self.select_segments(id)?;
         let fragments = selected.fragments(self.base_url.as_ref(), &segments)?;
         Ok((fragments, segments.media_timeline()))
     }
@@ -311,13 +431,13 @@ impl DashManifest {
     /// `SegmentList` (whose entries may carry byte ranges), with URLs resolved
     /// against the `BaseURL` chain and [`DashManifest::base_url`].
     pub fn fragments(&self, id: impl AsRef<str>) -> Result<Vec<Fragment>, Error> {
-        let selected = self.select(id.as_ref())?;
-        selected.fragments(self.base_url.as_ref(), &selected.segments()?)
+        let (selected, segments) = self.select_segments(id.as_ref())?;
+        selected.fragments(self.base_url.as_ref(), &segments)
     }
 
     /// Media-segment durations in timeline order, with the DASH timescale.
     pub fn media_timeline(&self, id: impl AsRef<str>) -> Result<MediaTimeline, Error> {
-        Ok(self.select(id.as_ref())?.segments()?.media_timeline())
+        Ok(self.select_segments(id.as_ref())?.1.media_timeline())
     }
 
     /// MIME type of a representation, inherited from its adaptation set if absent.
@@ -360,6 +480,21 @@ impl DashManifest {
                 self.selections()
                     .find(|selected| representation_token(selected.id()).eq_ignore_ascii_case(id))
             })
+    }
+
+    /// A representation and its media segments, or the error that kept its
+    /// `SegmentBase` index from loading.
+    fn select_segments(&self, id: &str) -> Result<(Selected<'_>, Segments), Error> {
+        let selected = self.select(id)?;
+        if selected.needs_segment_index()
+            && let Some(reason) = self.segment_index_errors.get(selected.id())
+        {
+            return Err(Error::DashManifestSegmentIndex {
+                representation: selected.id().to_owned(),
+                reason: reason.clone(),
+            });
+        }
+        Ok((selected, selected.segments()?))
     }
 
     fn select(&self, id: &str) -> Result<Selected<'_>, Error> {
@@ -1070,6 +1205,168 @@ mod tests {
                 Fragment::new("https://cdn.example/1.m4s"),
             ]
         );
+    }
+
+    /// Serves byte ranges of one in-memory file and records each request.
+    struct OneFile {
+        body: Vec<u8>,
+        requests: std::sync::Mutex<Vec<Fragment>>,
+    }
+
+    impl crate::Transport for OneFile {
+        fn get(&self, fragment: &Fragment, _size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
+            self.requests.lock().unwrap().push(fragment.clone());
+            let range = fragment
+                .range
+                .clone()
+                .unwrap_or(0..=self.body.len() as u64 - 1);
+            Ok(self.body[*range.start() as usize..=*range.end() as usize].into())
+        }
+    }
+
+    /// An 838-byte initialization, a `sidx` for two subsegments, then their media.
+    fn segment_base_file() -> (Vec<u8>, String) {
+        let sidx =
+            crate::manifest_segment_base::tests::sidx(0, 44_100, 0, &[(100, 4096), (50, 1024)]);
+        let index_range = format!("838-{}", 838 + sidx.len() - 1);
+        let mut body = vec![b'i'; 838];
+        body.extend(sidx);
+        body.extend([b'a'; 100]);
+        body.extend([b'b'; 50]);
+        (body, index_range)
+    }
+
+    fn segment_base_manifest(segment_base: &str) -> DashManifest {
+        let manifest = DashManifest::new(format!(
+            r#"<MPD><Period><AdaptationSet mimeType="audio/mp4"><Representation id="FLAC">
+                <BaseURL>track.mp4</BaseURL>{segment_base}
+            </Representation></AdaptationSet></Period></MPD>"#
+        ))
+        .unwrap();
+        // The relative BaseURL defers the index fetch until a base URL is known.
+        assert!(matches!(
+            manifest.fragments("FLAC"),
+            Err(Error::DashManifestInvalidSegments(reason)) if reason.contains("not loaded")
+        ));
+        manifest
+    }
+
+    #[test]
+    fn segment_base_index_becomes_ranged_fragments() {
+        use std::io::Read;
+
+        let (body, index_range) = segment_base_file();
+        let index_start = *parse_range(&index_range).start();
+        let index_end = *parse_range(&index_range).end();
+        let mut manifest =
+            segment_base_manifest(&format!(r#"<SegmentBase indexRange="{index_range}"/>"#));
+        manifest.base_url = Some(Url::parse("https://cdn.example/audio/").unwrap());
+        let transport = Arc::new(OneFile {
+            body: body.clone(),
+            requests: Default::default(),
+        });
+        manifest.load_segment_indexes_with(transport.as_ref());
+
+        let url = "https://cdn.example/audio/track.mp4";
+        assert_eq!(
+            *transport.requests.lock().unwrap(),
+            [ranged(url, index_start, index_end)]
+        );
+        // Without an Initialization element, everything before the index is the init.
+        assert_eq!(
+            manifest.fragments("FLAC").unwrap(),
+            [
+                ranged(url, 0, 837),
+                ranged(url, index_end + 1, index_end + 100),
+                ranged(url, index_end + 101, index_end + 150),
+            ]
+        );
+        assert_eq!(
+            manifest.media_timeline("FLAC").unwrap(),
+            MediaTimeline {
+                timescale: 44_100,
+                media_durations: vec![4096, 1024],
+            }
+        );
+
+        let mut reader = manifest
+            .stream_with_cache("FLAC", false, Arc::new(FragmentCache::new(transport)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        let mut expected = body[..838].to_vec();
+        expected.extend(&body[index_end as usize + 1..]);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn segment_base_keeps_its_initialization_element() {
+        let (body, index_range) = segment_base_file();
+        let mut manifest = segment_base_manifest(&format!(
+            r#"<SegmentBase indexRange="{index_range}"><Initialization range="0-99"/></SegmentBase>"#
+        ));
+        manifest.base_url = Some(Url::parse("https://cdn.example/").unwrap());
+        manifest.load_segment_indexes_with(&OneFile {
+            body,
+            requests: Default::default(),
+        });
+        assert_eq!(
+            manifest.fragments("FLAC").unwrap()[0],
+            ranged("https://cdn.example/track.mp4", 0, 99)
+        );
+    }
+
+    #[test]
+    fn failed_segment_base_index_only_fails_its_representation() {
+        let mut manifest = DashManifest::new(
+            r#"<MPD><Period><AdaptationSet mimeType="audio/mp4">
+                <Representation id="FLAC">
+                    <BaseURL>track.mp4</BaseURL><SegmentBase indexRange="0-9"/>
+                </Representation>
+                <Representation id="AACLC">
+                    <SegmentTemplate initialization="init" media="$Number$">
+                        <SegmentTimeline><S d="1"/></SegmentTimeline>
+                    </SegmentTemplate>
+                </Representation>
+            </AdaptationSet></Period></MPD>"#,
+        )
+        .unwrap();
+        manifest.base_url = Some(Url::parse("https://cdn.example/").unwrap());
+        let transport = OneFile {
+            body: vec![0; 10],
+            requests: Default::default(),
+        };
+        manifest.load_segment_indexes_with(&transport);
+
+        let error = manifest.fragments("FLAC").unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::DashManifestSegmentIndex { representation, reason }
+                if representation == "FLAC" && reason.contains("no sidx box")
+        ));
+        assert!(matches!(
+            manifest.media_timeline("FLAC"),
+            Err(Error::DashManifestSegmentIndex { .. })
+        ));
+        assert_eq!(manifest.mime_type("FLAC").unwrap(), Some("audio/mp4"));
+        assert_eq!(manifest.fragments("AACLC").unwrap().len(), 2);
+
+        // A later successful load clears the failure.
+        let (body, index_range) = segment_base_file();
+        manifest.mpd.periods[0].adaptations[0].representations[0]
+            .SegmentBase
+            .as_mut()
+            .unwrap()
+            .indexRange = Some(index_range);
+        manifest.load_segment_indexes_with(&OneFile {
+            body,
+            requests: Default::default(),
+        });
+        assert_eq!(manifest.fragments("FLAC").unwrap().len(), 3);
+    }
+
+    fn parse_range(value: &str) -> std::ops::RangeInclusive<u64> {
+        crate::stream::parse_byte_range(value).unwrap()
     }
 
     #[test]

@@ -4,7 +4,6 @@
 use std::time::Duration;
 
 use dash_mpd_core::{SegmentList, SegmentURL};
-use log::warn;
 
 use crate::error::Error;
 use crate::manifest_template::{Addressing, Segments, Timing, initialization_fragment};
@@ -67,8 +66,9 @@ impl<'a> ListChain<'a> {
         }
         .segments(period_duration)?;
 
+        #[cfg(feature = "log")]
         if (segments.segments.len() as u64) < count {
-            warn!(
+            log::warn!(
                 "SegmentList timing covers {} of {count} SegmentURL elements; ignoring the rest",
                 segments.segments.len()
             );

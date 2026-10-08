@@ -96,7 +96,12 @@ outside a `senc` box are not supported.
 
 ## Caveats
 
-`SegmentBase` and multi-period playback and live (`type="dynamic"`) manifests are not yet supported. Contributions
+For `SegmentBase` representations, `DashManifest` fetches the `sidx` index with an HTTP `Range`
+request while parsing, or in `with_base_url` when the media URL is relative. An index that
+fails to load is logged (with the default `log` feature) and only reported when that representation is streamed. Hierarchical
+`sidx` indexes are not supported.
+
+Multi-period playback and live (`type="dynamic"`) manifests are not yet supported. Contributions
 to improve this are very welcome.
 
 ## Example player

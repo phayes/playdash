@@ -3,7 +3,6 @@
 #[cfg(feature = "encryption")]
 use crate::cenc::{self, ContentKeys, FragmentRole};
 use crate::error::Error;
-use log::warn;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -218,7 +217,10 @@ impl Transport for ureq::Agent {
         response.into_body().into_reader().read_to_end(&mut bytes)?;
         match &fragment.range {
             Some(range) if !partial => {
-                warn!("server ignored the Range request for {fragment}; slicing the full body");
+                #[cfg(feature = "log")]
+                log::warn!(
+                    "server ignored the Range request for {fragment}; slicing the full body"
+                );
                 Ok(slice_range(&bytes, range).unwrap_or(&bytes).into())
             }
             _ => Ok(bytes.into()),
@@ -576,10 +578,12 @@ impl ReaderState {
             .is_some_and(|data| data.body().is_none())
     }
 
+    #[cfg_attr(not(feature = "log"), allow(unused_variables))]
     fn disable_head(&mut self, reason: &str) {
         if self.head_available {
             self.head_available = false;
-            warn!("MPEG stream disabling HEAD size probes: {reason}");
+            #[cfg(feature = "log")]
+            log::warn!("MPEG stream disabling HEAD size probes: {reason}");
         }
     }
 

@@ -4,6 +4,7 @@
 mod cenc;
 pub mod error;
 pub mod manifest;
+mod manifest_segment_base;
 mod manifest_segment_list;
 mod manifest_template;
 #[cfg(feature = "rodio")]

@@ -52,6 +52,18 @@ pub enum Error {
     #[error("Invalid MPEG-DASH segment addressing: {0}")]
     DashManifestInvalidSegments(String),
 
+    /// A representation's `SegmentBase` index could not be fetched or parsed
+    /// when the manifest was loaded
+    #[error(
+        "MPEG-DASH SegmentBase index for representation {representation} failed to load: {reason}"
+    )]
+    DashManifestSegmentIndex {
+        /// The representation ID
+        representation: String,
+        /// Why the index failed to load
+        reason: String,
+    },
+
     /// A MPEG-DASH URL could not be parsed or resolved against its BaseURL chain
     #[error("Cannot resolve MPEG-DASH URL {0}: {1}")]
     DashManifestUrl(String, #[source] url::ParseError),

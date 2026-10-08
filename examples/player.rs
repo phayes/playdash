@@ -6,6 +6,27 @@
 //!
 //! `MANIFEST` is an `http(s)` URL, MPEG-DASH XML, a `data:` URL, a file path, or
 //! omitted to read stdin.
+//!
+//! Without `--id` the first representation in the manifest plays. Most public
+//! test streams list video first, so pass the id of an audio representation.
+//! These public test streams play:
+//!
+//! ```text
+//! # Big Buck Bunny, HE-AAC, SegmentTemplate with $Number$
+//! cargo run --example player -- --id bbb_a64k https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd
+//!
+//! # Envivio, AAC-LC, 48 kHz, SegmentTemplate with $Number$
+//! cargo run --example player -- --id v4_258 https://dash.akamaized.net/envivio/EnvivioDash3/manifest.mpd
+//!
+//! # Shaka Player's "Angel One", AAC-LC, SegmentBase (sidx index)
+//! cargo run --example player -- --id 4 https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd
+//!
+//! # DASH-IF test vector, Elephants Dream, HE-AAC, SegmentBase; audio is listed first
+//! cargo run --example player -- https://dash.akamaized.net/dash264/TestCases/1a/netflix/exMPD_BIP_TC1.mpd
+//! ```
+//!
+//! Symphonia decodes only the AAC-LC core of HE-AAC streams, so they play at
+//! half the sample rate without the SBR high band.
 
 use std::error::Error;
 use std::fs;
