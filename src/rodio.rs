@@ -1,6 +1,6 @@
 //! Rodio source support for progressive, unprotected MPEG-DASH playback.
 
-use crate::{DashManifest, Error, MediaTimeline, MpegStreamReader};
+use crate::{DashManifest, Error, Fragment, FragmentCache, MediaTimeline, MpegStreamReader};
 use ::rodio::{Decoder, Source, source::SeekError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,10 +11,14 @@ use std::time::Duration;
 /// stream, so it does not require a total byte length. Seeking rebuilds the
 /// decoder with the initialization fragment followed by the media fragment
 /// containing the requested timestamp and the remaining media fragments.
+/// Every rebuild shares one [`FragmentCache`], so seeks reuse pooled
+/// connections and never re-download the initialization segment or fragments
+/// that already arrived.
 /// Common-encryption schemes such as `cenc` and `cbcs` are rejected because
 /// rodio and Symphonia do not provide DRM decryption.
 pub struct DashSource {
-    urls: Vec<String>,
+    fragments: Vec<Fragment>,
+    cache: Arc<FragmentCache>,
     timeline: MediaTimeline,
     mime_type: String,
     decoder: Decoder<MpegStreamReader>,
@@ -24,13 +28,25 @@ impl DashSource {
     /// Opens a representation from `manifest` for progressive rodio playback.
     ///
     /// `id` uses the same full-ID or format-token matching as
-    /// [`DashManifest::representation`].
+    /// [`DashManifest::representation`]. Fetches through a new
+    /// [`FragmentCache`] dedicated to this source.
     pub fn new(manifest: &DashManifest, id: impl AsRef<str>) -> Result<Self, Error> {
+        Self::new_with_cache(manifest, id, Arc::default())
+    }
+
+    /// Like [`DashSource::new`], but fetches through `cache`, for a custom
+    /// [`crate::Transport`] or to share connections and downloaded fragments
+    /// with other sources.
+    pub fn new_with_cache(
+        manifest: &DashManifest,
+        id: impl AsRef<str>,
+        cache: Arc<FragmentCache>,
+    ) -> Result<Self, Error> {
         let id = id.as_ref();
         if let Some(scheme) = manifest.protection_scheme(id)? {
             return Err(Error::RodioProtectedContent(scheme));
         }
-        let urls = manifest.fragment_urls(id)?;
+        let fragments = manifest.fragments(id)?;
         let timeline = manifest.media_timeline(id)?;
         if timeline.timescale == 0 {
             return Err(Error::StreamInitializationError(
@@ -38,10 +54,11 @@ impl DashSource {
             ));
         }
         let mime_type = manifest.mime_type(id)?.unwrap_or_default().to_owned();
-        let decoder = Self::build_decoder(&urls, &timeline, &mime_type, 0)?;
+        let decoder = Self::build_decoder(&fragments, &cache, &timeline, &mime_type, 0)?;
 
         Ok(Self {
-            urls,
+            fragments,
+            cache,
             timeline,
             mime_type,
             decoder,
@@ -49,14 +66,15 @@ impl DashSource {
     }
 
     fn build_decoder(
-        urls: &[String],
+        fragments: &[Fragment],
+        cache: &Arc<FragmentCache>,
         timeline: &MediaTimeline,
         mime_type: &str,
         media_index: usize,
     ) -> Result<Decoder<MpegStreamReader>, Error> {
-        let mut selected_urls = Vec::with_capacity(urls.len() - media_index);
-        selected_urls.push(urls[0].clone());
-        selected_urls.extend_from_slice(&urls[media_index + 1..]);
+        let mut selected = Vec::with_capacity(fragments.len() - media_index);
+        selected.push(fragments[0].clone());
+        selected.extend_from_slice(&fragments[media_index + 1..]);
 
         let selected_timeline = MediaTimeline {
             timescale: timeline.timescale,
@@ -64,7 +82,12 @@ impl DashSource {
         };
         // The decoder is unseekable and seeks rebuild by timeline, so byte
         // sizes from eager HEADs would go unused.
-        let reader = MpegStreamReader::new(selected_urls, Some(selected_timeline), false)?;
+        let reader = MpegStreamReader::new_with_cache(
+            selected,
+            Some(selected_timeline),
+            false,
+            cache.clone(),
+        )?;
 
         Ok(Decoder::builder()
             .with_data(reader)
@@ -112,9 +135,14 @@ impl Source for DashSource {
 
     fn try_seek(&mut self, requested: Duration) -> Result<(), SeekError> {
         let (media_index, fragment_start, target) = self.seek_target(requested);
-        let mut decoder =
-            Self::build_decoder(&self.urls, &self.timeline, &self.mime_type, media_index)
-                .map_err(|error| SeekError::Other(Arc::new(error)))?;
+        let mut decoder = Self::build_decoder(
+            &self.fragments,
+            &self.cache,
+            &self.timeline,
+            &self.mime_type,
+            media_index,
+        )
+        .map_err(|error| SeekError::Other(Arc::new(error)))?;
 
         let frames_to_skip = target
             .saturating_sub(fragment_start)
@@ -193,6 +221,7 @@ fn seek_target(timeline: &MediaTimeline, requested: Duration) -> (usize, Duratio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Transport;
 
     fn timeline() -> MediaTimeline {
         MediaTimeline {
@@ -236,6 +265,51 @@ mod tests {
         assert!(matches!(
             DashSource::new(&manifest, "FLAC"),
             Err(Error::RodioProtectedContent(scheme)) if scheme == "cbcs"
+        ));
+    }
+
+    #[test]
+    fn new_with_cache_fetches_through_its_transport() {
+        struct Offline;
+
+        impl Transport for Offline {
+            fn get(
+                &self,
+                fragment: &Fragment,
+                _size_hint: Option<u64>,
+            ) -> Result<Arc<[u8]>, Error> {
+                Err(Error::StreamInitializationError(format!(
+                    "offline: {fragment}"
+                )))
+            }
+        }
+
+        let manifest = DashManifest::new(
+            r#"
+            <MPD>
+                <Period>
+                    <AdaptationSet mimeType="audio/mp4">
+                        <Representation id="FLAC" codecs="flac">
+                            <SegmentTemplate initialization="https://cdn.example/init.mp4"
+                                media="https://cdn.example/$Number$.mp4">
+                                <SegmentTimeline><S d="1"/></SegmentTimeline>
+                            </SegmentTemplate>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            DashSource::new_with_cache(
+                &manifest,
+                "FLAC",
+                Arc::new(FragmentCache::new(Arc::new(Offline)))
+            ),
+            Err(Error::StreamInitializationError(message))
+                if message == "offline: https://cdn.example/init.mp4"
         ));
     }
 }

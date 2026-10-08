@@ -2,9 +2,12 @@
 
 use crate::error::Error;
 use log::warn;
+use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 /// Media-segment durations used to map playback time onto downloaded fragments.
@@ -98,8 +101,325 @@ pub enum TimeAccuracy {
     Coarse,
 }
 
-type GetFn = Arc<dyn Fn(String, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync>;
-type HeadFn = Arc<dyn Fn(String) -> Result<u64, Error> + Send + Sync>;
+/// Inclusive byte range within a resource, as in an HTTP `Range` header or a
+/// DASH `@mediaRange` / `@range` attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+impl ByteRange {
+    /// Range covering `start..=end`, or `None` if `end < start`.
+    pub fn new(start: u64, end: u64) -> Option<Self> {
+        (start <= end).then_some(Self { start, end })
+    }
+
+    /// First byte offset.
+    pub fn start(self) -> u64 {
+        self.start
+    }
+
+    /// Last byte offset (inclusive).
+    pub fn end(self) -> u64 {
+        self.end
+    }
+
+    /// Number of bytes covered. Ranges are never empty.
+    pub fn size(self) -> u64 {
+        self.end - self.start + 1
+    }
+}
+
+impl fmt::Display for ByteRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.start, self.end)
+    }
+}
+
+impl FromStr for ByteRange {
+    type Err = Error;
+
+    /// Parses the DASH and HTTP `first-last` form, such as `"0-837"`.
+    fn from_str(value: &str) -> Result<Self, Error> {
+        value
+            .trim()
+            .split_once('-')
+            .and_then(|(start, end)| Self::new(start.parse().ok()?, end.parse().ok()?))
+            .ok_or_else(|| Error::InvalidByteRange(value.to_owned()))
+    }
+}
+
+/// One piece of the concatenated stream: a URL, optionally narrowed to a byte range.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Fragment {
+    /// Absolute URL of the resource.
+    pub url: String,
+    /// Byte range within the resource, or `None` for the whole body.
+    pub range: Option<ByteRange>,
+}
+
+impl Fragment {
+    /// The whole body at `url`.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            range: None,
+        }
+    }
+
+    /// The bytes of `url` covered by `range`.
+    pub fn with_range(url: impl Into<String>, range: ByteRange) -> Self {
+        Self {
+            url: url.into(),
+            range: Some(range),
+        }
+    }
+
+    /// Byte length, when the range makes it known in advance.
+    pub fn known_size(&self) -> Option<u64> {
+        self.range.map(ByteRange::size)
+    }
+}
+
+impl From<String> for Fragment {
+    fn from(url: String) -> Self {
+        Self::new(url)
+    }
+}
+
+impl From<&str> for Fragment {
+    fn from(url: &str) -> Self {
+        Self::new(url)
+    }
+}
+
+impl fmt::Display for Fragment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.range {
+            Some(range) => write!(f, "{} (bytes {range})", self.url),
+            None => f.write_str(&self.url),
+        }
+    }
+}
+
+/// Fetches fragment bodies and sizes for a [`FragmentCache`].
+///
+/// [`ureq::Agent`] implements this with its connection pool.
+pub trait Transport: Send + Sync {
+    /// Body of `fragment`.
+    ///
+    /// Must honor [`Fragment::range`] and return exactly those bytes; a ranged
+    /// body of any other length fails the stream. `size_hint` is the length
+    /// when already known, for preallocating the body.
+    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error>;
+
+    /// Byte length of `fragment`, typically from a HEAD `Content-Length`.
+    ///
+    /// Never called for ranged fragments, whose sizes are already known. An
+    /// error disables HEAD probing for the stream; the default always errors.
+    fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
+        Err(Error::StreamInitializationError(format!(
+            "transport cannot HEAD {fragment}"
+        )))
+    }
+}
+
+impl Transport for ureq::Agent {
+    /// Sends a `Range` header for ranged fragments; if a server ignores it and
+    /// returns the whole body, the range is sliced out of that body.
+    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
+        let mut request = ureq::Agent::get(self, &fragment.url);
+        if let Some(range) = fragment.range {
+            request = request.header(ureq::http::header::RANGE, format!("bytes={range}"));
+        }
+        let response = request.call()?;
+        let partial = response.status() == ureq::http::StatusCode::PARTIAL_CONTENT;
+        let mut bytes = size_hint
+            .and_then(|len| usize::try_from(len).ok())
+            .map(Vec::with_capacity)
+            .unwrap_or_default();
+        response.into_body().into_reader().read_to_end(&mut bytes)?;
+        match fragment.range {
+            Some(range) if !partial => {
+                warn!("server ignored the Range request for {fragment}; slicing the full body");
+                Ok(slice_range(&bytes, range).unwrap_or(&bytes).into())
+            }
+            _ => Ok(bytes.into()),
+        }
+    }
+
+    fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
+        let url = &fragment.url;
+        let response = ureq::Agent::head(self, url).call()?;
+        response
+            .headers()
+            .get(ureq::http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                Error::StreamInitializationError(format!(
+                    "HEAD for {url} did not return Content-Length"
+                ))
+            })
+    }
+}
+
+/// What is known about one [`Fragment`]: its body once fetched, and its
+/// length once a range, HEAD or GET establishes it. Shared by every reader of
+/// a [`FragmentCache`]; each value is set at most once.
+#[derive(Debug)]
+struct FragmentData {
+    fragment: Fragment,
+    body: OnceLock<Arc<[u8]>>,
+    /// Length from HEAD, before the body arrives.
+    probed_size: OnceLock<u64>,
+    /// Held across a GET so a second reader waits for that download instead
+    /// of starting its own.
+    get_lock: Mutex<()>,
+}
+
+impl FragmentData {
+    fn new(fragment: Fragment) -> Self {
+        Self {
+            fragment,
+            body: OnceLock::new(),
+            probed_size: OnceLock::new(),
+            get_lock: Mutex::new(()),
+        }
+    }
+
+    fn body(&self) -> Option<&Arc<[u8]>> {
+        self.body.get()
+    }
+
+    /// Byte length from the range, else the body, else a probe.
+    fn size(&self) -> Option<u64> {
+        self.fragment
+            .known_size()
+            .or_else(|| self.body().map(|body| body.len() as u64))
+            .or_else(|| self.probed_size.get().copied())
+    }
+}
+
+/// Fragment bodies and lengths, keyed by [`Fragment`], and the [`Transport`]
+/// that fetches them.
+///
+/// Use this to share caches across multiple readers that read the same stream, 
+/// such as a reader rebuilt after a seek.
+pub struct FragmentCache {
+    transport: Arc<dyn Transport>,
+    fragments: Mutex<HashMap<Fragment, Arc<FragmentData>>>,
+}
+
+impl FragmentCache {
+    /// An empty cache that fetches through `transport`.
+    pub fn new(transport: Arc<dyn Transport>) -> Self {
+        Self {
+            transport,
+            fragments: Mutex::default(),
+        }
+    }
+
+    /// The body of `fragment`, if it has been fetched.
+    pub fn cached(&self, fragment: &Fragment) -> Option<Arc<[u8]>> {
+        self.lock().get(fragment)?.body().cloned()
+    }
+
+    /// The byte length of `fragment`, if its range, a HEAD or a GET has
+    /// established it.
+    pub fn known_size(&self, fragment: &Fragment) -> Option<u64> {
+        fragment
+            .known_size()
+            .or_else(|| self.lock().get(fragment)?.size())
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<Fragment, Arc<FragmentData>>> {
+        self.fragments
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// The shared entry for `fragment`, created empty if new.
+    fn data(&self, fragment: Fragment) -> Arc<FragmentData> {
+        self.lock()
+            .entry(fragment)
+            .or_insert_with_key(|fragment| Arc::new(FragmentData::new(fragment.clone())))
+            .clone()
+    }
+
+    /// The body of `data`, fetching it unless it is cached or another reader
+    /// is already fetching it. A ranged body of the wrong length is an error
+    /// and is not cached.
+    fn get(&self, data: &FragmentData) -> Result<Arc<[u8]>, Error> {
+        if let Some(body) = data.body() {
+            return Ok(body.clone());
+        }
+        let _in_flight = data
+            .get_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(body) = data.body() {
+            return Ok(body.clone());
+        }
+        let fragment = &data.fragment;
+        let body = self.transport.get(fragment, data.size())?;
+        if let Some(expected) = fragment.known_size()
+            && body.len() as u64 != expected
+        {
+            return Err(Error::FragmentLength {
+                fragment: fragment.to_string(),
+                expected,
+                actual: body.len() as u64,
+            });
+        }
+        Ok(data.body.get_or_init(|| body).clone())
+    }
+
+    /// HEADs `data` unless its size is already known.
+    fn probe(&self, data: &FragmentData) -> Result<(), Error> {
+        if data.size().is_none() {
+            let size = self.transport.head(&data.fragment)?;
+            data.probed_size.get_or_init(|| size);
+        }
+        Ok(())
+    }
+}
+
+impl Default for FragmentCache {
+    /// Fetches through a ureq agent with this crate's connection-pool settings.
+    fn default() -> Self {
+        Self::new(Arc::new(ureq_agent()))
+    }
+}
+
+impl fmt::Debug for FragmentCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FragmentCache")
+            .field("fragments", &self.lock().len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Adapts GET and HEAD closures for [`MpegStreamReader::new_with_get_head`].
+struct FnTransport<G, H> {
+    get: G,
+    head: H,
+}
+
+impl<G, H> Transport for FnTransport<G, H>
+where
+    G: Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync,
+    H: Fn(&Fragment) -> Result<u64, Error> + Send + Sync,
+{
+    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
+        (self.get)(fragment, size_hint).map(Arc::from)
+    }
+
+    fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
+        (self.head)(fragment)
+    }
+}
 
 /// How long to keep an idle HTTP connection in the ureq pool.
 ///
@@ -115,11 +435,20 @@ fn ureq_agent() -> ureq::Agent {
     )
 }
 
+/// The `range` bytes of a full body, for servers that answer a Range request with 200.
+fn slice_range(body: &[u8], range: ByteRange) -> Option<&[u8]> {
+    let start = usize::try_from(range.start()).ok()?;
+    let end = usize::try_from(range.end()).ok()?;
+    body.get(start..=end)
+}
+
 /// Progressive in-memory reader over MPEG-DASH fragments.
 ///
-/// Fragments are stored sparsely (`Option` per URL). The initialization
-/// segment is index `0`, followed by media segments in `SegmentTimeline`
-/// order. [`Read`] blocks until the current fragment slot is filled.
+/// Bodies live in a [`FragmentCache`], which can be shared across readers. The
+/// initialization segment is index `0`, followed by media segments in
+/// timeline order.
+/// Ranged fragments have known sizes up front and are fetched with HTTP
+/// `Range` requests. [`Read`] blocks until the current fragment slot is filled.
 ///
 /// Use [`Self::seek_bytes`] for exact offsets in the concatenated byte
 /// stream. When HEAD probes are available, `seek_bytes` discovers fragment
@@ -136,7 +465,7 @@ fn ureq_agent() -> ureq::Agent {
 /// return an oversized length estimate without waiting for every fragment.
 #[derive(Debug)]
 pub struct MpegStreamReader {
-    cache: Arc<MpegCache>,
+    shared: Arc<ReaderShared>,
     byte_position: Option<u64>,
     fragment_index: usize,
     offset_in_fragment: usize,
@@ -147,27 +476,22 @@ pub struct MpegStreamReader {
     length_estimate: Option<u64>,
 }
 
-struct MpegCache {
-    inner: Mutex<MpegCacheInner>,
+/// A reader's state, shared with its GET and HEAD worker threads.
+#[derive(Debug)]
+struct ReaderShared {
+    state: Mutex<ReaderState>,
+    /// Notified after every change to `state`, or to a body or size in
+    /// `state.fragments` written by this reader's threads.
     condvar: Condvar,
     cancelled: AtomicBool,
-    head: HeadFn,
+    cache: Arc<FragmentCache>,
 }
 
-impl std::fmt::Debug for MpegCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MpegCache")
-            .field("cancelled", &self.cancelled)
-            .finish_non_exhaustive()
-    }
-}
-
+/// Which fragments a reader wants and how its workers schedule them.
 #[derive(Debug)]
-struct MpegCacheInner {
-    urls: Vec<String>,
-    fragments: Vec<Option<Vec<u8>>>,
-    /// Known byte length per fragment (from HEAD and/or GET).
-    sizes: Vec<Option<u64>>,
+struct ReaderState {
+    /// Initialization fragment, then media fragments in timeline order.
+    fragments: Vec<Arc<FragmentData>>,
     /// When false, byte seeks wait on downloaded bodies instead of HEAD.
     head_available: bool,
     /// Background HEAD prefetch is wanted. Does not gate on-demand seek HEADs.
@@ -181,13 +505,15 @@ struct MpegCacheInner {
     error: Option<String>,
 }
 
-impl MpegCacheInner {
-    fn all_filled(&self) -> bool {
-        self.fragments.iter().all(|fragment| fragment.is_some())
+impl ReaderState {
+    fn all_sizes_known(&self) -> bool {
+        self.total_len().is_some()
     }
 
-    fn all_sizes_known(&self) -> bool {
-        self.sizes.iter().all(|size| size.is_some())
+    fn missing_body(&self, index: usize) -> bool {
+        self.fragments
+            .get(index)
+            .is_some_and(|data| data.body().is_none())
     }
 
     fn disable_head(&mut self, reason: &str) {
@@ -197,47 +523,38 @@ impl MpegCacheInner {
         }
     }
 
-    fn next_get(&mut self) -> Option<(usize, String, Option<u64>)> {
-        if let Some(priority) = self.priority.take()
-            && self
-                .fragments
-                .get(priority)
-                .is_some_and(|fragment| fragment.is_none())
-        {
-            return Some(self.get_work(priority));
-        }
+    fn next_get(&mut self) -> Option<(usize, Arc<FragmentData>)> {
         let cursor = self.cursor_fragment.min(self.fragments.len());
-        if let Some(offset) = self.fragments[cursor..]
-            .iter()
-            .position(|fragment| fragment.is_none())
-        {
-            return Some(self.get_work(cursor + offset));
-        }
-        self.fragments[..cursor]
-            .iter()
-            .position(|fragment| fragment.is_none())
-            .map(|index| self.get_work(index))
+        let index = self
+            .priority
+            .take()
+            .filter(|&priority| self.missing_body(priority))
+            .or_else(|| {
+                (cursor..self.fragments.len())
+                    .chain(0..cursor)
+                    .find(|&index| self.missing_body(index))
+            })?;
+        Some((index, self.fragments[index].clone()))
     }
 
-    fn get_work(&self, index: usize) -> (usize, String, Option<u64>) {
-        (index, self.urls[index].clone(), self.sizes[index])
-    }
-
-    fn next_head(&self) -> Option<(usize, String)> {
+    fn next_head(&self) -> Option<(usize, Arc<FragmentData>)> {
         if !self.head_available {
             return None;
         }
-        self.sizes
+        let index = self
+            .fragments
             .iter()
-            .position(|size| size.is_none())
-            .map(|index| (index, self.urls[index].clone()))
+            .position(|data| data.size().is_none())?;
+        Some((index, self.fragments[index].clone()))
+    }
+
+    /// Sum of the first `count` fragment sizes, if all are known.
+    fn prefix_len(&self, count: usize) -> Option<u64> {
+        self.fragments[..count].iter().map(|data| data.size()).sum()
     }
 
     fn total_len(&self) -> Option<u64> {
-        if !self.all_sizes_known() {
-            return None;
-        }
-        Some(self.sizes.iter().map(|size| size.unwrap_or(0)).sum())
+        self.prefix_len(self.fragments.len())
     }
 
     // TODO: Publish a media fragment's leading `moof` as soon as those bytes
@@ -245,18 +562,16 @@ impl MpegCacheInner {
     // and the first packet only need the `moof`; `Read` currently blocks until
     // this method sees the whole GET. Stream the body, parse top-level box
     // sizes, and wake readers once the `moof` is complete.
-    fn store_fragment(&mut self, index: usize, chunk: Vec<u8>) {
-        let len = chunk.len() as u64;
-        if let Some(expected) = self.sizes[index]
-            && expected != len
+    /// Stops trusting HEAD if fragment `index`'s body disagrees with its probe.
+    fn check_probe(&mut self, index: usize) {
+        let data = &self.fragments[index];
+        if let (Some(&expected), Some(body)) = (data.probed_size.get(), data.body())
+            && expected != body.len() as u64
         {
+            let len = body.len();
             self.disable_head(&format!(
                 "GET length {len} != HEAD length {expected} for fragment {index}"
             ));
-        }
-        self.sizes[index] = Some(len);
-        if self.fragments[index].is_none() {
-            self.fragments[index] = Some(chunk);
         }
     }
 
@@ -264,117 +579,88 @@ impl MpegCacheInner {
     /// sizes covering that offset are known.
     fn resolve_cursor(&self, target: u64) -> Option<(usize, usize)> {
         let mut acc = 0u64;
-        for (index, size) in self.sizes.iter().enumerate() {
-            let Some(len) = *size else {
-                return None;
-            };
+        for (index, data) in self.fragments.iter().enumerate() {
+            let len = data.size()?;
             if target < acc + len {
                 return Some((index, (target - acc) as usize));
             }
             acc += len;
         }
 
-        if self.sizes.is_empty() {
-            return Some((0, 0));
-        }
-        let last = self.sizes.len() - 1;
-        let len = self.sizes[last].unwrap_or(0) as usize;
-        Some((last, len))
+        let last = self.fragments.len().checked_sub(1)?;
+        Some((last, self.fragments[last].size().unwrap_or(0) as usize))
     }
 }
 
 impl MpegStreamReader {
-    /// Downloads the first fragment with the default ureq transport, then fills
+    /// Downloads the first fragment with a new ureq agent, then fills
     /// remaining slots on background threads.
     ///
     /// The initialization GET runs first so its TLS session is established
     /// before any other request. A GET worker then downloads bodies at or
     /// ahead of the read cursor, and only backfills earlier holes when the
-    /// suffix is complete. When `eager_head` is set, a second ureq agent
-    /// HEADs remaining URLs on its own connection to fill the size list;
-    /// otherwise prefetch starts stopped (see [`Self::start_eager_head`]).
-    /// If HEAD fails or later disagrees with GET, HEAD probing is disabled.
+    /// suffix is complete. When `eager_head` is set, a HEAD worker fills the
+    /// size list on its own pooled connection; otherwise prefetch starts
+    /// stopped (see [`Self::start_eager_head`]). If HEAD fails or later
+    /// disagrees with GET, HEAD probing is disabled. See
+    /// [`Self::new_with_cache`] to share connections and downloaded bodies
+    /// across readers.
     pub fn new(
-        urls: Vec<String>,
+        fragments: Vec<Fragment>,
         timeline: Option<MediaTimeline>,
         eager_head: bool,
     ) -> Result<Self, Error> {
-        let get_agent = ureq_agent();
-        let head_agent = ureq_agent();
-        Self::new_with_get_head(
-            urls,
-            timeline,
-            eager_head,
-            move |url, expected_len| {
-                let mut bytes = expected_len
-                    .and_then(|len| usize::try_from(len).ok())
-                    .map(Vec::with_capacity)
-                    .unwrap_or_default();
-                get_agent
-                    .get(&url)
-                    .call()?
-                    .into_body()
-                    .into_reader()
-                    .read_to_end(&mut bytes)?;
-                Ok(bytes)
-            },
-            move |url| {
-                let response = head_agent.head(&url).call()?;
-                response
-                    .headers()
-                    .get(ureq::http::header::CONTENT_LENGTH)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .ok_or_else(|| {
-                        Error::StreamInitializationError(format!(
-                            "HEAD for {url} did not return Content-Length"
-                        ))
-                    })
-            },
-        )
+        Self::new_with_cache(fragments, timeline, eager_head, Arc::default())
     }
 
-    /// Creates a reader with custom GET and HEAD implementations.
+    /// Creates a reader with custom GET and HEAD closures.
     ///
-    /// `head` should return the fragment byte length (typically from
-    /// `Content-Length`). After the initialization GET, a dedicated HEAD
-    /// worker rips through unknown sizes if `eager_head` is set; otherwise no
-    /// worker is spawned until [`Self::start_eager_head`]. On-demand HEADs
-    /// from byte seeks run either way. If HEAD fails or later disagrees
-    /// with GET, HEAD probing is disabled for the rest of the stream.
-    ///
-    /// `get` receives that known length as `Some` when a prior HEAD already
-    /// filled `sizes`; use it to preallocate the body buffer.
+    /// The closures behave as [`Transport::get`] and [`Transport::head`].
     pub fn new_with_get_head<G, H>(
-        urls: Vec<String>,
+        fragments: Vec<Fragment>,
         timeline: Option<MediaTimeline>,
         eager_head: bool,
         get: G,
         head: H,
     ) -> Result<Self, Error>
     where
-        G: Fn(String, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync + 'static,
-        H: Fn(String) -> Result<u64, Error> + Send + Sync + 'static,
+        G: Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync + 'static,
+        H: Fn(&Fragment) -> Result<u64, Error> + Send + Sync + 'static,
     {
-        if urls.is_empty() {
+        let cache = FragmentCache::new(Arc::new(FnTransport { get, head }));
+        Self::new_with_cache(fragments, timeline, eager_head, Arc::new(cache))
+    }
+
+    /// Creates a reader that fetches through `cache`.
+    ///
+    /// The initialization fragment is fetched before returning. After that, a
+    /// dedicated HEAD worker rips through unknown sizes if `eager_head` is
+    /// set; otherwise no worker is spawned until [`Self::start_eager_head`].
+    /// On-demand HEADs from byte seeks run either way. If HEAD fails or later
+    /// disagrees with GET, HEAD probing is disabled for the rest of the stream.
+    /// Sizes known from a fragment's range or from `cache` are never HEADed.
+    /// GETs receive a fragment's length as `size_hint` when one of those or a
+    /// prior HEAD established it.
+    pub fn new_with_cache(
+        fragments: Vec<Fragment>,
+        timeline: Option<MediaTimeline>,
+        eager_head: bool,
+        cache: Arc<FragmentCache>,
+    ) -> Result<Self, Error> {
+        if fragments.is_empty() {
             return Err(Error::DashManifestMissingUrls);
         }
 
-        let get: GetFn = Arc::new(get);
-        let head: HeadFn = Arc::new(head);
-        let first = get(urls[0].clone(), None)?;
-        let first_len = first.len() as u64;
-        let mut fragments = vec![None; urls.len()];
-        let mut sizes = vec![None; urls.len()];
-        fragments[0] = Some(first);
-        sizes[0] = Some(first_len);
-        let complete = fragments.iter().all(|fragment| fragment.is_some());
+        let fragments: Vec<_> = fragments
+            .into_iter()
+            .map(|fragment| cache.data(fragment))
+            .collect();
+        cache.get(&fragments[0])?;
+        let complete = fragments.iter().all(|data| data.body().is_some());
 
-        let cache = Arc::new(MpegCache {
-            inner: Mutex::new(MpegCacheInner {
-                urls,
+        let shared = Arc::new(ReaderShared {
+            state: Mutex::new(ReaderState {
                 fragments,
-                sizes,
                 head_available: true,
                 eager_head: false,
                 head_worker_running: false,
@@ -385,15 +671,15 @@ impl MpegStreamReader {
             }),
             condvar: Condvar::new(),
             cancelled: AtomicBool::new(false),
-            head,
+            cache,
         });
 
         if !complete {
-            spawn_get_worker(cache.clone(), get);
+            spawn_get_worker(shared.clone());
         }
 
         let reader = Self {
-            cache,
+            shared,
             byte_position: Some(0),
             fragment_index: 0,
             offset_in_fragment: 0,
@@ -412,19 +698,19 @@ impl MpegStreamReader {
     /// Spawns the HEAD worker if none is running. No-op once every size is
     /// known or HEAD probing has been disabled.
     pub fn start_eager_head(&self) {
-        let mut inner = self.cache.lock();
+        let mut inner = self.shared.lock();
         inner.eager_head = true;
         if inner.head_worker_running
             || inner.error.is_some()
             || inner.next_head().is_none()
-            || self.cache.cancelled.load(Ordering::SeqCst)
+            || self.shared.cancelled.load(Ordering::SeqCst)
         {
             // A running worker sees `eager_head` on its next check and continues.
             return;
         }
         inner.head_worker_running = true;
         drop(inner);
-        spawn_head_worker(self.cache.clone());
+        spawn_head_worker(self.shared.clone());
     }
 
     /// Stops background HEAD prefetch.
@@ -433,7 +719,7 @@ impl MpegStreamReader {
     /// prefetch HEADs are issued. On-demand HEADs from byte seeks are
     /// unaffected.
     pub fn stop_eager_head(&self) {
-        self.cache.lock().eager_head = false;
+        self.shared.lock().eager_head = false;
     }
 
     /// Treat [`SeekFrom::End`]`(0)` as a length query for demuxers such as
@@ -459,8 +745,8 @@ impl MpegStreamReader {
             )
         })?;
         let init_len = {
-            let inner = self.cache.lock();
-            inner.sizes.first().copied().flatten().unwrap_or(0)
+            let inner = self.shared.lock();
+            inner.fragments[0].size().unwrap_or(0)
         };
         let estimate = timeline
             .estimate_len(init_len, bitrate_bps)
@@ -476,14 +762,14 @@ impl MpegStreamReader {
 
     /// Exact total when every size is known; otherwise the compat overestimate.
     fn reported_end_len(&self) -> Option<u64> {
-        let inner = self.cache.lock();
+        let inner = self.shared.lock();
         if let Some(exact) = inner.total_len() {
             return Some(exact);
         }
         if !self.symphonia_compat {
             return None;
         }
-        let known: u64 = inner.sizes.iter().copied().flatten().sum();
+        let known: u64 = inner.fragments.iter().filter_map(|data| data.size()).sum();
         self.length_estimate.map(|estimate| estimate.max(known))
     }
 
@@ -522,9 +808,9 @@ impl MpegStreamReader {
                 }
             }
             SeekFrom::End(offset) => {
-                self.ensure_all_sizes()?;
+                self.ensure_sizes(ReaderState::all_sizes_known)?;
                 let size = {
-                    let inner = self.cache.lock();
+                    let inner = self.shared.lock();
                     inner.total_len().unwrap_or(0)
                 };
                 if offset >= 0 {
@@ -535,10 +821,10 @@ impl MpegStreamReader {
             }
         };
 
-        self.ensure_sizes_covering(target)?;
+        self.ensure_sizes(|inner| inner.resolve_cursor(target).is_some())?;
 
         let (fragment_index, offset_in_fragment) = {
-            let inner = self.cache.lock();
+            let inner = self.shared.lock();
             match inner.resolve_cursor(target) {
                 Some(cursor) => cursor,
                 None => {
@@ -614,50 +900,28 @@ impl MpegStreamReader {
 
         let target_fragment = media_index + 1;
         {
-            let mut inner = self.cache.lock();
+            let mut inner = self.shared.lock();
             if target_fragment >= inner.fragments.len() {
                 return Err(io::Error::other(
                     "MPEG stream ended before the requested media time",
                 ));
             }
             inner.cursor_fragment = target_fragment;
-            if inner.fragments[target_fragment].is_none() {
+            if inner.missing_body(target_fragment) {
                 inner.priority = Some(target_fragment);
-                self.cache.condvar.notify_all();
+                self.shared.condvar.notify_all();
             }
         }
 
         let byte_position = {
-            let inner = self.wait_until(|inner| {
-                inner
-                    .fragments
-                    .get(target_fragment)
-                    .is_some_and(|fragment| fragment.is_some())
-                    || inner.complete
-            })?;
-
-            let Some(_fragment) = inner
-                .fragments
-                .get(target_fragment)
-                .and_then(|f| f.as_ref())
-            else {
+            let inner =
+                self.wait_until(|inner| !inner.missing_body(target_fragment) || inner.complete)?;
+            if inner.missing_body(target_fragment) {
                 return Err(io::Error::other(
                     "MPEG stream ended before the requested media time",
                 ));
-            };
-
-            let prefix_ready = inner.sizes[..target_fragment]
-                .iter()
-                .all(|size| size.is_some());
-            if prefix_ready {
-                let prefix: u64 = inner.sizes[..target_fragment]
-                    .iter()
-                    .map(|size| size.unwrap_or(0))
-                    .sum();
-                Some(prefix)
-            } else {
-                None
             }
+            inner.prefix_len(target_fragment)
         };
 
         self.fragment_index = target_fragment;
@@ -676,134 +940,46 @@ impl MpegStreamReader {
         })
     }
 
-    /// Fills unknown sizes needed to map `target`, via on-demand HEAD or GET fallback.
-    fn ensure_sizes_covering(&self, target: u64) -> io::Result<()> {
+    /// Fills unknown sizes until `known` holds, via on-demand HEAD or GET
+    /// fallback. Also returns once every body is downloaded.
+    fn ensure_sizes(&self, known: impl Fn(&ReaderState) -> bool) -> io::Result<()> {
         loop {
             let next_head = {
-                let inner = self.cache.lock();
-                if inner.resolve_cursor(target).is_some() {
+                let inner = self.shared.lock();
+                if known(&inner) {
                     return Ok(());
                 }
-                if !inner.head_available {
-                    None
-                } else {
-                    inner
-                        .sizes
-                        .iter()
-                        .position(|size| size.is_none())
-                        .map(|index| (index, inner.urls[index].clone()))
-                }
+                inner.next_head()
             };
-
-            let Some((index, url)) = next_head else {
+            // A failed HEAD disables probing, so `next_head` ends the loop.
+            let Some((index, data)) = next_head else {
                 break;
             };
-
-            match (self.cache.head)(url) {
-                Ok(len) => {
-                    let mut inner = self.cache.lock();
-                    if inner.sizes[index].is_none() {
-                        inner.sizes[index] = Some(len);
-                    }
-                    self.cache.condvar.notify_all();
-                }
-                Err(error) => {
-                    let mut inner = self.cache.lock();
-                    inner.disable_head(&format!("HEAD failed for fragment {index}: {error}"));
-                    break;
-                }
-            }
+            self.shared.probe(index, &data);
         }
 
         {
-            let mut inner = self.cache.lock();
-            if inner.resolve_cursor(target).is_some() {
+            let mut inner = self.shared.lock();
+            if known(&inner) {
                 return Ok(());
             }
-            if let Some(index) = inner
-                .fragments
-                .iter()
-                .position(|fragment| fragment.is_none())
-            {
+            if let Some(index) = (0..inner.fragments.len()).find(|&i| inner.missing_body(i)) {
                 inner.priority = Some(index);
-                self.cache.condvar.notify_all();
+                self.shared.condvar.notify_all();
             }
         }
 
-        let inner =
-            self.wait_until(|inner| inner.resolve_cursor(target).is_some() || inner.complete)?;
-        if inner.resolve_cursor(target).is_none() && !inner.complete {
-            return Err(io::Error::other(
-                "MPEG stream ended before the requested byte offset",
-            ));
-        }
-        Ok(())
+        self.wait_until(|inner| known(inner) || inner.complete)
+            .map(drop)
     }
 
-    fn ensure_all_sizes(&self) -> io::Result<()> {
-        loop {
-            let next_head = {
-                let inner = self.cache.lock();
-                if inner.all_sizes_known() {
-                    return Ok(());
-                }
-                if !inner.head_available {
-                    None
-                } else {
-                    inner
-                        .sizes
-                        .iter()
-                        .position(|size| size.is_none())
-                        .map(|index| (index, inner.urls[index].clone()))
-                }
-            };
-
-            let Some((index, url)) = next_head else {
-                break;
-            };
-
-            match (self.cache.head)(url) {
-                Ok(len) => {
-                    let mut inner = self.cache.lock();
-                    if inner.sizes[index].is_none() {
-                        inner.sizes[index] = Some(len);
-                    }
-                    self.cache.condvar.notify_all();
-                }
-                Err(error) => {
-                    let mut inner = self.cache.lock();
-                    inner.disable_head(&format!("HEAD failed for fragment {index}: {error}"));
-                    break;
-                }
-            }
-        }
-
-        {
-            let mut inner = self.cache.lock();
-            if inner.all_sizes_known() {
-                return Ok(());
-            }
-            if let Some(index) = inner
-                .fragments
-                .iter()
-                .position(|fragment| fragment.is_none())
-            {
-                inner.priority = Some(index);
-                self.cache.condvar.notify_all();
-            }
-        }
-
-        let _inner = self.wait_until(|inner| inner.all_sizes_known() || inner.complete)?;
-        Ok(())
-    }
-
-    fn wait_until<F>(&self, mut ready: F) -> io::Result<MutexGuard<'_, MpegCacheInner>>
+    fn wait_until<F>(&self, mut ready: F) -> io::Result<MutexGuard<'_, ReaderState>>
     where
-        F: FnMut(&MpegCacheInner) -> bool,
+        F: FnMut(&ReaderState) -> bool,
     {
-        let mut inner = self.cache.lock();
+        let mut inner = self.shared.lock();
         loop {
-            if self.cache.cancelled.load(Ordering::SeqCst) {
+            if self.shared.cancelled.load(Ordering::SeqCst) {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "MPEG stream cancelled",
@@ -816,7 +992,7 @@ impl MpegStreamReader {
                 return Ok(inner);
             }
             inner = self
-                .cache
+                .shared
                 .condvar
                 .wait(inner)
                 .unwrap_or_else(|error| error.into_inner());
@@ -824,19 +1000,15 @@ impl MpegStreamReader {
     }
 
     fn prioritize_fragment(&self, index: usize) {
-        let mut inner = self.cache.lock();
-        if inner
-            .fragments
-            .get(index)
-            .is_some_and(|fragment| fragment.is_none())
-        {
+        let mut inner = self.shared.lock();
+        if inner.missing_body(index) {
             inner.priority = Some(index);
-            self.cache.condvar.notify_all();
+            self.shared.condvar.notify_all();
         }
     }
 
     fn publish_cursor(&self) {
-        let mut inner = self.cache.lock();
+        let mut inner = self.shared.lock();
         inner.cursor_fragment = self.fragment_index;
     }
 
@@ -867,7 +1039,7 @@ impl MpegStreamReader {
     /// Report EOF for [`SeekFrom::End`]`(0)` without retargeting the GET worker.
     fn park_at_reported_end(&mut self, len: u64) -> io::Result<Position> {
         let fragment_count = {
-            let inner = self.cache.lock();
+            let inner = self.shared.lock();
             inner.fragments.len()
         };
         self.fragment_index = fragment_count;
@@ -880,70 +1052,61 @@ impl MpegStreamReader {
     }
 }
 
-impl MpegCache {
-    fn lock(&self) -> MutexGuard<'_, MpegCacheInner> {
-        self.inner.lock().unwrap_or_else(|error| error.into_inner())
+impl ReaderShared {
+    fn lock(&self) -> MutexGuard<'_, ReaderState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// HEADs fragment `index` unless its size is known, or disables HEAD
+    /// probing if the request fails.
+    fn probe(&self, index: usize, data: &FragmentData) {
+        let result = self.cache.probe(data);
+        let mut state = self.lock();
+        if let Err(error) = result {
+            state.disable_head(&format!("HEAD failed for fragment {index}: {error}"));
+        }
+        self.condvar.notify_all();
     }
 }
 
-fn spawn_get_worker(cache: Arc<MpegCache>, get: GetFn) {
+fn spawn_get_worker(shared: Arc<ReaderShared>) {
     std::thread::spawn(move || {
-        loop {
-            if cache.cancelled.load(Ordering::SeqCst) {
-                return;
-            }
-
-            let next = {
-                let mut inner = cache.lock();
-                if inner.error.is_some() {
+        while !shared.cancelled.load(Ordering::SeqCst) {
+            let (index, data) = {
+                let mut state = shared.lock();
+                if state.error.is_some() {
                     return;
                 }
-                if inner.all_filled() {
-                    inner.complete = true;
-                    cache.condvar.notify_all();
+                let Some(work) = state.next_get() else {
+                    state.complete = true;
+                    shared.condvar.notify_all();
                     return;
-                }
-                match inner.next_get() {
-                    Some(work) => work,
-                    None => {
-                        inner.complete = true;
-                        cache.condvar.notify_all();
-                        return;
-                    }
-                }
+                };
+                work
             };
 
-            match get(next.1, next.2) {
-                Ok(chunk) => {
-                    let mut inner = cache.lock();
-                    inner.store_fragment(next.0, chunk);
-                    if inner.all_filled() {
-                        inner.complete = true;
-                    }
-                    cache.condvar.notify_all();
-                }
-                Err(error) => {
-                    let mut inner = cache.lock();
-                    inner.error = Some(error.to_string());
-                    cache.condvar.notify_all();
-                    return;
-                }
+            let result = shared.cache.get(&data);
+            let mut state = shared.lock();
+            match result {
+                Ok(_) => state.check_probe(index),
+                Err(error) => state.error = Some(error.to_string()),
             }
+            shared.condvar.notify_all();
         }
     });
 }
 
-fn spawn_head_worker(cache: Arc<MpegCache>) {
+fn spawn_head_worker(shared: Arc<ReaderShared>) {
     std::thread::spawn(move || {
         loop {
-            if cache.cancelled.load(Ordering::SeqCst) {
+            if shared.cancelled.load(Ordering::SeqCst) {
                 return;
             }
 
             // Exit and spawn decisions share the lock so start/stop cannot
             // leave zero or two workers.
-            let Some((index, url)) = ({
-                let mut inner = cache.lock();
+            let Some((index, data)) = ({
+                let mut inner = shared.lock();
                 let next = if inner.eager_head && inner.error.is_none() {
                     inner.next_head()
                 } else {
@@ -957,22 +1120,8 @@ fn spawn_head_worker(cache: Arc<MpegCache>) {
                 return;
             };
 
-            match (cache.head)(url) {
-                Ok(len) => {
-                    let mut inner = cache.lock();
-                    if inner.sizes[index].is_none() {
-                        inner.sizes[index] = Some(len);
-                    }
-                    cache.condvar.notify_all();
-                }
-                Err(error) => {
-                    let mut inner = cache.lock();
-                    inner.disable_head(&format!("HEAD failed for fragment {index}: {error}"));
-                    inner.head_worker_running = false;
-                    cache.condvar.notify_all();
-                    return;
-                }
-            }
+            // After a failure, `next_head` is `None` and the worker exits.
+            shared.probe(index, &data);
         }
     });
 }
@@ -985,7 +1134,7 @@ impl Read for MpegStreamReader {
 
         loop {
             let fragment_count = {
-                let inner = self.cache.lock();
+                let inner = self.shared.lock();
                 inner.fragments.len()
             };
             if self.fragment_index >= fragment_count {
@@ -998,15 +1147,9 @@ impl Read for MpegStreamReader {
             let index = self.fragment_index;
             let offset = self.offset_in_fragment;
             let (copied, fragment_len) = {
-                let inner = self.wait_until(|inner| {
-                    inner
-                        .fragments
-                        .get(index)
-                        .is_some_and(|fragment| fragment.is_some())
-                        || inner.complete
-                })?;
-
-                let Some(fragment) = inner.fragments.get(index).and_then(|f| f.as_ref()) else {
+                let inner =
+                    self.wait_until(|inner| !inner.missing_body(index) || inner.complete)?;
+                let Some(fragment) = inner.fragments[index].body() else {
                     return Ok(0);
                 };
                 let fragment_len = fragment.len();
@@ -1050,8 +1193,8 @@ impl Seek for MpegStreamReader {
 
 impl Drop for MpegStreamReader {
     fn drop(&mut self) {
-        self.cache.cancelled.store(true, Ordering::SeqCst);
-        self.cache.condvar.notify_all();
+        self.shared.cancelled.store(true, Ordering::SeqCst);
+        self.shared.condvar.notify_all();
     }
 }
 
@@ -1074,8 +1217,9 @@ mod tests {
 
     fn instant_get(
         payloads: &'static [(&'static str, &'static [u8])],
-    ) -> impl Fn(String, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync {
-        move |url: String, _expected_len: Option<u64>| {
+    ) -> impl Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync {
+        move |fragment: &Fragment, _expected_len: Option<u64>| {
+            let url = fragment.url.clone();
             payloads
                 .iter()
                 .find(|(name, _)| *name == url)
@@ -1086,8 +1230,9 @@ mod tests {
 
     fn instant_head(
         payloads: &'static [(&'static str, &'static [u8])],
-    ) -> impl Fn(String) -> Result<u64, Error> + Send + Sync {
-        move |url: String| {
+    ) -> impl Fn(&Fragment) -> Result<u64, Error> + Send + Sync {
+        move |fragment: &Fragment| {
+            let url = fragment.url.clone();
             payloads
                 .iter()
                 .find(|(name, _)| *name == url)
@@ -1096,12 +1241,12 @@ mod tests {
         }
     }
 
-    fn failing_head() -> impl Fn(String) -> Result<u64, Error> + Send + Sync {
-        move |_url: String| Err(Error::StreamInitializationError("HEAD unavailable".into()))
+    fn failing_head() -> impl Fn(&Fragment) -> Result<u64, Error> + Send + Sync {
+        move |_fragment: &Fragment| Err(Error::StreamInitializationError("HEAD unavailable".into()))
     }
 
     fn start_instant(
-        urls: Vec<String>,
+        urls: Vec<Fragment>,
         payloads: &'static [(&'static str, &'static [u8])],
     ) -> Result<MpegStreamReader, Error> {
         MpegStreamReader::new_with_get_head(
@@ -1116,8 +1261,9 @@ mod tests {
     fn gated_get(
         allow_rest: Arc<AtomicBool>,
         payload: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
-    ) -> impl Fn(String, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync {
-        move |url: String, _expected_len: Option<u64>| {
+    ) -> impl Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync {
+        move |fragment: &Fragment, _expected_len: Option<u64>| {
+            let url = fragment.url.clone();
             if url != "init" {
                 while !allow_rest.load(Ordering::SeqCst) {
                     thread::sleep(Duration::from_millis(5));
@@ -1234,7 +1380,8 @@ mod tests {
             {
                 let allow_get = allow_get.clone();
                 let get_order = get_order.clone();
-                move |url: String, _expected_len: Option<u64>| {
+                move |fragment: &Fragment, _expected_len: Option<u64>| {
+                    let url = fragment.url.clone();
                     if url != "init" {
                         while !allow_get.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(5));
@@ -1246,7 +1393,8 @@ mod tests {
             },
             {
                 let head_calls = head_calls.clone();
-                move |url: String| {
+                move |fragment: &Fragment| {
+                    let url = fragment.url.clone();
                     head_calls.lock().unwrap().push(url.clone());
                     Ok(4)
                 }
@@ -1283,7 +1431,8 @@ mod tests {
             true,
             {
                 let allow_get = allow_get.clone();
-                move |url: String, _expected_len: Option<u64>| {
+                move |fragment: &Fragment, _expected_len: Option<u64>| {
+                    let url = fragment.url.clone();
                     if url != "init" {
                         while !allow_get.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(5));
@@ -1299,7 +1448,8 @@ mod tests {
                     }
                 }
             },
-            move |url: String| {
+            move |fragment: &Fragment| {
+                let url = fragment.url.clone();
                 // Lie about "a" so GET will disagree after HEAD was used.
                 match url.as_str() {
                     "init" => Ok(4),
@@ -1320,7 +1470,7 @@ mod tests {
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"A");
         assert!(
-            !reader.cache.lock().head_available,
+            !reader.shared.lock().head_available,
             "HEAD should be disabled after GET/HEAD length mismatch"
         );
     }
@@ -1341,7 +1491,7 @@ mod tests {
                 let allow_a = allow_a.clone();
                 let allow_b = allow_b.clone();
                 let allow_c = allow_c.clone();
-                move |url: String, _expected_len: Option<u64>| match url.as_str() {
+                move |fragment: &Fragment, _expected_len: Option<u64>| match fragment.url.as_str() {
                     "init" => Ok(b"INIT".to_vec()),
                     "a" => {
                         while !allow_a.load(Ordering::SeqCst) {
@@ -1443,6 +1593,7 @@ mod tests {
         let allow_a = Arc::new(AtomicBool::new(false));
         let allow_b = Arc::new(AtomicBool::new(false));
         let allow_c = Arc::new(AtomicBool::new(false));
+        let a_started = Arc::new(AtomicBool::new(false));
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut reader = MpegStreamReader::new_with_get_head(
             vec!["init".into(), "a".into(), "b".into(), "c".into()],
@@ -1455,10 +1606,12 @@ mod tests {
                 let allow_a = allow_a.clone();
                 let allow_b = allow_b.clone();
                 let allow_c = allow_c.clone();
+                let a_started = a_started.clone();
                 let order = order.clone();
-                move |url: String, _expected_len: Option<u64>| match url.as_str() {
+                move |fragment: &Fragment, _expected_len: Option<u64>| match fragment.url.as_str() {
                     "init" => Ok(b"INIT".to_vec()),
                     "a" => {
+                        a_started.store(true, Ordering::SeqCst);
                         while !allow_a.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(5));
                         }
@@ -1487,6 +1640,10 @@ mod tests {
             failing_head(),
         )
         .unwrap();
+        // The worker must be busy with "a" before the seek, or it would take "c" first.
+        while !a_started.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
 
         let handle = thread::spawn(move || {
             let position = reader.seek_time_coarse(Duration::from_secs(2)).unwrap();
@@ -1537,7 +1694,8 @@ mod tests {
             {
                 let release_media = release_media.clone();
                 let order = order.clone();
-                move |url: String, _expected_len: Option<u64>| {
+                move |fragment: &Fragment, _expected_len: Option<u64>| {
+                    let url = fragment.url.clone();
                     if url != "init" {
                         while !release_media.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(5));
@@ -1551,7 +1709,7 @@ mod tests {
         )
         .unwrap();
 
-        let cache = reader.cache.clone();
+        let cache = reader.shared.clone();
         let release_media_when_seeked = release_media.clone();
         thread::spawn(move || {
             loop {
@@ -1563,7 +1721,7 @@ mod tests {
             }
         });
         reader.seek_time_coarse(Duration::from_secs(2)).unwrap();
-        let _inner = reader.wait_until(|inner| inner.all_filled()).unwrap();
+        let _inner = reader.wait_until(|inner| inner.complete).unwrap();
 
         let got = order.lock().unwrap().clone();
         let b = got.iter().position(|url| url == "b").unwrap();
@@ -1644,7 +1802,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let get = {
             let calls = calls.clone();
-            move |url: String, _expected_len: Option<u64>| {
+            move |fragment: &Fragment, _expected_len: Option<u64>| {
+                let url = fragment.url.clone();
                 let n = calls.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     Ok(b"INIT".to_vec())
@@ -1710,7 +1869,8 @@ mod tests {
             {
                 let allow_late = allow_late.clone();
                 let get_expected = get_expected.clone();
-                move |url: String, expected_len: Option<u64>| {
+                move |fragment: &Fragment, expected_len: Option<u64>| {
+                    let url = fragment.url.clone();
                     get_expected
                         .lock()
                         .unwrap()
@@ -1725,7 +1885,8 @@ mod tests {
             },
             {
                 let head_calls = head_calls.clone();
-                move |url: String| {
+                move |fragment: &Fragment| {
+                    let url = fragment.url.clone();
                     head_calls.lock().unwrap().push(url.clone());
                     Ok(4)
                 }
@@ -1734,10 +1895,12 @@ mod tests {
         .unwrap();
 
         let inner = reader
-            .wait_until(|inner| inner.sizes[4].is_some() && inner.sizes[5].is_some())
+            .wait_until(|inner| {
+                inner.fragments[4].size().is_some() && inner.fragments[5].size().is_some()
+            })
             .unwrap();
         assert!(
-            inner.fragments[4].is_none() && inner.fragments[5].is_none(),
+            inner.missing_body(4) && inner.missing_body(5),
             "HEAD worker should learn sizes before those bodies are fetched"
         );
         drop(inner);
@@ -1747,7 +1910,7 @@ mod tests {
         assert!(heads.contains(&"e".to_string()), "{heads:?}");
 
         allow_late.store(true, Ordering::SeqCst);
-        let _inner = reader.wait_until(|inner| inner.all_filled()).unwrap();
+        let _inner = reader.wait_until(|inner| inner.complete).unwrap();
         let expected = get_expected.lock().unwrap().clone();
         assert!(
             expected
@@ -1767,7 +1930,8 @@ mod tests {
             true,
             {
                 let allow_get = allow_get.clone();
-                move |url: String, _expected_len: Option<u64>| {
+                move |fragment: &Fragment, _expected_len: Option<u64>| {
+                    let url = fragment.url.clone();
                     if url != "init" {
                         while !allow_get.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(5));
@@ -1778,7 +1942,8 @@ mod tests {
             },
             {
                 let head_calls = head_calls.clone();
-                move |url: String| {
+                move |fragment: &Fragment| {
+                    let url = fragment.url.clone();
                     head_calls.lock().unwrap().push(url.clone());
                     Ok(4)
                 }
@@ -1788,9 +1953,7 @@ mod tests {
 
         let inner = reader.wait_until(|inner| inner.all_sizes_known()).unwrap();
         assert!(
-            inner.fragments[1].is_none()
-                && inner.fragments[2].is_none()
-                && inner.fragments[3].is_none(),
+            (1..=3).all(|index| inner.missing_body(index)),
             "HEAD worker should fill sizes without waiting for a body buffer"
         );
         drop(inner);
@@ -1817,7 +1980,7 @@ mod tests {
             ]),
             {
                 let allow_heads = allow_heads.clone();
-                move |_url: String| {
+                move |_fragment: &Fragment| {
                     while !allow_heads.load(Ordering::SeqCst) {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -1827,7 +1990,7 @@ mod tests {
         )
         .unwrap();
 
-        let _inner = reader.wait_until(|inner| inner.all_filled()).unwrap();
+        let _inner = reader.wait_until(|inner| inner.complete).unwrap();
         allow_heads.store(true, Ordering::SeqCst);
     }
 
@@ -1847,7 +2010,8 @@ mod tests {
             true,
             {
                 let allow_get = allow_get.clone();
-                move |url: String, _expected_len: Option<u64>| {
+                move |fragment: &Fragment, _expected_len: Option<u64>| {
+                    let url = fragment.url.clone();
                     if url != "init" {
                         while !allow_get.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(5));
@@ -1858,7 +2022,7 @@ mod tests {
             },
             {
                 let head_calls = head_calls.clone();
-                move |_url: String| {
+                move |_fragment: &Fragment| {
                     head_calls.fetch_add(1, Ordering::SeqCst);
                     Err(Error::StreamInitializationError("HEAD unavailable".into()))
                 }
@@ -1873,13 +2037,14 @@ mod tests {
         );
         drop(inner);
         allow_get.store(true, Ordering::SeqCst);
-        let _inner = reader.wait_until(|inner| inner.all_filled()).unwrap();
+        let _inner = reader.wait_until(|inner| inner.complete).unwrap();
     }
 
     fn recording_head(
         calls: Arc<Mutex<Vec<String>>>,
-    ) -> impl Fn(String) -> Result<u64, Error> + Send + Sync {
-        move |url: String| {
+    ) -> impl Fn(&Fragment) -> Result<u64, Error> + Send + Sync {
+        move |fragment: &Fragment| {
+            let url = fragment.url.clone();
             calls.lock().unwrap().push(url);
             Ok(4)
         }
@@ -1913,7 +2078,8 @@ mod tests {
             false,
             {
                 let allow_get = allow_get.clone();
-                move |url: String, _expected_len: Option<u64>| {
+                move |fragment: &Fragment, _expected_len: Option<u64>| {
+                    let url = fragment.url.clone();
                     if url != "init" {
                         while !allow_get.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(5));
@@ -1931,7 +2097,11 @@ mod tests {
 
         reader.start_eager_head();
         let inner = reader.wait_until(|inner| inner.all_sizes_known()).unwrap();
-        assert!(inner.fragments[1..].iter().all(Option::is_none));
+        assert!(
+            inner.fragments[1..]
+                .iter()
+                .all(|data| data.body().is_none())
+        );
         drop(inner);
         let _inner = reader
             .wait_until(|inner| !inner.head_worker_running)
@@ -1958,7 +2128,8 @@ mod tests {
             true,
             {
                 let allow_get = allow_get.clone();
-                move |url: String, _expected_len: Option<u64>| {
+                move |fragment: &Fragment, _expected_len: Option<u64>| {
+                    let url = fragment.url.clone();
                     if url != "init" {
                         while !allow_get.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(5));
@@ -1970,7 +2141,7 @@ mod tests {
             {
                 let head_entered = head_entered.clone();
                 let release_head = release_head.clone();
-                move |_url: String| {
+                move |_fragment: &Fragment| {
                     head_entered.fetch_add(1, Ordering::SeqCst);
                     while !release_head.load(Ordering::SeqCst) {
                         thread::sleep(Duration::from_millis(5));
@@ -1991,8 +2162,16 @@ mod tests {
             .wait_until(|inner| !inner.head_worker_running)
             .unwrap();
         assert_eq!(head_entered.load(Ordering::SeqCst), 1);
-        assert_eq!(inner.sizes[1], Some(4), "in-flight HEAD should be kept");
-        assert!(inner.sizes[2..].iter().all(Option::is_none));
+        assert_eq!(
+            inner.fragments[1].size(),
+            Some(4),
+            "in-flight HEAD should be kept"
+        );
+        assert!(
+            inner.fragments[2..]
+                .iter()
+                .all(|data| data.size().is_none())
+        );
         drop(inner);
 
         allow_get.store(true, Ordering::SeqCst);
@@ -2010,7 +2189,8 @@ mod tests {
             true,
             {
                 let allow_get = allow_get.clone();
-                move |url: String, _expected_len: Option<u64>| {
+                move |fragment: &Fragment, _expected_len: Option<u64>| {
+                    let url = fragment.url.clone();
                     if url != "init" {
                         while !allow_get.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(5));
@@ -2023,7 +2203,7 @@ mod tests {
                 let release_head = release_head.clone();
                 let active = active.clone();
                 let max_active = max_active.clone();
-                move |_url: String| {
+                move |_fragment: &Fragment| {
                     let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                     max_active.fetch_max(now, Ordering::SeqCst);
                     while !release_head.load(Ordering::SeqCst) {
@@ -2065,9 +2245,9 @@ mod tests {
         )
         .unwrap();
 
-        reader.cache.lock().disable_head("test");
+        reader.shared.lock().disable_head("test");
         reader.start_eager_head();
-        assert!(!reader.cache.lock().head_worker_running);
+        assert!(!reader.shared.lock().head_worker_running);
         assert!(head_calls.lock().unwrap().is_empty());
     }
 
@@ -2088,7 +2268,7 @@ mod tests {
         let position = reader.seek_bytes(SeekFrom::End(0)).unwrap();
         assert_eq!(position.byte, Some(4 + 4 + 4));
         assert_eq!(head_calls.lock().unwrap().as_slice(), &["a", "b"]);
-        assert!(!reader.cache.lock().head_worker_running);
+        assert!(!reader.shared.lock().head_worker_running);
     }
 
     fn two_second_timeline() -> MediaTimeline {
@@ -2179,5 +2359,442 @@ mod tests {
         assert!(
             matches!(error, Error::StreamInitializationError(message) if message.contains("SegmentTimeline"))
         );
+    }
+
+    #[test]
+    fn byte_range_parses_dash_form() {
+        let range: ByteRange = " 100-199 ".parse().unwrap();
+        assert_eq!((range.start(), range.end(), range.size()), (100, 199, 100));
+        assert_eq!(range.to_string(), "100-199");
+        assert_eq!(ByteRange::new(5, 5).map(ByteRange::size), Some(1));
+        assert_eq!(ByteRange::new(5, 4), None);
+        for invalid in ["", "5", "5-", "-5", "9-3", "a-b"] {
+            assert!(
+                matches!(invalid.parse::<ByteRange>(), Err(Error::InvalidByteRange(value)) if value == invalid),
+                "{invalid:?} should be rejected"
+            );
+        }
+        assert_eq!(
+            Fragment::with_range("media.mp4", range).to_string(),
+            "media.mp4 (bytes 100-199)"
+        );
+    }
+
+    /// Serves byte ranges of one in-memory file, keyed by fragment range.
+    fn ranged_get(
+        file: &'static [u8],
+    ) -> impl Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync {
+        move |fragment: &Fragment, _expected_len: Option<u64>| {
+            let range = fragment.range.expect("test fragments are ranged");
+            Ok(file[range.start() as usize..=range.end() as usize].to_vec())
+        }
+    }
+
+    fn ranged(url: &str, start: u64, end: u64) -> Fragment {
+        Fragment::with_range(url, ByteRange::new(start, end).unwrap())
+    }
+
+    #[test]
+    fn ranged_fragments_know_sizes_without_head() {
+        const FILE: &[u8] = b"INITaaaaBBBBBBcc";
+        let allow_media = Arc::new(AtomicBool::new(false));
+        let head_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = MpegStreamReader::new_with_get_head(
+            vec![
+                ranged("file", 0, 3),
+                ranged("file", 4, 7),
+                ranged("file", 8, 13),
+                ranged("file", 14, 15),
+            ],
+            None,
+            true,
+            {
+                let allow_media = allow_media.clone();
+                let get = ranged_get(FILE);
+                move |fragment: &Fragment, expected_len: Option<u64>| {
+                    assert_eq!(expected_len, fragment.known_size());
+                    if fragment.range.unwrap().start() > 0 {
+                        while !allow_media.load(Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    get(fragment, expected_len)
+                }
+            },
+            recording_head(head_calls.clone()),
+        )
+        .unwrap();
+
+        // Every size comes from a range, so byte seeks resolve before any media body arrives.
+        assert_eq!(reader.seek_bytes(SeekFrom::End(0)).unwrap().byte, Some(16));
+        assert_eq!(reader.seek_bytes(SeekFrom::Start(9)).unwrap().byte, Some(9));
+        assert!(reader.shared.lock().missing_body(2));
+
+        allow_media.store(true, Ordering::SeqCst);
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"BBBBBcc");
+        reader.seek_bytes(SeekFrom::Start(0)).unwrap();
+        let mut all = Vec::new();
+        reader.read_to_end(&mut all).unwrap();
+        assert_eq!(all, FILE);
+        assert!(head_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ranged_fragment_with_wrong_length_fails() {
+        let result = MpegStreamReader::new_with_get_head(
+            vec![ranged("file", 0, 7)],
+            None,
+            false,
+            |_fragment: &Fragment, _expected_len: Option<u64>| Ok(b"INIT".to_vec()),
+            failing_head(),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::FragmentLength { fragment, expected: 8, actual: 4 })
+                if fragment == "file (bytes 0-7)"
+        ));
+
+        let mut reader = MpegStreamReader::new_with_get_head(
+            vec![ranged("file", 0, 3), ranged("file", 4, 7)],
+            None,
+            false,
+            |fragment: &Fragment, _expected_len: Option<u64>| match fragment.range.unwrap().start()
+            {
+                0 => Ok(b"INIT".to_vec()),
+                _ => Ok(b"short".to_vec()),
+            },
+            failing_head(),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let error = reader.read_to_end(&mut bytes).unwrap_err();
+        assert!(error.to_string().contains("returned 5 bytes, expected 4"));
+    }
+
+    /// Serves `FILE` over HTTP, answering `Range` requests with 206 on `/ranged`
+    /// and ignoring them (200, full body) on `/plain`. Returns the base URL.
+    fn spawn_range_server(connections: usize) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        const FILE: &[u8] = b"INITaaaaBBBBBBcc";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for _ in 0..connections {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut range = None;
+                let mut header = String::new();
+                while reader.read_line(&mut header).unwrap() > 2 {
+                    if let Some(value) = header.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        range = Some(value.trim().parse::<ByteRange>().unwrap());
+                    }
+                    header.clear();
+                }
+                let (status, body) = match range {
+                    Some(range) if request_line.starts_with("GET /ranged ") => (
+                        "206 Partial Content",
+                        &FILE[range.start() as usize..=range.end() as usize],
+                    ),
+                    _ => ("200 OK", FILE),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let stream = reader.get_mut();
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[test]
+    fn default_transport_sends_range_and_slices_ignored_ranges() {
+        let base = spawn_range_server(3);
+        let mut reader = MpegStreamReader::new(
+            vec![
+                ranged(&format!("{base}/ranged"), 0, 3),
+                ranged(&format!("{base}/plain"), 8, 13),
+                ranged(&format!("{base}/ranged"), 14, 15),
+            ],
+            None,
+            false,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"INITBBBBBBcc");
+    }
+
+    /// Records GETs and HEADs (bodies are the URL bytes) and blocks GETs of
+    /// `gated` URLs until released.
+    struct CountingTransport {
+        gets: Mutex<Vec<String>>,
+        heads: Mutex<Vec<String>>,
+        gated: &'static [&'static str],
+        released: AtomicBool,
+    }
+
+    impl CountingTransport {
+        fn new(gated: &'static [&'static str]) -> Self {
+            Self {
+                gets: Mutex::new(Vec::new()),
+                heads: Mutex::new(Vec::new()),
+                gated,
+                released: AtomicBool::new(false),
+            }
+        }
+
+        fn gets(&self) -> Vec<String> {
+            self.gets.lock().unwrap().clone()
+        }
+
+        fn heads(&self) -> Vec<String> {
+            self.heads.lock().unwrap().clone()
+        }
+    }
+
+    impl Transport for CountingTransport {
+        fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
+            self.heads.lock().unwrap().push(fragment.url.clone());
+            Ok(fragment.url.len() as u64)
+        }
+
+        fn get(&self, fragment: &Fragment, _size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
+            self.gets.lock().unwrap().push(fragment.url.clone());
+            if self.gated.contains(&fragment.url.as_str()) {
+                while !self.released.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Ok(fragment.url.as_bytes().into())
+        }
+    }
+
+    fn wait_for(mut ready: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if ready() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("condition not reached within 2s");
+    }
+
+    /// A cache over a fresh [`CountingTransport`], and that transport.
+    fn counting_cache(
+        gated: &'static [&'static str],
+    ) -> (Arc<FragmentCache>, Arc<CountingTransport>) {
+        let transport = Arc::new(CountingTransport::new(gated));
+        (Arc::new(FragmentCache::new(transport.clone())), transport)
+    }
+
+    #[test]
+    fn fragment_cache_reuses_bodies_across_readers() {
+        let (cache, transport) = counting_cache(&[]);
+        let mut first = MpegStreamReader::new_with_cache(
+            vec!["init".into(), "a".into(), "b".into()],
+            None,
+            false,
+            cache.clone(),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        first.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"initab");
+
+        // A rebuilt reader, as after a seek, gets everything from memory.
+        let mut second = MpegStreamReader::new_with_cache(
+            vec!["init".into(), "b".into()],
+            None,
+            true,
+            cache.clone(),
+        )
+        .unwrap();
+        bytes.clear();
+        second.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"initb");
+        assert_eq!(transport.gets(), ["init", "a", "b"]);
+        assert_eq!(cache.known_size(&"a".into()), Some(1));
+        assert!(transport.heads().is_empty());
+    }
+
+    #[test]
+    fn fragment_cache_keeps_in_flight_bodies_after_reader_drop() {
+        let (cache, transport) = counting_cache(&["b"]);
+        let first = MpegStreamReader::new_with_cache(
+            vec!["init".into(), "a".into(), "b".into()],
+            None,
+            false,
+            cache.clone(),
+        )
+        .unwrap();
+        wait_for(|| transport.gets().contains(&"b".to_owned()));
+        drop(first);
+
+        transport.released.store(true, Ordering::SeqCst);
+        wait_for(|| cache.cached(&"b".into()).is_some());
+
+        let mut second = MpegStreamReader::new_with_cache(
+            vec!["init".into(), "b".into()],
+            None,
+            false,
+            cache.clone(),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        second.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"initb");
+        assert_eq!(transport.gets(), ["init", "a", "b"]);
+    }
+
+    #[test]
+    fn fragment_cache_joins_a_get_already_in_flight() {
+        let (cache, transport) = counting_cache(&["b"]);
+        let first = MpegStreamReader::new_with_cache(
+            vec!["init".into(), "a".into(), "b".into()],
+            None,
+            false,
+            cache.clone(),
+        )
+        .unwrap();
+        wait_for(|| transport.gets().contains(&"b".to_owned()));
+        drop(first);
+
+        // The rebuilt reader waits on the dropped reader's GET of "b".
+        let mut second = MpegStreamReader::new_with_cache(
+            vec!["init".into(), "b".into()],
+            None,
+            false,
+            cache.clone(),
+        )
+        .unwrap();
+        transport.released.store(true, Ordering::SeqCst);
+        let mut bytes = Vec::new();
+        second.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"initb");
+        assert_eq!(transport.gets(), ["init", "a", "b"]);
+    }
+
+    #[test]
+    fn fragment_cache_skips_wrong_length_ranged_bodies() {
+        let cache = FragmentCache::new(Arc::new(FnTransport {
+            get: |_fragment: &Fragment, _size_hint: Option<u64>| Ok(b"short".to_vec()),
+            head: |_fragment: &Fragment| Ok(0),
+        }));
+        let fragment = ranged("file", 0, 7);
+        assert!(matches!(
+            cache.get(&cache.data(fragment.clone())),
+            Err(Error::FragmentLength {
+                expected: 8,
+                actual: 5,
+                ..
+            })
+        ));
+        assert_eq!(cache.cached(&fragment), None);
+
+        let whole = Fragment::new("file");
+        cache.get(&cache.data(whole.clone())).unwrap();
+        assert_eq!(cache.cached(&whole).as_deref(), Some(&b"short"[..]));
+    }
+
+    /// Serves each path's name as its body with HTTP keep-alive. Returns the
+    /// base URL and a count of accepted TCP connections.
+    fn spawn_keep_alive_server() -> (String, Arc<AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = connections.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.unwrap());
+                    loop {
+                        let mut request_line = String::new();
+                        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut header = String::new();
+                        while reader.read_line(&mut header).unwrap() > 2 {
+                            header.clear();
+                        }
+                        let path = request_line.split(' ').nth(1).unwrap();
+                        let body = path.trim_start_matches('/');
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        reader.get_mut().write_all(response.as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        (base, connections)
+    }
+
+    #[test]
+    fn fragment_cache_reuses_pooled_connections_across_readers() {
+        let (base, connections) = spawn_keep_alive_server();
+        let fragments = |paths: &[&str]| -> Vec<Fragment> {
+            paths
+                .iter()
+                .map(|path| format!("{base}/{path}").into())
+                .collect()
+        };
+        let read_all = |mut reader: MpegStreamReader| {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+
+        let cache = Arc::new(FragmentCache::default());
+        let first =
+            MpegStreamReader::new_with_cache(fragments(&["init", "a"]), None, false, cache.clone())
+                .unwrap();
+        assert_eq!(read_all(first), b"inita");
+        let second =
+            MpegStreamReader::new_with_cache(fragments(&["init", "b"]), None, false, cache.clone())
+                .unwrap();
+        assert_eq!(read_all(second), b"initb");
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+
+        // Separate agents cannot share the connection.
+        let third = MpegStreamReader::new(fragments(&["init", "c"]), None, false).unwrap();
+        assert_eq!(read_all(third), b"initc");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fragment_cache_remembers_head_lengths_across_readers() {
+        let (cache, transport) = counting_cache(&["a", "bb"]);
+        let fragments = || vec!["init".into(), "a".into(), "bb".into()];
+        let first =
+            MpegStreamReader::new_with_cache(fragments(), None, true, cache.clone()).unwrap();
+        wait_for(|| cache.known_size(&"bb".into()).is_some());
+        drop(first);
+
+        // The rebuilt reader starts with every size and sends no HEAD at all.
+        let mut second =
+            MpegStreamReader::new_with_cache(fragments(), None, true, cache.clone()).unwrap();
+        assert!(second.shared.lock().all_sizes_known());
+        assert_eq!(second.seek_bytes(SeekFrom::End(0)).unwrap().byte, Some(7));
+        assert_eq!(transport.heads(), ["a", "bb"]);
+        assert_eq!(cache.cached(&"bb".into()), None);
+
+        // A later GET's body takes precedence over the HEAD length.
+        transport.released.store(true, Ordering::SeqCst);
+        wait_for(|| cache.cached(&"bb".into()).is_some());
+        assert_eq!(cache.known_size(&"bb".into()), Some(2));
     }
 }

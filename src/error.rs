@@ -48,9 +48,9 @@ pub enum Error {
     #[error("MPEG-DASH segment count needs a Period duration, presentation duration or endNumber")]
     DashManifestMissingDuration,
 
-    /// A MPEG-DASH SegmentTemplate URL or attribute could not be expanded
-    #[error("Invalid MPEG-DASH segment template: {0}")]
-    DashManifestInvalidTemplate(String),
+    /// A MPEG-DASH SegmentTemplate or SegmentList could not be expanded into segments
+    #[error("Invalid MPEG-DASH segment addressing: {0}")]
+    DashManifestInvalidSegments(String),
 
     /// A MPEG-DASH URL could not be parsed or resolved against its BaseURL chain
     #[error("Cannot resolve MPEG-DASH URL {0}: {1}")]
@@ -67,6 +67,21 @@ pub enum Error {
     /// A MPEG-DASH representation had a zero or out-of-range timescale
     #[error("MPEG-DASH representation has an invalid timescale")]
     DashManifestMissingTimescale,
+
+    /// A byte range was not in `first-last` form with `first <= last`
+    #[error("Invalid byte range: {0}")]
+    InvalidByteRange(String),
+
+    /// A ranged fragment's body did not match the length of its range
+    #[error("Fragment {fragment} returned {actual} bytes, expected {expected}")]
+    FragmentLength {
+        /// The fragment URL and range
+        fragment: String,
+        /// Bytes covered by the range
+        expected: u64,
+        /// Bytes received
+        actual: u64,
+    },
 
     /// Failed to initialize audio stream
     #[error("Stream initialization error: {0}")]

@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod manifest;
+mod manifest_segment_list;
 mod manifest_template;
 #[cfg(feature = "rodio")]
 pub mod rodio;
@@ -12,4 +13,7 @@ pub use error::Error;
 pub use manifest::DashManifest;
 #[cfg(feature = "rodio")]
 pub use rodio::DashSource;
-pub use stream::{MediaTimeline, MpegStreamReader, Position, TimeAccuracy, TimePosition};
+pub use stream::{
+    ByteRange, Fragment, FragmentCache, MediaTimeline, MpegStreamReader, Position, TimeAccuracy,
+    TimePosition, Transport,
+};

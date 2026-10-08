@@ -3,11 +3,12 @@
 use std::time::Duration;
 
 use crate::error::Error;
+use crate::manifest_segment_list::ListChain;
 use crate::manifest_template::{Segments, TemplateChain, TemplateValues};
-use crate::stream::MediaTimeline;
-use crate::stream::MpegStreamReader;
+use crate::stream::{Fragment, FragmentCache, MediaTimeline, MpegStreamReader};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use dash_mpd_core::{AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation};
+use std::sync::Arc;
 use ureq::ResponseExt;
 use url::Url;
 
@@ -62,6 +63,37 @@ impl<'a> Selected<'a> {
         ])
     }
 
+    /// Segment lists from the most to the least specific level.
+    fn lists(self) -> ListChain<'a> {
+        ListChain::new([
+            self.representation.SegmentList.as_ref(),
+            self.adaptation.SegmentList.as_ref(),
+            self.period.SegmentList.as_ref(),
+        ])
+    }
+
+    /// Whether the most specific level with segment addressing uses a
+    /// `SegmentList` rather than a `SegmentTemplate`.
+    fn uses_segment_list(self) -> bool {
+        [
+            (
+                self.representation.SegmentTemplate.is_some(),
+                self.representation.SegmentList.is_some(),
+            ),
+            (
+                self.adaptation.SegmentTemplate.is_some(),
+                self.adaptation.SegmentList.is_some(),
+            ),
+            (
+                self.period.SegmentTemplate.is_some(),
+                self.period.SegmentList.is_some(),
+            ),
+        ]
+        .into_iter()
+        .find(|&(template, list)| template || list)
+        .is_some_and(|(_, list)| list)
+    }
+
     fn mime_type(self) -> Option<&'a str> {
         self.representation
             .mimeType
@@ -88,23 +120,37 @@ impl<'a> Selected<'a> {
     }
 
     fn segments(self) -> Result<Segments, Error> {
-        self.templates().segments(self.period_duration())
+        if self.uses_segment_list() {
+            self.lists().segments(self.period_duration())
+        } else {
+            self.templates().segments(self.period_duration())
+        }
     }
 
-    fn fragment_urls(
+    fn fragments(
         self,
         manifest_url: Option<&Url>,
         segments: &Segments,
-    ) -> Result<Vec<String>, Error> {
-        let values = TemplateValues {
-            representation_id: self.id(),
-            bandwidth: self.representation.bandwidth,
-            ..TemplateValues::default()
+    ) -> Result<Vec<Fragment>, Error> {
+        let fragments = if self.uses_segment_list() {
+            self.lists().fragments(segments)?
+        } else {
+            let values = TemplateValues {
+                representation_id: self.id(),
+                bandwidth: self.representation.bandwidth,
+                ..TemplateValues::default()
+            };
+            self.templates().fragments(values, segments)?
         };
-        let urls = self.templates().fragment_urls(values, segments)?;
         let base = self.base_url(manifest_url)?;
-        urls.iter()
-            .map(|url| resolve_url(base.as_ref(), url).map(String::from))
+        fragments
+            .into_iter()
+            .map(|fragment| {
+                Ok(Fragment {
+                    url: resolve_url(base.as_ref(), &fragment.url)?.into(),
+                    ..fragment
+                })
+            })
             .collect()
     }
 
@@ -126,6 +172,7 @@ impl<'a> Selected<'a> {
 }
 
 /// Resolves `reference` (RFC 3986) against `base`; without a base it must be absolute.
+/// An empty reference is the base itself.
 fn resolve_url(base: Option<&Url>, reference: &str) -> Result<Url, Error> {
     let reference = reference.trim();
     match base {
@@ -216,10 +263,30 @@ impl DashManifest {
     /// the containing fMP4 fragment and returns a
     /// [`crate::stream::Position`].
     pub fn stream(&self, id: impl AsRef<str>, eager_head: bool) -> Result<MpegStreamReader, Error> {
-        let selected = self.select(id.as_ref())?;
+        let (fragments, timeline) = self.stream_parts(id.as_ref())?;
+        MpegStreamReader::new(fragments, Some(timeline), eager_head)
+    }
+
+    /// Like [`DashManifest::stream`], but fetches through `cache`.
+    ///
+    /// Pass clones of one [`FragmentCache`] to share pooled connections and
+    /// downloaded fragments between readers, such as a reader rebuilt after a
+    /// seek.
+    pub fn stream_with_cache(
+        &self,
+        id: impl AsRef<str>,
+        eager_head: bool,
+        cache: Arc<FragmentCache>,
+    ) -> Result<MpegStreamReader, Error> {
+        let (fragments, timeline) = self.stream_parts(id.as_ref())?;
+        MpegStreamReader::new_with_cache(fragments, Some(timeline), eager_head, cache)
+    }
+
+    fn stream_parts(&self, id: &str) -> Result<(Vec<Fragment>, MediaTimeline), Error> {
+        let selected = self.select(id)?;
         let segments = selected.segments()?;
-        let urls = selected.fragment_urls(self.base_url.as_ref(), &segments)?;
-        MpegStreamReader::new(urls, Some(segments.media_timeline()), eager_head)
+        let fragments = selected.fragments(self.base_url.as_ref(), &segments)?;
+        Ok((fragments, segments.media_timeline()))
     }
 
     /// Representations in document order, across all periods and adaptation sets.
@@ -238,13 +305,14 @@ impl DashManifest {
             .map(|selected| selected.representation)
     }
 
-    /// Initialization URL followed by media segment URLs in timeline order.
+    /// Initialization fragment followed by media segment fragments in timeline order.
     ///
-    /// URLs are expanded from the representation's `SegmentTemplate` and
-    /// resolved against the `BaseURL` chain and [`DashManifest::base_url`].
-    pub fn fragment_urls(&self, id: impl AsRef<str>) -> Result<Vec<String>, Error> {
+    /// Fragments come from the representation's `SegmentTemplate` or
+    /// `SegmentList` (whose entries may carry byte ranges), with URLs resolved
+    /// against the `BaseURL` chain and [`DashManifest::base_url`].
+    pub fn fragments(&self, id: impl AsRef<str>) -> Result<Vec<Fragment>, Error> {
         let selected = self.select(id.as_ref())?;
-        selected.fragment_urls(self.base_url.as_ref(), &selected.segments()?)
+        selected.fragments(self.base_url.as_ref(), &selected.segments()?)
     }
 
     /// Media-segment durations in timeline order, with the DASH timescale.
@@ -324,6 +392,18 @@ fn common_encryption_scheme(protections: &[ContentProtection]) -> Option<String>
 mod tests {
     use super::*;
 
+    fn urls(manifest: &DashManifest, id: &str) -> Vec<String> {
+        manifest
+            .fragments(id)
+            .unwrap()
+            .into_iter()
+            .map(|fragment| {
+                assert_eq!(fragment.range, None);
+                fragment.url
+            })
+            .collect()
+    }
+
     #[test]
     fn parses_dash_manifest_fields() {
         let xml = r#"
@@ -374,11 +454,11 @@ mod tests {
         assert_eq!(aac.codecs.as_deref(), Some("mp4a.40.2"));
         assert_eq!(aac.bandwidth, Some(320_000));
         assert!(matches!(
-            manifest.fragment_urls("FLAC"),
+            manifest.fragments("FLAC"),
             Err(Error::DashManifestMissingDuration)
         ));
         assert!(matches!(
-            manifest.fragment_urls("AACLC"),
+            manifest.fragments("AACLC"),
             Err(Error::DashManifestMissingTimeline)
         ));
         assert!(matches!(
@@ -413,7 +493,7 @@ mod tests {
 
         let manifest = DashManifest::new(xml).unwrap();
         assert_eq!(
-            manifest.fragment_urls("AACLC").unwrap(),
+            urls(&manifest, "AACLC"),
             [
                 "https://cdn.example/0.mp4?token=abc&info=init",
                 "https://cdn.example/1.mp4?token=abc&info=media",
@@ -453,7 +533,7 @@ mod tests {
             .with_base_url("https://cdn.example/track/manifest.mpd")
             .unwrap();
         assert_eq!(
-            manifest.fragment_urls("FLAC").unwrap(),
+            urls(&manifest, "FLAC"),
             [
                 "https://cdn.example/track/init.mp4",
                 "https://cdn.example/track/5.mp4",
@@ -594,7 +674,7 @@ mod tests {
     #[test]
     fn parses_sample_tidal_manifest() {
         let manifest = DashManifest::new(include_str!("../test_files/manifest.xml")).unwrap();
-        assert_eq!(manifest.fragment_urls("FLAC").unwrap().len(), 86);
+        assert_eq!(urls(&manifest, "FLAC").len(), 86);
         assert_eq!(manifest.mime_type("FLAC").unwrap(), Some("audio/mp4"));
         assert_eq!(manifest.protection_scheme("FLAC").unwrap(), None);
     }
@@ -661,7 +741,7 @@ mod tests {
             Some("https://cdn.example/manifests/track.mpd?sig=1")
         );
         assert_eq!(
-            manifest.fragment_urls("FLAC").unwrap(),
+            urls(&manifest, "FLAC"),
             [
                 "https://cdn.example/media/audio/flac/FLAC-init.mp4",
                 "https://cdn.example/media/audio/flac/1411200/001.m4s",
@@ -677,7 +757,7 @@ mod tests {
             }
         );
         assert_eq!(
-            manifest.fragment_urls("AACLC").unwrap(),
+            urls(&manifest, "AACLC"),
             [
                 "https://other.example/aac/i.mp4",
                 "https://other.example/aac/0.m4s"
@@ -702,7 +782,7 @@ mod tests {
         "#;
         let manifest = DashManifest::new(xml).unwrap();
         assert!(matches!(
-            manifest.fragment_urls("FLAC"),
+            manifest.fragments("FLAC"),
             Err(Error::DashManifestUrl(url, url::ParseError::RelativeUrlWithoutBase)) if url == "init.mp4"
         ));
         assert!(matches!(
@@ -799,7 +879,7 @@ mod tests {
             Some(format!("http://{address}/tracks/7/manifest.mpd").as_str())
         );
         assert_eq!(
-            manifest.fragment_urls("FLAC").unwrap(),
+            urls(&manifest, "FLAC"),
             [
                 format!("http://{address}/tracks/7/init.mp4"),
                 format!("http://{address}/tracks/7/1.mp4"),
@@ -816,5 +896,237 @@ mod tests {
                 .unwrap();
         assert!(manifest.representation("AACLC").is_some());
         assert_eq!(manifest.base_url(), None);
+    }
+
+    fn ranged(url: &str, start: u64, end: u64) -> Fragment {
+        Fragment::with_range(url, crate::ByteRange::new(start, end).unwrap())
+    }
+
+    #[test]
+    fn segment_list_media_ranges_address_one_file() {
+        let xml = r#"
+            <MPD>
+                <Period>
+                    <AdaptationSet mimeType="audio/mp4">
+                        <Representation id="FLAC" codecs="flac">
+                            <BaseURL>track.mp4</BaseURL>
+                            <SegmentList timescale="1000" duration="4000">
+                                <Initialization range="0-837"/>
+                                <SegmentURL mediaRange="838-50000"/>
+                                <SegmentURL mediaRange="50001-90000"/>
+                            </SegmentList>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+        "#;
+        let manifest = DashManifest::new(xml)
+            .unwrap()
+            .with_base_url("https://cdn.example/audio/manifest.mpd")
+            .unwrap();
+        assert_eq!(
+            manifest.fragments("FLAC").unwrap(),
+            [
+                ranged("https://cdn.example/audio/track.mp4", 0, 837),
+                ranged("https://cdn.example/audio/track.mp4", 838, 50_000),
+                ranged("https://cdn.example/audio/track.mp4", 50_001, 90_000),
+            ]
+        );
+        assert_eq!(
+            manifest.media_timeline("FLAC").unwrap(),
+            MediaTimeline {
+                timescale: 1000,
+                media_durations: vec![4000, 4000],
+            }
+        );
+    }
+
+    #[test]
+    fn segment_list_inherits_initialization_and_timeline() {
+        let xml = r#"
+            <MPD>
+                <Period>
+                    <AdaptationSet mimeType="audio/mp4">
+                        <SegmentList timescale="100">
+                            <Initialization sourceURL="init.mp4"/>
+                            <SegmentTimeline><S d="200" r="1"/><S d="50"/></SegmentTimeline>
+                        </SegmentList>
+                        <Representation id="AACLC" codecs="mp4a.40.2">
+                            <SegmentList>
+                                <SegmentURL media="a.m4s"/>
+                                <SegmentURL media="b.m4s"/>
+                                <SegmentURL media="c.m4s"/>
+                            </SegmentList>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+        "#;
+        let manifest = DashManifest::new(xml)
+            .unwrap()
+            .with_base_url("https://cdn.example/aac/")
+            .unwrap();
+        assert_eq!(
+            urls(&manifest, "AACLC"),
+            [
+                "https://cdn.example/aac/init.mp4",
+                "https://cdn.example/aac/a.m4s",
+                "https://cdn.example/aac/b.m4s",
+                "https://cdn.example/aac/c.m4s",
+            ]
+        );
+        assert_eq!(
+            manifest.media_timeline("AACLC").unwrap().media_durations,
+            [200, 200, 50]
+        );
+    }
+
+    #[test]
+    fn segment_list_drops_urls_past_the_period() {
+        let xml = r#"
+            <MPD mediaPresentationDuration="PT5S">
+                <Period>
+                    <AdaptationSet mimeType="audio/mp4">
+                        <Representation id="FLAC" codecs="flac">
+                            <SegmentList timescale="1" duration="2">
+                                <Initialization sourceURL="https://cdn.example/init.mp4"/>
+                                <SegmentURL media="https://cdn.example/1.m4s"/>
+                                <SegmentURL media="https://cdn.example/2.m4s"/>
+                                <SegmentURL media="https://cdn.example/3.m4s"/>
+                                <SegmentURL media="https://cdn.example/4.m4s"/>
+                            </SegmentList>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+        "#;
+        let manifest = DashManifest::new(xml).unwrap();
+        assert_eq!(
+            urls(&manifest, "FLAC"),
+            [
+                "https://cdn.example/init.mp4",
+                "https://cdn.example/1.m4s",
+                "https://cdn.example/2.m4s",
+                "https://cdn.example/3.m4s",
+            ]
+        );
+        assert_eq!(
+            manifest.media_timeline("FLAC").unwrap().media_durations,
+            [2, 2, 1]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_segment_list() {
+        let manifest = |list: &str| {
+            DashManifest::new(format!(
+                r#"<MPD><Period><AdaptationSet><Representation id="FLAC">{list}</Representation></AdaptationSet></Period></MPD>"#
+            ))
+            .unwrap()
+            .with_base_url("https://cdn.example/")
+            .unwrap()
+        };
+        assert!(matches!(
+            manifest(r#"<SegmentList duration="1"><Initialization/></SegmentList>"#)
+                .fragments("FLAC"),
+            Err(Error::DashManifestInvalidSegments(_))
+        ));
+        assert!(matches!(
+            manifest(r#"<SegmentList duration="1"><SegmentURL media="a.m4s"/></SegmentList>"#)
+                .fragments("FLAC"),
+            Err(Error::DashManifestMissingUrls)
+        ));
+        assert!(matches!(
+            manifest(
+                r#"<SegmentList duration="1"><Initialization/><SegmentURL mediaRange="9-1"/></SegmentList>"#
+            )
+            .fragments("FLAC"),
+            Err(Error::InvalidByteRange(range)) if range == "9-1"
+        ));
+    }
+
+    #[test]
+    fn segment_template_falls_back_to_initialization_element() {
+        let xml = r#"
+            <MPD>
+                <Period>
+                    <AdaptationSet mimeType="audio/mp4">
+                        <Representation id="FLAC" codecs="flac">
+                            <BaseURL>https://cdn.example/track.mp4</BaseURL>
+                            <SegmentTemplate media="$Number$.m4s">
+                                <Initialization range="0-99"/>
+                                <SegmentTimeline><S d="1"/></SegmentTimeline>
+                            </SegmentTemplate>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+        "#;
+        let manifest = DashManifest::new(xml).unwrap();
+        assert_eq!(
+            manifest.fragments("FLAC").unwrap(),
+            [
+                ranged("https://cdn.example/track.mp4", 0, 99),
+                Fragment::new("https://cdn.example/1.m4s"),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_with_cache_shares_cached_fragments() {
+        use crate::Transport;
+        use std::io::Read;
+        use std::sync::Mutex;
+
+        /// Serves each URL's last path segment as its body and records requests.
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<String>>);
+
+        impl Transport for Recording {
+            fn get(
+                &self,
+                fragment: &Fragment,
+                _size_hint: Option<u64>,
+            ) -> Result<Arc<[u8]>, Error> {
+                self.0.lock().unwrap().push(fragment.url.clone());
+                Ok(fragment.url.rsplit('/').next().unwrap().as_bytes().into())
+            }
+        }
+
+        let xml = r#"
+            <MPD>
+                <Period>
+                    <AdaptationSet mimeType="audio/mp4">
+                        <Representation id="FLAC" codecs="flac">
+                            <SegmentTemplate initialization="init" media="$Number$">
+                                <SegmentTimeline><S d="1" r="1"/></SegmentTimeline>
+                            </SegmentTemplate>
+                        </Representation>
+                    </AdaptationSet>
+                </Period>
+            </MPD>
+        "#;
+        let manifest = DashManifest::new(xml)
+            .unwrap()
+            .with_base_url("https://cdn.example/")
+            .unwrap();
+        let transport = Arc::new(Recording::default());
+        let cache = Arc::new(FragmentCache::new(transport.clone()));
+        for _ in 0..2 {
+            let mut reader = manifest
+                .stream_with_cache("FLAC", false, cache.clone())
+                .unwrap();
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"init12");
+        }
+        assert_eq!(
+            *transport.0.lock().unwrap(),
+            [
+                "https://cdn.example/init",
+                "https://cdn.example/1",
+                "https://cdn.example/2",
+            ]
+        );
     }
 }

@@ -2,14 +2,15 @@
 //!
 //! Fills `$RepresentationID$`, `$Number$`, `$Time$` and `$Bandwidth$` URL
 //! identifiers (with optional `%0[width]d` padding and `$$` escapes), and lists
-//! media segments from either a `SegmentTimeline` or a fixed `@duration`.
+//! media segments from either a `SegmentTimeline` or a fixed `@duration`. The
+//! segment timing here is shared with `SegmentList` addressing.
 
 use std::time::Duration;
 
-use dash_mpd_core::{S, SegmentTemplate, SegmentTimeline};
+use dash_mpd_core::{Initialization, S, SegmentTemplate, SegmentTimeline};
 
 use crate::error::Error;
-use crate::stream::MediaTimeline;
+use crate::stream::{Fragment, MediaTimeline};
 
 /// Values substituted for the `$...$` identifiers of a URL template.
 #[derive(Clone, Copy, Debug, Default)]
@@ -85,7 +86,7 @@ fn identifier_value(
 }
 
 fn invalid_template(template: &str, reason: &str) -> Error {
-    Error::DashManifestInvalidTemplate(format!("{template}: {reason}"))
+    Error::DashManifestInvalidSegments(format!("{template}: {reason}"))
 }
 
 /// One media segment generated from a template.
@@ -119,10 +120,64 @@ impl Segments {
     }
 }
 
-/// How the segments of a template are addressed.
-enum Addressing<'a> {
+/// How segments are timed.
+pub(crate) enum Addressing<'a> {
     Timeline(&'a SegmentTimeline),
     Duration(f64),
+}
+
+/// Segment timing attributes shared by `SegmentTemplate` and `SegmentList`,
+/// already resolved through DASH inheritance.
+pub(crate) struct Timing<'a> {
+    pub timescale: Option<u64>,
+    pub start_number: Option<u64>,
+    pub end_number: Option<u64>,
+    pub presentation_time_offset: Option<u64>,
+    pub addressing: Option<Addressing<'a>>,
+}
+
+impl Timing<'_> {
+    /// Lists media segments.
+    ///
+    /// `period_duration` bounds open-ended `S@r="-1"` repeats and `@duration`
+    /// addressing; it may be omitted when `end_number` provides the bound instead.
+    pub fn segments(self, period_duration: Option<Duration>) -> Result<Segments, Error> {
+        let timescale = u32::try_from(self.timescale.unwrap_or(1))
+            .ok()
+            .filter(|&timescale| timescale > 0)
+            .ok_or(Error::DashManifestMissingTimescale)?;
+        let bounds = Bounds {
+            start_number: self.start_number.unwrap_or(1),
+            end_number: self.end_number,
+            offset: self.presentation_time_offset.unwrap_or(0),
+            period_ticks: period_duration.map(|duration| to_ticks(duration, timescale)),
+        };
+
+        let mut segments = match self.addressing.ok_or(Error::DashManifestMissingTimeline)? {
+            Addressing::Timeline(timeline) => bounds.timeline_segments(&timeline.segments)?,
+            Addressing::Duration(duration) => bounds.duration_segments(duration)?,
+        };
+        if let Some(end_number) = bounds.end_number {
+            segments.retain(|segment| segment.number <= end_number);
+        }
+
+        Ok(Segments {
+            timescale,
+            segments,
+        })
+    }
+}
+
+/// An `Initialization` element as a fragment; a missing `@sourceURL` means the BaseURL itself.
+pub(crate) fn initialization_fragment(initialization: &Initialization) -> Result<Fragment, Error> {
+    Ok(Fragment {
+        url: initialization.sourceURL.clone().unwrap_or_default(),
+        range: initialization
+            .range
+            .as_deref()
+            .map(str::parse)
+            .transpose()?,
+    })
 }
 
 /// `SegmentTemplate` elements a representation inherits from, most specific first
@@ -146,74 +201,56 @@ impl<'a> TemplateChain<'a> {
         self.templates().find_map(field)
     }
 
-    /// Unresolved initialization URL followed by media segment URLs.
-    pub fn fragment_urls(
+    /// Initialization fragment followed by media segment fragments, with unresolved URLs.
+    ///
+    /// The initialization comes from `@initialization`, or else an inherited
+    /// `Initialization` element.
+    pub fn fragments(
         self,
         values: TemplateValues,
         segments: &Segments,
-    ) -> Result<Vec<String>, Error> {
-        let initialization = self
-            .get(|template| template.initialization.as_deref())
-            .ok_or(Error::DashManifestMissingUrls)?;
+    ) -> Result<Vec<Fragment>, Error> {
+        let initialization = match self.get(|template| template.initialization.as_deref()) {
+            Some(initialization) => Fragment::new(fill(initialization, &values)?),
+            None => initialization_fragment(
+                self.get(|template| template.Initialization.as_ref())
+                    .ok_or(Error::DashManifestMissingUrls)?,
+            )?,
+        };
         let media = self
             .get(|template| template.media.as_deref())
             .ok_or(Error::DashManifestMissingMediaTemplate)?;
 
-        let mut urls = Vec::with_capacity(segments.segments.len() + 1);
-        urls.push(fill(initialization, &values)?);
+        let mut fragments = Vec::with_capacity(segments.segments.len() + 1);
+        fragments.push(initialization);
         for segment in &segments.segments {
             let values = TemplateValues {
                 number: Some(segment.number),
                 time: Some(segment.time),
                 ..values
             };
-            urls.push(fill(media, &values)?);
+            fragments.push(Fragment::new(fill(media, &values)?));
         }
-        Ok(urls)
+        Ok(fragments)
     }
 
-    /// Lists media segments.
-    ///
-    /// `period_duration` bounds open-ended `S@r="-1"` repeats and `@duration`
-    /// addressing; it may be omitted when `@endNumber` provides the bound instead.
+    /// Lists media segments; see [`Timing::segments`].
     pub fn segments(self, period_duration: Option<Duration>) -> Result<Segments, Error> {
-        let timescale = self.get(|template| template.timescale).unwrap_or(1);
-        let timescale = u32::try_from(timescale)
-            .ok()
-            .filter(|&timescale| timescale > 0)
-            .ok_or(Error::DashManifestMissingTimescale)?;
-        let bounds = Bounds {
-            start_number: self.get(|template| template.startNumber).unwrap_or(1),
+        Timing {
+            timescale: self.get(|template| template.timescale),
+            start_number: self.get(|template| template.startNumber),
             end_number: self.get(|template| template.endNumber),
-            offset: self
-                .get(|template| template.presentationTimeOffset)
-                .unwrap_or(0),
-            period_ticks: period_duration.map(|duration| to_ticks(duration, timescale)),
-        };
-
-        // Timeline and @duration are exclusive; the most specific level that sets either wins.
-        let addressing = self
-            .templates()
-            .find_map(|template| {
+            presentation_time_offset: self.get(|template| template.presentationTimeOffset),
+            // Timeline and @duration are exclusive; the most specific level that sets either wins.
+            addressing: self.templates().find_map(|template| {
                 template
                     .SegmentTimeline
                     .as_ref()
                     .map(Addressing::Timeline)
                     .or(template.duration.map(Addressing::Duration))
-            })
-            .ok_or(Error::DashManifestMissingTimeline)?;
-        let mut segments = match addressing {
-            Addressing::Timeline(timeline) => bounds.timeline_segments(&timeline.segments)?,
-            Addressing::Duration(duration) => bounds.duration_segments(duration)?,
-        };
-        if let Some(end_number) = bounds.end_number {
-            segments.retain(|segment| segment.number <= end_number);
+            }),
         }
-
-        Ok(Segments {
-            timescale,
-            segments,
-        })
+        .segments(period_duration)
     }
 }
 
@@ -238,7 +275,7 @@ impl Bounds {
         let mut time = 0;
         for (index, entry) in entries.iter().enumerate() {
             if entry.d == 0 {
-                return Err(Error::DashManifestInvalidTemplate(
+                return Err(Error::DashManifestInvalidSegments(
                     "SegmentTimeline entry has a zero duration".to_owned(),
                 ));
             }
@@ -277,8 +314,8 @@ impl Bounds {
     /// Segments of a fixed `duration`; the last one is cut short at the end of the Period.
     fn duration_segments(&self, duration: f64) -> Result<Vec<Segment>, Error> {
         if !(duration.is_finite() && duration > 0.0) {
-            return Err(Error::DashManifestInvalidTemplate(format!(
-                "SegmentTemplate@duration {duration} is not positive"
+            return Err(Error::DashManifestInvalidSegments(format!(
+                "segment @duration {duration} is not positive"
             )));
         }
         if self.period_ticks.is_none() && self.end_number.is_none() {
@@ -364,7 +401,7 @@ mod tests {
         };
         assert!(matches!(
             fill("init-$Number$.mp4", &values),
-            Err(Error::DashManifestInvalidTemplate(message)) if message.contains("$Number$")
+            Err(Error::DashManifestInvalidSegments(message)) if message.contains("$Number$")
         ));
     }
 
@@ -372,7 +409,7 @@ mod tests {
     fn rejects_unsupported_format_tag() {
         assert!(matches!(
             fill("$Number%5x$.m4s", &values()),
-            Err(Error::DashManifestInvalidTemplate(message)) if message.contains("%5x")
+            Err(Error::DashManifestInvalidSegments(message)) if message.contains("%5x")
         ));
     }
 

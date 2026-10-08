@@ -59,16 +59,15 @@ reader.seek_time_coarse(Duration::from_secs(90))?;
 reader.read(&mut mpeg_buffer)?;
 ```
 
+If you create several readers for the same track, for example rebuilding one after a seek,
+`DashManifest::stream_with_cache` with a shared `FragmentCache` reuses pooled connections
+and never downloads a fragment twice, even while another reader's download is in flight.
+`DashSource` does this internally; use `DashSource::new_with_cache` to share a cache or to
+supply your own `Transport` through `FragmentCache::new`.
+
 ## Caveats
 
-Manifests are parsed with [dash-mpd-core](https://crates.io/crates/dash-mpd-core), and the full parsed
-`MPD` is available as `DashManifest::mpd` (the crate is re-exported as `tidal_dash::dash_mpd_core`).
-Streaming supports `SegmentTemplate` addressing, with either a `SegmentTimeline` or a fixed
-`@duration`, and the `$RepresentationID$`, `$Number$`, `$Time$` and `$Bandwidth$` identifiers
-(including `%0[width]d` padding). Relative URLs resolve through the `BaseURL` chain against the
-manifest's own URL: use `DashManifest::new_from_url` to fetch a manifest, or
-`DashManifest::with_base_url` when you load the XML yourself. `SegmentBase`, `SegmentList`,
-multi-period playback and live (`type="dynamic"`) manifests are not yet supported. Contributions
+`SegmentBase` and multi-period playback and live (`type="dynamic"`) manifests are not yet supported. Contributions
 to improve this are very welcome.
 
 ## Example player
