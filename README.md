@@ -21,7 +21,6 @@ use std::io::Read;
 use std::time::Duration;
 use playdash::DashManifest;
 
-# fn example() -> Result<(), Box<dyn std::error::Error>> {
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 let mut reader = manifest.stream("FLAC", true)?;
 
@@ -31,8 +30,6 @@ reader.read(&mut mpeg_buffer)?;
 // Seek to a specific timestamp. Lands at the start of the containing fragment.
 reader.seek_time_coarse(Duration::from_secs(90))?;
 reader.read(&mut mpeg_buffer)?;
-# Ok(())
-# }
 ```
 
 ## Rodio playback
@@ -49,7 +46,6 @@ rodio = { version = "0.22", default-features = false, features = ["playback"] }
 use rodio::{DeviceSinkBuilder, Player};
 use playdash::{DashManifest, DashSource};
 
-# fn example() -> Result<(), Box<dyn std::error::Error>> {
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 let source = DashSource::new(&manifest, "FLAC")?;
 
@@ -57,8 +53,6 @@ let device = DeviceSinkBuilder::open_default_sink()?;
 let player = Player::connect_new(device.mixer());
 player.append(source);
 player.sleep_until_end();
-# Ok(())
-# }
 ```
 
 ## Buffer progress
@@ -68,7 +62,6 @@ player.sleep_until_end();
 ```rust,no_run
 use playdash::{DashManifest, DashSource};
 
-# fn example() -> Result<(), Box<dyn std::error::Error>> {
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 let source = DashSource::new(&manifest, "FLAC")?;
 
@@ -82,8 +75,6 @@ source.buffer().on_change(|status| {
         status.ranges,
     );
 });
-# Ok(())
-# }
 ```
 
 ## Encrypted streams
@@ -99,15 +90,12 @@ playdash = { version = "0.1", features = ["encryption", "rodio"] }
 ```rust,no_run
 use playdash::{ContentKeys, DashManifest, DashSource};
 
-# fn example() -> Result<(), Box<dyn std::error::Error>> {
 let mut keys = ContentKeys::new();
 // KID and key as 32 hex digits; a UUID-form KID from `cenc:default_KID` also works.
 keys.insert_hex("0123456789abcdef0123456789abcdef", "00112233445566778899aabbccddeeff")?;
 
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 let source = DashSource::new_with_keys(&manifest, "FLAC", keys)?;
-# Ok(())
-# }
 ```
 
 ## Limitations
