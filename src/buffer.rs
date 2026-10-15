@@ -13,10 +13,11 @@ use std::time::Duration;
 /// # Examples
 ///
 /// ```no_run
+/// # #[cfg(feature = "rodio")]
+/// # fn example() -> Result<(), playdash::Error> {
 /// use playdash::{DashManifest, DashSource};
 /// use std::time::Duration;
 ///
-/// # fn example() -> Result<(), playdash::Error> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 /// let source = DashSource::new(&manifest, "FLAC")?;
 /// let status = source.buffer().status();

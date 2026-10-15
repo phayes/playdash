@@ -1,6 +1,6 @@
 [package]
 name = "playdash"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Patrick Hayes <patrick.d.hayes@gmail.com>"]
 description = "Parse MPEG-DASH manifests and set them up for progressive streaming playback"
 license = "MIT OR Apache-2.0"

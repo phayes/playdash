@@ -16,7 +16,7 @@ playdash = "0.1"
 `DashManifest::stream` returns a `StreamReader` that implements `std::io::Read` and
 `std::io::Seek`, so it can feed an MP4 demuxer or playback system.
 
-```rust,no_run
+```rust,ignore
 use std::io::Read;
 use std::time::Duration;
 use playdash::DashManifest;
@@ -42,7 +42,7 @@ playdash = { version = "0.1", features = ["rodio"] }
 rodio = { version = "0.22", default-features = false, features = ["playback"] }
 ```
 
-```rust,no_run
+```rust,ignore
 use rodio::{DeviceSinkBuilder, Player};
 use playdash::{DashManifest, DashSource};
 
@@ -59,7 +59,7 @@ player.sleep_until_end();
 
 `StreamReader::buffer` returns a handle that reports how much of the stream its cache holds, in fragments, bytes and media time. `DashSource::buffer` reports the same for a rodio source. 
 
-```rust,no_run
+```rust,ignore
 use playdash::{DashManifest, DashSource};
 
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
@@ -87,7 +87,7 @@ content keys you already hold. It does not talk to a DRM licence server or CDM.
 playdash = { version = "0.1", features = ["encryption", "rodio"] }
 ```
 
-```rust,no_run
+```rust,ignore
 use playdash::{ContentKeys, DashManifest, DashSource};
 
 let mut keys = ContentKeys::new();

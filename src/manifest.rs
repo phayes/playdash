@@ -926,10 +926,9 @@ mod tests {
         ));
     }
 
-    // Tidal-style manifest: `group="main"` is not an integer, which dash-mpd-core 0.1.0
-    // rejects. The `dash_mpd_tidal_fix` branch uses a patched dash-mpd-core that accepts it.
+    // Tidal-style manifest: `group="main"` is not an integer, which upstream dash-mpd-core 0.1.0
+    // rejects. The vendored copy ignores the non-conformant value instead.
     #[test]
-    #[ignore = "needs a dash-mpd-core release that accepts non-numeric AdaptationSet@group"]
     fn parses_sample_manifest() {
         let manifest = DashManifest::new(
             r#"<?xml version='1.0' encoding='UTF-8'?>
