@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use dash_mpd_core::{Initialization, S, SegmentTemplate, SegmentTimeline};
+use crate::vendor::dash_mpd_core::{Initialization, S, SegmentTemplate, SegmentTimeline};
 
 use crate::error::Error;
 use crate::stream::{Fragment, MediaTimeline, parse_byte_range};

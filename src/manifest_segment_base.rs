@@ -7,7 +7,9 @@
 
 use std::ops::RangeInclusive;
 
-use dash_mpd_core::{Initialization, S, SegmentBase, SegmentList, SegmentTimeline, SegmentURL};
+use crate::vendor::dash_mpd_core::{
+    Initialization, S, SegmentBase, SegmentList, SegmentTimeline, SegmentURL,
+};
 
 use crate::error::Error;
 use crate::stream::{Fragment, Transport, parse_byte_range};

@@ -7,11 +7,11 @@ use crate::manifest_segment_base::BaseChain;
 use crate::manifest_segment_list::ListChain;
 use crate::manifest_template::{Segments, TemplateChain, TemplateValues};
 use crate::stream::{Fragment, FragmentCache, MediaTimeline, StreamReader, Transport};
-use base64::{Engine, engine::general_purpose::STANDARD};
-use dash_mpd_core::{
+use crate::vendor::dash_mpd_core::{
     AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation as CoreRepresentation,
     SegmentList,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use std::collections::HashMap;
 use std::sync::Arc;
 use ureq::ResponseExt;
@@ -337,7 +337,7 @@ impl DashManifest {
     /// from using other representations.
     pub fn new(dash_xml: impl AsRef<str>) -> Result<Self, Error> {
         let mut manifest = Self {
-            mpd: dash_mpd_core::parse(dash_xml.as_ref())?,
+            mpd: crate::vendor::dash_mpd_core::parse(dash_xml.as_ref())?,
             base_url: None,
             segment_index_errors: HashMap::new(),
         };

@@ -16,9 +16,6 @@ categories = ["multimedia::audio"]
 aes = { version = "0.9", optional = true }
 base64 = "0.23"
 ctr = { version = "0.10", optional = true }
-# dash-mpd-core 0.1.0 fails to build without its `log` feature (it imports `tracing`
-# unconditionally), so it stays on regardless of our own `log` feature.
-dash-mpd-core = { version = "0.1", default-features = false, features = ["log"] }
 log = { version = "^0.4", optional = true }
 rodio = { version = "0.22", optional = true, default-features = false, features = [
     "symphonia-isomp4",
@@ -26,6 +23,17 @@ rodio = { version = "0.22", optional = true, default-features = false, features 
 thiserror = "^2.0"
 ureq = { version = "3.1", default-features = false, features = ["rustls"] }
 url = "2.5"
+
+# Vendored dash-mpd-core (src/vendor/dash_mpd_core). It also uses `thiserror`, `url` and,
+# with our `log` feature, `log` from above.
+chrono = { version = "0.4.45", features = ["serde"] }
+iso8601 = "0.6.5"
+num-traits = "0.2.19"
+quick-xml = { version = "0.42.0", features = ["serialize", "overlapped-lists"] }
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_path_to_error = "0.1.20"
+serde_with = "3.23.0"
 
 [features]
 default = ["log"]

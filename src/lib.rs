@@ -12,6 +12,7 @@ mod manifest_template;
 #[cfg(feature = "rodio")]
 mod rodio;
 mod stream;
+mod vendor;
 
 #[doc(inline)]
 pub use buffer::{BufferAmount, BufferHandle, BufferStatus, BufferTotal};

@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use dash_mpd_core::{SegmentList, SegmentURL};
+use crate::vendor::dash_mpd_core::{SegmentList, SegmentURL};
 
 use crate::error::Error;
 use crate::manifest_template::{Addressing, Segments, Timing, initialization_fragment};

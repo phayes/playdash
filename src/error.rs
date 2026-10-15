@@ -17,7 +17,7 @@ pub enum Error {
 
     /// MPEG-DASH manifest XML could not be parsed
     #[error("MPEG-DASH manifest parsing failed: {0}")]
-    DashManifestParse(#[from] dash_mpd_core::DashMpdError),
+    DashManifestParse(#[from] crate::vendor::dash_mpd_core::DashMpdError),
 
     /// An MPEG-DASH representation did not include an initialization URL
     #[error("MPEG-DASH representation is missing an initialization URL")]
