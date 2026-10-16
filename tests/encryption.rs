@@ -3,8 +3,8 @@
 #![cfg(all(feature = "encryption", feature = "rodio"))]
 
 use playdash::{
-    BufferStatus, ContentKeys, DashManifest, DashSource, Error, Fragment, FragmentCache,
-    StreamReader, Transport,
+    BufferStatus, Bytes, ContentKeys, DashManifest, DashSource, Error, Fragment, FragmentCache,
+    FragmentStream, Fragments, Transport,
 };
 use rodio::{Decoder, Source};
 use std::io::Cursor;
@@ -25,12 +25,12 @@ fn fixture(name: &str) -> Vec<u8> {
 struct Fixtures;
 
 impl Transport for Fixtures {
-    fn get(&self, fragment: &Fragment, _size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
+    fn get(&self, fragment: &Fragment, _size_hint: Option<u64>) -> Result<Bytes, Error> {
         let name = fragment.url.strip_prefix(BASE).expect("fixture URL");
-        let body = fixture(name);
+        let body = Bytes::from(fixture(name));
         Ok(match &fragment.range {
-            Some(range) => body[*range.start() as usize..=*range.end() as usize].into(),
-            None => body.into(),
+            Some(range) => body.slice(*range.start() as usize..=*range.end() as usize),
+            None => body,
         })
     }
 }
@@ -51,7 +51,7 @@ impl Gated {
 }
 
 impl Transport for Gated {
-    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
+    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error> {
         if fragment.url.ends_with("_3.m4s") {
             let open = self.open.lock().unwrap();
             drop(self.opened.wait_while(open, |open| !*open).unwrap());
@@ -124,9 +124,9 @@ fn plain_samples() -> Vec<f32> {
     samples
 }
 
-/// Byte ranges of `ftyp`+`moov`, then each `moof`+`mdat`, in a single
-/// fragmented MP4 file.
-fn split_fragments(file: &[u8]) -> Vec<std::ops::RangeInclusive<u64>> {
+/// The fragments of `file`, a single fragmented MP4 file at `url`: the
+/// `ftyp`+`moov` byte range, then each `moof`+`mdat`.
+fn split_fragments(url: &str, file: &[u8]) -> Fragments {
     let mut ranges = Vec::new();
     let (mut start, mut pos) = (0, 0);
     while pos < file.len() {
@@ -142,15 +142,16 @@ fn split_fragments(file: &[u8]) -> Vec<std::ops::RangeInclusive<u64>> {
         }
         pos = end;
     }
-    ranges
+    let mut fragments = ranges
+        .into_iter()
+        .map(|range| Fragment::with_range(url, range));
+    let init = fragments.next().expect("a moov");
+    Fragments::new(init, fragments)
 }
 
-fn ranged_reader(name: &str, cache: Arc<FragmentCache>) -> StreamReader {
-    let fragments = split_fragments(&fixture(name))
-        .into_iter()
-        .map(|range| Fragment::with_range(format!("{BASE}{name}"), range))
-        .collect();
-    StreamReader::new_with_cache(fragments, None, false, cache).unwrap()
+fn ranged_reader(name: &str, cache: Arc<FragmentCache>) -> FragmentStream {
+    let fragments = split_fragments(&format!("{BASE}{name}"), &fixture(name));
+    FragmentStream::new_with_cache(fragments, None, cache).unwrap()
 }
 
 #[test]
@@ -171,6 +172,22 @@ fn decrypts_shaka_cenc_dash() {
 fn decrypts_ffmpeg_cenc_byte_ranges() {
     let reader = ranged_reader("ffmpeg_cenc.mp4", keyed_cache());
     assert_eq!(decode(reader), plain_samples());
+}
+
+#[test]
+fn iterates_decrypted_fragments() {
+    let manifest = manifest("shaka_cbcs.mpd");
+    let fragments: Vec<_> = manifest
+        .stream_with_cache("0", keyed_cache())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        fragments.len(),
+        1 + manifest.fragments("0").unwrap().media.len()
+    );
+    let joined: Vec<u8> = fragments.iter().flatten().copied().collect();
+    assert_eq!(decode(Cursor::new(joined)), plain_samples());
 }
 
 #[test]
@@ -231,13 +248,14 @@ fn cache_holds_same_length_plaintext() {
     let source = DashSource::new_with_cache(&manifest, "0", cache.clone()).unwrap();
     assert!(source.count() > 0);
 
-    for fragment in manifest.fragments("0").unwrap() {
-        let raw = Fixtures.get(&fragment, None).unwrap();
-        let cached = cache.cached(&fragment).expect("fetched during playback");
+    let fragments = manifest.fragments("0").unwrap();
+    for fragment in std::iter::once(&fragments.init).chain(&fragments.media) {
+        let raw = Fixtures.get(fragment, None).unwrap();
+        let cached = cache.cached(fragment).expect("fetched during playback");
         assert_eq!(cached.len(), raw.len(), "{fragment}");
         assert_ne!(cached, raw, "{fragment} was not decrypted");
     }
-    let init = cache.cached(&manifest.fragments("0").unwrap()[0]).unwrap();
+    let init = cache.cached(&fragments.init).unwrap();
     assert!(!init.windows(4).any(|window| window == b"enca"));
 }
 
@@ -261,4 +279,120 @@ fn protected_dash_without_keys_is_rejected() {
         DashSource::new_with_cache(&manifest("shaka_cbcs.mpd"), "0", cache),
         Err(Error::RodioProtectedContent(scheme)) if scheme == "cbcs"
     ));
+}
+
+/// The same fixtures through the async `FragmentStream`, served over HTTP.
+#[cfg(feature = "async")]
+mod nonblocking {
+    use super::*;
+    use futures_util::StreamExt;
+    use playdash::nonblocking::{FragmentCache, FragmentStream};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    /// Serves the fixtures by file name on a local port, answering `Range`
+    /// requests with 206. Returns the base URL.
+    fn serve_fixtures() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.unwrap());
+                    let mut request_line = String::new();
+                    reader.read_line(&mut request_line).unwrap();
+                    let name = request_line.split(' ').nth(1).unwrap()[1..].to_owned();
+                    let mut range = None;
+                    let mut header = String::new();
+                    while reader.read_line(&mut header).unwrap() > 2 {
+                        if let Some(value) = header
+                            .to_ascii_lowercase()
+                            .trim()
+                            .strip_prefix("range: bytes=")
+                        {
+                            let (start, end) = value.split_once('-').unwrap();
+                            range = Some(start.parse::<usize>().unwrap()..=end.parse().unwrap());
+                        }
+                        header.clear();
+                    }
+                    let file = fixture(&name);
+                    let (status, body) = match range {
+                        Some(range) => ("206 Partial Content", &file[range]),
+                        None => ("200 OK", &file[..]),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let stream = reader.get_mut();
+                    stream.write_all(head.as_bytes()).unwrap();
+                    stream.write_all(body).unwrap();
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// The DASH fixture `name`, served from `base`.
+    fn async_manifest(base: &str, name: &str) -> playdash::nonblocking::DashManifest {
+        let xml = String::from_utf8(fixture(name)).unwrap();
+        playdash::nonblocking::DashManifest::new(xml)
+            .unwrap()
+            .with_base_url(&format!("{base}/{name}"))
+            .unwrap()
+    }
+
+    /// Every item of `stream`, joined into one file.
+    async fn joined(stream: FragmentStream) -> Vec<u8> {
+        let items: Vec<_> = stream.collect().await;
+        items.into_iter().flat_map(|item| item.unwrap()).collect()
+    }
+
+    fn keyed_cache(keys: ContentKeys) -> Arc<FragmentCache> {
+        Arc::new(FragmentCache::default().with_keys(keys))
+    }
+
+    #[tokio::test]
+    async fn stream_decrypts_shaka_dash() {
+        let base = serve_fixtures();
+        for name in ["shaka_cbcs.mpd", "shaka_cenc.mpd"] {
+            let stream = async_manifest(&base, name)
+                .stream_with_cache("0", keyed_cache(keys()))
+                .await
+                .unwrap();
+            assert_eq!(
+                decode(Cursor::new(joined(stream).await)),
+                plain_samples(),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_decrypts_ffmpeg_cenc_byte_ranges() {
+        let base = serve_fixtures();
+        for name in ["ffmpeg_cenc.mp4", "plain.mp4"] {
+            let fragments = split_fragments(&format!("{base}/{name}"), &fixture(name));
+            let stream = FragmentStream::new_with_cache(fragments, None, keyed_cache(keys()))
+                .await
+                .unwrap();
+            assert_eq!(
+                decode(Cursor::new(joined(stream).await)),
+                plain_samples(),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_without_the_key_fails_before_media() {
+        let base = serve_fixtures();
+        let mut keys = ContentKeys::new();
+        keys.insert_hex("ffffffffffffffffffffffffffffffff", KEY)
+            .unwrap();
+        let opened = async_manifest(&base, "shaka_cbcs.mpd")
+            .stream_with_cache("0", keyed_cache(keys))
+            .await;
+        assert!(matches!(opened, Err(Error::MissingContentKey(kid)) if kid == KID));
+    }
 }

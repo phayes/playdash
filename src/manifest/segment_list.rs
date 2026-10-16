@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use crate::vendor::dash_mpd_core::{SegmentList, SegmentURL};
 
+use super::segments::{Addressing, Segments, Timing, initialization_fragment};
 use crate::error::Error;
-use crate::manifest_template::{Addressing, Segments, Timing, initialization_fragment};
-use crate::stream::{Fragment, parse_byte_range};
+use crate::fragment::{Fragment, Fragments, parse_byte_range};
 
 /// `SegmentList` elements a representation inherits from, most specific first
 /// (Representation, AdaptationSet, Period).
@@ -76,25 +76,29 @@ impl<'a> ListChain<'a> {
         Ok(segments)
     }
 
-    /// Initialization fragment followed by one fragment per timed segment, with
+    /// Initialization fragment and one media fragment per timed segment, with
     /// unresolved URLs. A missing `@media` means the BaseURL itself.
-    pub fn fragments(self, segments: &Segments) -> Result<Vec<Fragment>, Error> {
+    pub fn fragments(self, segments: &Segments) -> Result<Fragments, Error> {
         let initialization = self
             .get(|list| list.Initialization.as_ref())
             .ok_or(Error::DashManifestMissingUrls)?;
+        let init = initialization_fragment(initialization)?;
 
-        let mut fragments = Vec::with_capacity(segments.segments.len() + 1);
-        fragments.push(initialization_fragment(initialization)?);
-        for segment_url in self.segment_urls().iter().take(segments.segments.len()) {
-            fragments.push(Fragment {
-                url: segment_url.media.clone().unwrap_or_default(),
-                range: segment_url
-                    .mediaRange
-                    .as_deref()
-                    .map(parse_byte_range)
-                    .transpose()?,
-            });
-        }
-        Ok(fragments)
+        let media = self
+            .segment_urls()
+            .iter()
+            .take(segments.segments.len())
+            .map(|segment_url| {
+                Ok(Fragment {
+                    url: segment_url.media.clone().unwrap_or_default(),
+                    range: segment_url
+                        .mediaRange
+                        .as_deref()
+                        .map(parse_byte_range)
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<_, Error>>()?;
+        Ok(Fragments { init, media })
     }
 }

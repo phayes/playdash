@@ -26,25 +26,29 @@
 //! The library does not yet provide full coverage of the sixth edition of the specification. All
 //! elements and attributes in common use are supported, however.
 
+#![allow(
+    non_snake_case,
+    dead_code,
+    clippy::collapsible_if,
+    clippy::upper_case_acronyms
+)]
 
-
-#![allow(non_snake_case, dead_code, clippy::collapsible_if, clippy::upper_case_acronyms)]
-
-use std::sync::LazyLock;
-use std::time::Duration;
-use serde::{Serialize, Serializer, Deserialize};
-use serde::de;
-use serde_with::skip_serializing_none;
-use regex::Regex;
 use chrono::DateTime;
-use url::Url;
 #[cfg(feature = "log")]
 #[allow(unused_imports)]
 use log::warn;
+use regex::Regex;
+use serde::de;
+use serde::{Deserialize, Serialize, Serializer};
+use serde_with::skip_serializing_none;
+use std::sync::LazyLock;
+use std::time::Duration;
+use url::Url;
 
 // used to parse duration when de-serializing to MPD
-static XS_DURATION_REGEX: LazyLock<Regex> = LazyLock::new(||
-    Regex::new(concat!(r"^(?P<sign>[+-])?P",
+static XS_DURATION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"^(?P<sign>[+-])?P",
         r"(?:(?P<years>\d+)Y)?",
         r"(?:(?P<months>\d+)M)?",
         r"(?:(?P<weeks>\d+)W)?",
@@ -53,8 +57,10 @@ static XS_DURATION_REGEX: LazyLock<Regex> = LazyLock::new(||
         r"(?:(?P<hours>\d+)H)?",
         r"(?:(?P<minutes>\d+)M)?",
         r"(?:(?P<seconds>\d+)(?:(?P<nanoseconds>[.,]\d+)?)S)?",
-        r")?")).unwrap()
-);
+        r")?"
+    ))
+    .unwrap()
+});
 
 /// Type representing an xs:dateTime, as per <https://www.w3.org/TR/xmlschema-2/#dateTime>
 // Something like 2021-06-03T13:00:00Z or 2022-12-06T22:27:53
@@ -86,7 +92,6 @@ pub enum DashMpdError {
     #[error("{0:?}")]
     Other(String),
 }
-
 
 // Serialize an xsd:double parameter. We can't use the default serde serialization for f64 due to
 // the difference in handling INF, -INF and NaN values.
@@ -126,7 +131,6 @@ where
     }
 }
 
-
 /// Parse an XML duration string, as per <https://www.w3.org/TR/xmlschema-2/#duration>
 ///
 /// The lexical representation for duration is the ISO 8601 extended format PnYn MnDTnH nMnS, where
@@ -154,12 +158,13 @@ fn parse_xs_duration(s: &str) -> Result<Duration, DashMpdError> {
 
     match XS_DURATION_REGEX.captures(s) {
         Some(m) => {
-            if m.name("hastime").is_none() &&
-               m.name("years").is_none() &&
-               m.name("months").is_none() &&
-               m.name("weeks").is_none() &&
-               m.name("days").is_none() {
-                  return Err(DashMpdError::InvalidDuration("empty".to_string()));
+            if m.name("hastime").is_none()
+                && m.name("years").is_none()
+                && m.name("months").is_none()
+                && m.name("weeks").is_none()
+                && m.name("days").is_none()
+            {
+                return Err(DashMpdError::InvalidDuration("empty".to_string()));
             }
             let mut secs: u64 = 0;
             let mut nsecs: u32 = 0;
@@ -169,56 +174,74 @@ fn parse_xs_duration(s: &str) -> Result<Duration, DashMpdError> {
                 let lim = min(nano.as_str().len(), 9 + ".".len());
                 if let Some(ss) = &nano.as_str().get(1..lim) {
                     let padded = format!("{ss:0<9}");
-                    nsecs = padded.parse::<u32>()
+                    nsecs = padded
+                        .parse::<u32>()
                         .map_err(|_| DashMpdError::InvalidDuration(String::from(s)))?;
                 }
             }
             if let Some(mseconds) = m.name("seconds") {
-                let seconds = mseconds.as_str().parse::<u64>()
+                let seconds = mseconds
+                    .as_str()
+                    .parse::<u64>()
                     .map_err(|_| DashMpdError::InvalidDuration(String::from(s)))?;
                 secs += seconds;
             }
             if let Some(mminutes) = m.name("minutes") {
-                let minutes = mminutes.as_str().parse::<u64>()
+                let minutes = mminutes
+                    .as_str()
+                    .parse::<u64>()
                     .map_err(|_| DashMpdError::InvalidDuration(String::from(s)))?;
                 secs += minutes * 60;
             }
             if let Some(mhours) = m.name("hours") {
-                let hours = mhours.as_str().parse::<u64>()
+                let hours = mhours
+                    .as_str()
+                    .parse::<u64>()
                     .map_err(|_| DashMpdError::InvalidDuration(String::from(s)))?;
                 secs += hours * 60 * 60;
             }
             if let Some(mdays) = m.name("days") {
-                let days = mdays.as_str().parse::<u64>()
+                let days = mdays
+                    .as_str()
+                    .parse::<u64>()
                     .map_err(|_| DashMpdError::InvalidDuration(String::from(s)))?;
                 secs += days * 60 * 60 * 24;
             }
             if let Some(mweeks) = m.name("weeks") {
-                let weeks = mweeks.as_str().parse::<u64>()
+                let weeks = mweeks
+                    .as_str()
+                    .parse::<u64>()
                     .map_err(|_| DashMpdError::InvalidDuration(String::from(s)))?;
                 secs += weeks * 60 * 60 * 24 * 7;
             }
             if let Some(mmonths) = m.name("months") {
-                let months = mmonths.as_str().parse::<u64>()
+                let months = mmonths
+                    .as_str()
+                    .parse::<u64>()
                     .map_err(|_| DashMpdError::InvalidDuration(String::from(s)))?;
                 secs += months * 60 * 60 * 24 * 30;
             }
             if let Some(myears) = m.name("years") {
-                let years = myears.as_str().parse::<u64>()
+                let years = myears
+                    .as_str()
+                    .parse::<u64>()
                     .map_err(|_| DashMpdError::InvalidDuration(String::from(s)))?;
                 secs += years * 60 * 60 * 24 * 365;
             }
             if let Some(msign) = m.name("sign") {
                 if msign.as_str() == "-" {
-                    return Err(DashMpdError::InvalidDuration("can't represent negative durations".to_string()));
+                    return Err(DashMpdError::InvalidDuration(
+                        "can't represent negative durations".to_string(),
+                    ));
                 }
             }
             Ok(Duration::new(secs, nsecs))
-        },
-        None => Err(DashMpdError::InvalidDuration(String::from("couldn't parse XS duration"))),
+        }
+        None => Err(DashMpdError::InvalidDuration(String::from(
+            "couldn't parse XS duration",
+        ))),
     }
 }
-
 
 // Note bug in current version of the iso8601 crate which incorrectly parses
 // strings like "PT344S" (seen in a real MPD) as a zero duration. However, ISO 8601 standard as
@@ -262,8 +285,6 @@ fn parse_xs_duration(s: &str) -> Result<Duration, DashMpdError> {
 //         Err(e) => Err(anyhow!("Couldn't parse XS duration {}: {:?}", s, e)),
 //     }
 // }
-
-
 
 // Deserialize an optional XML duration string to an Option<Duration>. This is a little trickier
 // than deserializing a required field with serde.
@@ -322,35 +343,38 @@ where
     }
 }
 
-
 // We can't use the parsing functionality from the chrono crate, because that assumes RFC 3339
 // format (including a timezone), whereas the xs:dateTime type (as per
 // <https://www.w3.org/TR/xmlschema-2/#dateTime>) allows the timezone to be omitted. For more on the
 // complicated relationship between ISO 8601 and RFC 3339, see
 // <https://ijmacd.github.io/rfc3339-iso8601/>.
 fn parse_xs_datetime(s: &str) -> Result<XsDatetime, DashMpdError> {
-    use iso8601::Date;
     use chrono::{LocalResult, NaiveDate, TimeZone};
+    use iso8601::Date;
     use num_traits::cast::FromPrimitive;
     match DateTime::<chrono::offset::FixedOffset>::parse_from_rfc3339(s) {
         Ok(dt) => Ok(dt.into()),
         Err(_) => match iso8601::datetime(s) {
             Ok(dt) => {
                 let nd = match dt.date {
-                    Date::YMD { year, month, day } =>
-                        NaiveDate::from_ymd_opt(year, month, day)
+                    Date::YMD { year, month, day } => NaiveDate::from_ymd_opt(year, month, day)
                         .ok_or(DashMpdError::InvalidDateTime(s.to_string()))?,
                     Date::Week { year, ww, d } => {
                         let d = chrono::Weekday::from_u32(d)
                             .ok_or(DashMpdError::InvalidDateTime(s.to_string()))?;
                         NaiveDate::from_isoywd_opt(year, ww, d)
                             .ok_or(DashMpdError::InvalidDateTime(s.to_string()))?
-                    },
-                    Date::Ordinal { year, ddd } =>
-                        NaiveDate::from_yo_opt(year, ddd)
+                    }
+                    Date::Ordinal { year, ddd } => NaiveDate::from_yo_opt(year, ddd)
                         .ok_or(DashMpdError::InvalidDateTime(s.to_string()))?,
                 };
-                let nd = nd.and_hms_nano_opt(dt.time.hour, dt.time.minute, dt.time.second, dt.time.millisecond*1000*1000)
+                let nd = nd
+                    .and_hms_nano_opt(
+                        dt.time.hour,
+                        dt.time.minute,
+                        dt.time.second,
+                        dt.time.millisecond * 1000 * 1000,
+                    )
                     .ok_or(DashMpdError::InvalidDateTime(s.to_string()))?;
                 let tz_secs = dt.time.tz_offset_hours * 3600 + dt.time.tz_offset_minutes * 60;
                 match chrono::FixedOffset::east_opt(tz_secs)
@@ -360,9 +384,9 @@ fn parse_xs_datetime(s: &str) -> Result<XsDatetime, DashMpdError> {
                     LocalResult::Single(local) => Ok(local.with_timezone(&chrono::Utc)),
                     _ => Err(DashMpdError::InvalidDateTime(s.to_string())),
                 }
-            },
+            }
             Err(_) => Err(DashMpdError::InvalidDateTime(s.to_string())),
-        }
+        },
     }
 }
 
@@ -425,9 +449,12 @@ where
         Ok(val) => Ok(Some(val)),
         Err(_) => {
             #[cfg(feature = "log")]
-            warn!("Ignoring value {s:?} which is not a valid {}", std::any::type_name::<T>());
+            warn!(
+                "Ignoring value {s:?} which is not a valid {}",
+                std::any::type_name::<T>()
+            );
             Ok(None)
-        },
+        }
     }
 }
 
@@ -442,7 +469,9 @@ where
 
 #[allow(clippy::ref_option)]
 fn serialize_xmlns<S>(os: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
-where S: serde::Serializer {
+where
+    S: serde::Serializer,
+{
     if let Some(s) = os {
         serializer.serialize_str(s)
     } else {
@@ -452,7 +481,9 @@ where S: serde::Serializer {
 
 #[allow(clippy::ref_option)]
 fn serialize_xsi_ns<S>(os: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
-where S: serde::Serializer {
+where
+    S: serde::Serializer,
+{
     if let Some(s) = os {
         serializer.serialize_str(s)
     } else {
@@ -462,7 +493,9 @@ where S: serde::Serializer {
 
 #[allow(clippy::ref_option)]
 fn serialize_cenc_ns<S>(os: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
-where S: serde::Serializer {
+where
+    S: serde::Serializer,
+{
     if let Some(s) = os {
         serializer.serialize_str(s)
     } else {
@@ -472,7 +505,9 @@ where S: serde::Serializer {
 
 #[allow(clippy::ref_option)]
 fn serialize_mspr_ns<S>(os: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
-where S: serde::Serializer {
+where
+    S: serde::Serializer,
+{
     if let Some(s) = os {
         serializer.serialize_str(s)
     } else {
@@ -482,7 +517,9 @@ where S: serde::Serializer {
 
 #[allow(clippy::ref_option)]
 fn serialize_xlink_ns<S>(os: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
-where S: serde::Serializer {
+where
+    S: serde::Serializer,
+{
     if let Some(s) = os {
         serializer.serialize_str(s)
     } else {
@@ -492,14 +529,15 @@ where S: serde::Serializer {
 
 #[allow(clippy::ref_option)]
 fn serialize_dvb_ns<S>(os: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
-where S: serde::Serializer {
+where
+    S: serde::Serializer,
+{
     if let Some(s) = os {
         serializer.serialize_str(s)
     } else {
         serializer.serialize_str("urn:dvb:dash-extensions:2014-1")
     }
 }
-
 
 // These default_* functions are needed to provide defaults for serde deserialization of certain
 // elements, where the Default function for that type doesn't return a value compatible with the
@@ -554,7 +592,6 @@ fn default_optu64_one() -> Option<u64> {
     Some(1)
 }
 
-
 // The MPD format is documented by ISO using an XML Schema at
 // https://standards.iso.org/ittf/PubliclyAvailableStandards/MPEG-DASH_schema_files/DASH-MPD-edition2.xsd
 // Historical spec: https://ptabdata.blob.core.windows.net/files/2020/IPR2020-01688/v67_EXHIBIT%201067%20-%20ISO-IEC%2023009-1%202019(E)%20-%20Info.%20Tech.%20-%20Dynamic%20Adaptive%20Streaming%20Over%20HTTP%20(DASH).pdf
@@ -606,7 +643,10 @@ pub struct ProgramInformation {
     pub Title: Option<Title>,
     pub Source: Option<Source>,
     pub Copyright: Option<Copyright>,
-    #[serde(rename(serialize = "scte214:ContentIdentifier", deserialize = "ContentIdentifier"))]
+    #[serde(rename(
+        serialize = "scte214:ContentIdentifier",
+        deserialize = "ContentIdentifier"
+    ))]
     pub scte214ContentIdentifier: Option<Scte214ContentIdentifier>,
 }
 
@@ -732,7 +772,10 @@ pub struct SegmentTemplate {
     pub pbDelta: Option<i64>,
     #[serde(rename = "@presentationTimeOffset")]
     pub presentationTimeOffset: Option<u64>,
-    #[serde(rename = "@availabilityTimeOffset", serialize_with="serialize_opt_xsd_double")]
+    #[serde(
+        rename = "@availabilityTimeOffset",
+        serialize_with = "serialize_opt_xsd_double"
+    )]
     pub availabilityTimeOffset: Option<f64>,
     #[serde(rename = "@availabilityTimeComplete")]
     pub availabilityTimeComplete: Option<bool>,
@@ -773,14 +816,19 @@ pub struct BaseURL {
     pub byte_range: Option<String>,
     /// Elements with the same `@serviceLocation` value are likely to have their URLs resolve to
     /// services at a common network location, for example the same CDN.
-    #[serde(rename = "@availabilityTimeOffset", serialize_with="serialize_opt_xsd_double")]
+    #[serde(
+        rename = "@availabilityTimeOffset",
+        serialize_with = "serialize_opt_xsd_double"
+    )]
     pub availability_time_offset: Option<f64>,
     #[serde(rename = "@availabilityTimeComplete")]
     pub availability_time_complete: Option<bool>,
-    #[serde(rename = "@timeShiftBufferDepth",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@timeShiftBufferDepth",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub timeShiftBufferDepth: Option<Duration>,
     /// Lowest value indicates the highest priority.
     #[serde(rename = "@dvb:priority", alias = "@priority")]
@@ -841,7 +889,10 @@ pub struct SegmentBase {
     pub indexRange: Option<String>,
     #[serde(rename = "@indexRangeExact")]
     pub indexRangeExact: Option<bool>,
-    #[serde(rename = "@availabilityTimeOffset", serialize_with="serialize_opt_xsd_double")]
+    #[serde(
+        rename = "@availabilityTimeOffset",
+        serialize_with = "serialize_opt_xsd_double"
+    )]
     pub availabilityTimeOffset: Option<f64>,
     #[serde(rename = "@availabilityTimeComplete")]
     pub availabilityTimeComplete: Option<bool>,
@@ -893,7 +944,11 @@ pub struct SegmentList {
     /// A "remote resource", following the XML Linking Language (XLink) specification.
     #[serde(rename = "@xlink:href", alias = "@href")]
     pub href: Option<String>,
-    #[serde(rename = "@xlink:actuate", alias = "@actuate", default="default_optstring_on_request")]
+    #[serde(
+        rename = "@xlink:actuate",
+        alias = "@actuate",
+        default = "default_optstring_on_request"
+    )]
     pub actuate: Option<String>,
     #[serde(rename = "@xlink:type", alias = "@type")]
     pub sltype: Option<String>,
@@ -1107,7 +1162,10 @@ pub struct SubRepresentation {
     #[serde(rename = "@audioSamplingRate")]
     pub audioSamplingRate: Option<String>,
     /// Indicates the possibility for accelerated playout allowed by this codec profile and level.
-    #[serde(rename = "@maxPlayoutRate", serialize_with="serialize_opt_xsd_double")]
+    #[serde(
+        rename = "@maxPlayoutRate",
+        serialize_with = "serialize_opt_xsd_double"
+    )]
     pub maxPlayoutRate: Option<f64>,
     #[serde(rename = "@codingDependency")]
     pub codingDependency: Option<bool>,
@@ -1117,7 +1175,10 @@ pub struct SubRepresentation {
     pub height: Option<u64>,
     #[serde(rename = "@startWithSAP")]
     pub startWithSAP: Option<u64>,
-    #[serde(rename = "@maximumSAPPeriod", serialize_with="serialize_opt_xsd_double")]
+    #[serde(
+        rename = "@maximumSAPPeriod",
+        serialize_with = "serialize_opt_xsd_double"
+    )]
     pub maximumSAPPeriod: Option<f64>,
     pub FramePacking: Vec<FramePacking>,
     pub AudioChannelConfiguration: Vec<AudioChannelConfiguration>,
@@ -1200,7 +1261,10 @@ pub struct Representation {
     #[serde(rename = "@startWithSAP")]
     pub startWithSAP: Option<u64>,
     /// Indicates the possibility for accelerated playout allowed by this codec profile and level.
-    #[serde(rename = "@maxPlayoutRate", serialize_with="serialize_opt_xsd_double")]
+    #[serde(
+        rename = "@maxPlayoutRate",
+        serialize_with = "serialize_opt_xsd_double"
+    )]
     pub maxPlayoutRate: Option<f64>,
     #[serde(rename = "@codingDependency")]
     pub codingDependency: Option<bool>,
@@ -1222,9 +1286,16 @@ pub struct Representation {
     pub numChannels: Option<u32>,
     #[serde(rename = "@xlink:href", alias = "@href")]
     pub href: Option<String>,
-    #[serde(rename = "@xlink:actuate", alias = "@actuate", default = "default_optstring_on_request")]
+    #[serde(
+        rename = "@xlink:actuate",
+        alias = "@actuate",
+        default = "default_optstring_on_request"
+    )]
     pub actuate: Option<String>,
-    #[serde(rename = "@scte214:supplementalProfiles", alias = "@supplementalProfiles")]
+    #[serde(
+        rename = "@scte214:supplementalProfiles",
+        alias = "@supplementalProfiles"
+    )]
     pub scte214_supplemental_profiles: Option<String>,
     #[serde(rename = "@scte214:supplementalCodecs", alias = "@supplementalCodecs")]
     pub scte214_supplemental_codecs: Option<String>,
@@ -1302,7 +1373,7 @@ pub struct Laurl {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Hash)]
 #[serde(default)]
 pub struct MsprPro {
-    #[serde(rename = "@xmlns", serialize_with="serialize_xmlns")]
+    #[serde(rename = "@xmlns", serialize_with = "serialize_xmlns")]
     pub xmlns: Option<String>,
     #[serde(rename = "$text")]
     pub content: Option<String>,
@@ -1368,7 +1439,7 @@ pub struct ContentProtection {
     #[serde(rename = "@id")]
     pub id: Option<String>,
     /// The DRM initialization data (Protection System Specific Header).
-    #[serde(rename="cenc:pssh", alias="pssh")]
+    #[serde(rename = "cenc:pssh", alias = "pssh")]
     pub cenc_pssh: Vec<CencPssh>,
     /// The DRM key identifier.
     #[serde(rename = "@cenc:default_KID", alias = "@default_KID")]
@@ -1490,7 +1561,11 @@ pub struct EventStream {
     #[serde(rename = "@xlink:href")]
     #[serde(alias = "@href")]
     pub href: Option<String>,
-    #[serde(rename = "@xlink:actuate", alias = "@actuate", default = "default_optstring_on_request")]
+    #[serde(
+        rename = "@xlink:actuate",
+        alias = "@actuate",
+        default = "default_optstring_on_request"
+    )]
     pub actuate: Option<String>,
     #[serde(rename = "@messageData")]
     // actually an xs:anyURI
@@ -1589,7 +1664,11 @@ pub struct AdaptationSet {
     /// A "remote resource", following the XML Linking Language (XLink) specification.
     #[serde(rename = "@xlink:href", alias = "@href")]
     pub href: Option<String>,
-    #[serde(rename = "@xlink:actuate", alias = "@actuate", default = "default_optstring_on_request")]
+    #[serde(
+        rename = "@xlink:actuate",
+        alias = "@actuate",
+        default = "default_optstring_on_request"
+    )]
     pub actuate: Option<String>,
     /// Non-integer values, which are not conformant, are ignored when parsing.
     #[serde(rename = "@group", deserialize_with = "deserialize_lenient", default)]
@@ -1656,9 +1735,15 @@ pub struct AdaptationSet {
     #[serde(rename = "@maxFrameRate")]
     pub maxFrameRate: Option<String>, // it can be something like "15/2"
     /// Indicates the possibility for accelerated playout allowed by this codec profile and level.
-    #[serde(rename = "@maxPlayoutRate", serialize_with="serialize_opt_xsd_double")]
+    #[serde(
+        rename = "@maxPlayoutRate",
+        serialize_with = "serialize_opt_xsd_double"
+    )]
     pub maxPlayoutRate: Option<f64>,
-    #[serde(rename = "@maximumSAPPeriod", serialize_with="serialize_opt_xsd_double")]
+    #[serde(
+        rename = "@maximumSAPPeriod",
+        serialize_with = "serialize_opt_xsd_double"
+    )]
     pub maximumSAPPeriod: Option<f64>,
     #[serde(rename = "@startWithSAP")]
     pub startWithSAP: Option<u64>,
@@ -1691,7 +1776,10 @@ pub struct AdaptationSet {
     pub SegmentTemplate: Option<SegmentTemplate>,
     #[serde(rename = "Representation")]
     pub representations: Vec<Representation>,
-    #[serde(rename = "@scte214:supplementalProfiles", alias = "@supplementalProfiles")]
+    #[serde(
+        rename = "@scte214:supplementalProfiles",
+        alias = "@supplementalProfiles"
+    )]
     pub scte214_supplemental_profiles: Option<String>,
     #[serde(rename = "@scte214:supplementalCodecs", alias = "@supplementalCodecs")]
     pub scte214_supplemental_codecs: Option<String>,
@@ -1726,10 +1814,12 @@ pub struct Subset {
     pub id: Option<String>,
     /// Specifies the AdaptationSets contained in a Subset by providing a whitespace separated
     /// list of the @id values of the contained AdaptationSets.
-    #[serde(rename = "@contains",
-            deserialize_with = "deserialize_xsd_uintvector",
-            serialize_with = "serialize_xsd_uintvector",
-            default)]
+    #[serde(
+        rename = "@contains",
+        deserialize_with = "deserialize_xsd_uintvector",
+        serialize_with = "serialize_xsd_uintvector",
+        default
+    )]
     pub contains: Vec<u64>,
 }
 
@@ -1743,24 +1833,32 @@ pub struct Period {
     #[serde(rename = "@xlink:href", alias = "@href")]
     pub href: Option<String>,
 
-    #[serde(rename = "@xlink:actuate", alias = "@actuate", default="default_optstring_on_request")]
+    #[serde(
+        rename = "@xlink:actuate",
+        alias = "@actuate",
+        default = "default_optstring_on_request"
+    )]
     pub actuate: Option<String>,
 
     #[serde(rename = "@id")]
     pub id: Option<String>,
 
     /// The start time of the Period relative to the MPD availability start time.
-    #[serde(rename = "@start",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@start",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub start: Option<Duration>,
 
     // note: the spec says that this is an xs:duration, not an unsigned int as for other "duration" fields
-    #[serde(rename = "@duration",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@duration",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub duration: Option<Duration>,
 
     // The default for the bitstreamSwitching attribute is specified to be "false".
@@ -1828,15 +1926,19 @@ pub struct Reporting {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Hash)]
 #[serde(default)]
 pub struct Range {
-    #[serde(rename = "@starttime",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@starttime",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub starttime: Option<Duration>,
-    #[serde(rename = "@duration",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@duration",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub duration: Option<Duration>,
 }
 
@@ -1855,11 +1957,11 @@ pub struct Metrics {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct Latency {
-    #[serde(rename = "@min", serialize_with="serialize_opt_xsd_double")]
+    #[serde(rename = "@min", serialize_with = "serialize_opt_xsd_double")]
     pub min: Option<f64>,
-    #[serde(rename = "@max", serialize_with="serialize_opt_xsd_double")]
+    #[serde(rename = "@max", serialize_with = "serialize_opt_xsd_double")]
     pub max: Option<f64>,
-    #[serde(rename = "@target", serialize_with="serialize_opt_xsd_double")]
+    #[serde(rename = "@target", serialize_with = "serialize_opt_xsd_double")]
     pub target: Option<f64>,
     #[serde(rename = "@referenceId")]
     pub referenceId: Option<String>,
@@ -1870,9 +1972,9 @@ pub struct Latency {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct PlaybackRate {
-    #[serde(rename = "@min", serialize_with="serialize_opt_xsd_double")]
+    #[serde(rename = "@min", serialize_with = "serialize_opt_xsd_double")]
     pub min: Option<f64>,
-    #[serde(rename = "@max", serialize_with="serialize_opt_xsd_double")]
+    #[serde(rename = "@max", serialize_with = "serialize_opt_xsd_double")]
     pub max: Option<f64>,
 }
 
@@ -1956,10 +2058,12 @@ pub struct ClientDataReporting {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct PlaybackRestrictions {
-    #[serde(rename = "@skipAfter",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@skipAfter",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub skipAfter: Option<Duration>,
 }
 
@@ -2016,10 +2120,12 @@ pub struct ProducerReferenceTime {
     // There are two capitalizations for this attribute in the specification at
     // https://dashif.org/docs/CR-Low-Latency-Live-r8.pdf. The attribute is required according to
     // the specification XSD.
-    #[serde(rename = "@wallClockTime",
-            alias="@wallclockTime",
-            deserialize_with = "deserialize_xs_datetime",
-            default)]
+    #[serde(
+        rename = "@wallClockTime",
+        alias = "@wallclockTime",
+        deserialize_with = "deserialize_xs_datetime",
+        default
+    )]
     pub wallClockTime: Option<XsDatetime>,
     pub UTCTiming: Option<UTCTiming>,
 }
@@ -2032,9 +2138,11 @@ pub struct LeapSecondInformation {
     pub availabilityStartLeapOffset: Option<i64>,
     #[serde(rename = "@nextAvailabilityStartLeapOffset")]
     pub nextAvailabilityStartLeapOffset: Option<i64>,
-    #[serde(rename = "@nextLeapChangeTime",
-            deserialize_with = "deserialize_xs_datetime",
-            default)]
+    #[serde(
+        rename = "@nextLeapChangeTime",
+        deserialize_with = "deserialize_xs_datetime",
+        default
+    )]
     pub nextLeapChangeTime: Option<XsDatetime>,
 }
 
@@ -2048,7 +2156,7 @@ pub struct LeapSecondInformation {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct PatchLocation {
-    #[serde(rename = "@ttl", serialize_with="serialize_opt_xsd_double")]
+    #[serde(rename = "@ttl", serialize_with = "serialize_opt_xsd_double")]
     pub ttl: Option<f64>,
     #[serde(rename = "$text")]
     pub content: String,
@@ -2059,7 +2167,7 @@ pub struct PatchLocation {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct MPD {
-    #[serde(rename = "@xmlns", serialize_with="serialize_xmlns")]
+    #[serde(rename = "@xmlns", serialize_with = "serialize_xmlns")]
     pub xmlns: Option<String>,
     #[serde(rename = "@id")]
     pub id: Option<String>,
@@ -2069,79 +2177,119 @@ pub struct MPD {
     /// available over time).
     #[serde(rename = "@type")]
     pub mpdtype: Option<String>,
-    #[serde(rename = "@availabilityStartTime",
-            deserialize_with = "deserialize_xs_datetime",
-            default)]
+    #[serde(
+        rename = "@availabilityStartTime",
+        deserialize_with = "deserialize_xs_datetime",
+        default
+    )]
     pub availabilityStartTime: Option<XsDatetime>,
-    #[serde(rename = "@availabilityEndTime",
-            deserialize_with = "deserialize_xs_datetime",
-            default)]
+    #[serde(
+        rename = "@availabilityEndTime",
+        deserialize_with = "deserialize_xs_datetime",
+        default
+    )]
     pub availabilityEndTime: Option<XsDatetime>,
-    #[serde(rename = "@publishTime",
-            deserialize_with = "deserialize_xs_datetime",
-            default)]
+    #[serde(
+        rename = "@publishTime",
+        deserialize_with = "deserialize_xs_datetime",
+        default
+    )]
     pub publishTime: Option<XsDatetime>,
-    #[serde(rename = "@mediaPresentationDuration",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@mediaPresentationDuration",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub mediaPresentationDuration: Option<Duration>,
-    #[serde(rename = "@minimumUpdatePeriod",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@minimumUpdatePeriod",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub minimumUpdatePeriod: Option<Duration>,
     // This attribute is actually required by the XSD specification, but we make it optional.
-    #[serde(rename = "@minBufferTime",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@minBufferTime",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub minBufferTime: Option<Duration>,
     /// Prescribes how many seconds of buffer a client should keep to avoid stalling when streaming
     /// under ideal network conditions with bandwidth matching the @bandwidth attribute.
-    #[serde(rename = "@timeShiftBufferDepth",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@timeShiftBufferDepth",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub timeShiftBufferDepth: Option<Duration>,
     /// A suggested delay of the presentation compared to the Live edge.
-    #[serde(rename = "@suggestedPresentationDelay",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@suggestedPresentationDelay",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub suggestedPresentationDelay: Option<Duration>,
-    #[serde(rename = "@maxSegmentDuration",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@maxSegmentDuration",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub maxSegmentDuration: Option<Duration>,
-    #[serde(rename = "@maxSubsegmentDuration",
-            serialize_with = "serialize_xs_duration",
-            deserialize_with = "deserialize_xs_duration",
-            default)]
+    #[serde(
+        rename = "@maxSubsegmentDuration",
+        serialize_with = "serialize_xs_duration",
+        deserialize_with = "deserialize_xs_duration",
+        default
+    )]
     pub maxSubsegmentDuration: Option<Duration>,
     /// The XML namespace prefix used by convention for the XML Schema Instance namespace.
     #[serialize_always]
-    #[serde(rename="@xmlns:xsi", alias="@xsi", serialize_with="serialize_xsi_ns")]
+    #[serde(
+        rename = "@xmlns:xsi",
+        alias = "@xsi",
+        serialize_with = "serialize_xsi_ns"
+    )]
     pub xsi: Option<String>,
     #[serde(alias = "@ext", rename = "@xmlns:ext")]
     pub ext: Option<String>,
     /// The XML namespace prefix used by convention for the Common Encryption scheme.
     #[serialize_always]
-    #[serde(rename="@xmlns:cenc", alias="@cenc", serialize_with="serialize_cenc_ns")]
+    #[serde(
+        rename = "@xmlns:cenc",
+        alias = "@cenc",
+        serialize_with = "serialize_cenc_ns"
+    )]
     pub cenc: Option<String>,
     /// The XML namespace prefix used by convention for the Microsoft PlayReady scheme.
     #[serialize_always]
-    #[serde(rename="@xmlns:mspr", alias="@mspr", serialize_with="serialize_mspr_ns")]
+    #[serde(
+        rename = "@xmlns:mspr",
+        alias = "@mspr",
+        serialize_with = "serialize_mspr_ns"
+    )]
     pub mspr: Option<String>,
     /// The XML namespace prefix used by convention for the XML Linking Language.
     #[serialize_always]
-    #[serde(rename="@xmlns:xlink", alias="@xlink", serialize_with="serialize_xlink_ns")]
+    #[serde(
+        rename = "@xmlns:xlink",
+        alias = "@xlink",
+        serialize_with = "serialize_xlink_ns"
+    )]
     pub xlink: Option<String>,
     /// The XML namespace prefix used by convention for DASH extensions proposed by the Digital
     /// Video Broadcasting Project, as per RFC 5328.
     #[serialize_always]
-    #[serde(rename="@xmlns:dvb", alias="@dvb", serialize_with="serialize_dvb_ns")]
+    #[serde(
+        rename = "@xmlns:dvb",
+        alias = "@dvb",
+        serialize_with = "serialize_dvb_ns"
+    )]
     pub dvb: Option<String>,
     #[serde(rename = "@xsi:schemaLocation", alias = "@schemaLocation")]
     pub schemaLocation: Option<String>,
@@ -2174,40 +2322,42 @@ pub struct MPD {
 
 impl std::fmt::Display for MPD {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", quick_xml::se::to_string(self).map_err(|_| std::fmt::Error)?)
+        write!(
+            f,
+            "{}",
+            quick_xml::se::to_string(self).map_err(|_| std::fmt::Error)?
+        )
     }
 }
 
 /// Parse an MPD manifest, provided as an XML string, returning an `MPD` node.
 pub fn parse(xml: &str) -> Result<MPD, DashMpdError> {
     let xd = &mut quick_xml::de::Deserializer::from_str(xml);
-    let mpd: MPD = serde_path_to_error::deserialize(xd)
-        .map_err(|e| DashMpdError::Parsing(e.to_string()))?;
+    let mpd: MPD =
+        serde_path_to_error::deserialize(xd).map_err(|e| DashMpdError::Parsing(e.to_string()))?;
     Ok(mpd)
 }
 
-
 // Note that a codec name can be of the form "mp4a" or "mp4a.40.2".
 fn is_audio_codec(name: &str) -> bool {
-    name.starts_with("mp4a") ||
-        name.starts_with("aac") ||
-        name.starts_with("vorbis") ||
-        name.starts_with("opus") ||
-        name.starts_with("ogg") ||
-        name.starts_with("webm") ||
-        name.starts_with("flac") ||
-        name.starts_with("mp3") ||
-        name.starts_with("mpeg") ||
-        name.starts_with("3gpp") ||
-        name.starts_with("wav") ||
-        name.starts_with("ec-3") ||
-        name.starts_with("ac-4") ||
-        name.starts_with("dtsc") ||
-        name.starts_with("aptx") ||
-        name.starts_with("aiff") ||
-        name.starts_with("mha1")       // MPEG-H 3D Audio
+    name.starts_with("mp4a")
+        || name.starts_with("aac")
+        || name.starts_with("vorbis")
+        || name.starts_with("opus")
+        || name.starts_with("ogg")
+        || name.starts_with("webm")
+        || name.starts_with("flac")
+        || name.starts_with("mp3")
+        || name.starts_with("mpeg")
+        || name.starts_with("3gpp")
+        || name.starts_with("wav")
+        || name.starts_with("ec-3")
+        || name.starts_with("ac-4")
+        || name.starts_with("dtsc")
+        || name.starts_with("aptx")
+        || name.starts_with("aiff")
+        || name.starts_with("mha1") // MPEG-H 3D Audio
 }
-
 
 /// Returns `true` if this AdaptationSet contains audio content.
 ///
@@ -2288,22 +2438,15 @@ pub fn is_video_adaptation(a: &&AdaptationSet) -> bool {
     false
 }
 
-
 fn is_subtitle_mimetype(mt: &str) -> bool {
-    mt.eq("text/vtt") ||
-    mt.eq("application/ttml+xml") ||
-    mt.eq("application/x-sami")
+    mt.eq("text/vtt") || mt.eq("application/ttml+xml") || mt.eq("application/x-sami")
 
     // Some manifests use a @mimeType of "application/mp4" together with @contentType="text"; we'll
     // classify these only based on their contentType.
 }
 
 fn is_subtitle_codec(c: &str) -> bool {
-    c == "wvtt" ||
-    c == "c608" ||
-    c == "stpp" ||
-    c == "tx3g" ||
-    c.starts_with("stpp.")
+    c == "wvtt" || c == "c608" || c == "stpp" || c == "tx3g" || c.starts_with("stpp.")
 }
 
 /// Returns `true` if this AdaptationSet contains subtitle content.
@@ -2349,7 +2492,6 @@ pub fn is_subtitle_adaptation(a: &&AdaptationSet) -> bool {
     false
 }
 
-
 // Incomplete, see https://en.wikipedia.org/wiki/Subtitles#Subtitle_formats
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SubtitleType {
@@ -2383,7 +2525,7 @@ fn subtitle_type_for_mimetype(mt: &str) -> Option<SubtitleType> {
         "text/vtt" => Some(SubtitleType::Vtt),
         "application/ttml+xml" => Some(SubtitleType::Ttml),
         "application/x-sami" => Some(SubtitleType::Sami),
-        _ => None
+        _ => None,
     }
 }
 
@@ -2438,7 +2580,6 @@ pub fn subtitle_type(a: &&AdaptationSet) -> SubtitleType {
     }
     SubtitleType::Unknown
 }
-
 
 #[allow(dead_code)]
 pub fn content_protection_type(cp: &ContentProtection) -> String {
@@ -2505,18 +2646,19 @@ pub fn content_protection_type(cp: &ContentProtection) -> String {
     String::from("<unknown>")
 }
 
-
 fn check_segment_template_duration(
     st: &SegmentTemplate,
     max_seg_duration: &Duration,
-    outer_timescale: u64) -> Vec<String>
-{
+    outer_timescale: u64,
+) -> Vec<String> {
     let mut errors = Vec::new();
     if let Some(timeline) = &st.SegmentTimeline {
         for s in &timeline.segments {
             let sd = s.d / st.timescale.unwrap_or(outer_timescale);
             if sd > max_seg_duration.as_secs() {
-                errors.push(String::from("SegmentTimeline has segment@d > @maxSegmentDuration"));
+                errors.push(String::from(
+                    "SegmentTimeline has segment@d > @maxSegmentDuration",
+                ));
             }
         }
     }
@@ -2530,7 +2672,9 @@ fn check_segment_template_conformity(st: &SegmentTemplate) -> Vec<String> {
             errors.push(format!("invalid URL {md}"));
         }
         if md.contains("$Number$") && md.contains("$Time") {
-            errors.push(String::from("both $Number$ and $Time$ are used in media template URL"));
+            errors.push(String::from(
+                "both $Number$ and $Time$ are used in media template URL",
+            ));
         }
     }
     if let Some(init) = &st.initialization {
@@ -2538,18 +2682,23 @@ fn check_segment_template_conformity(st: &SegmentTemplate) -> Vec<String> {
             errors.push(format!("invalid URL {init}"));
         }
         if init.contains("$Number") {
-            errors.push(String::from("$Number$ identifier used in initialization segment URL"));
+            errors.push(String::from(
+                "$Number$ identifier used in initialization segment URL",
+            ));
         }
         if init.contains("$Time") {
-            errors.push(String::from("$Time$ identifier used in initialization segment URL"));
+            errors.push(String::from(
+                "$Time$ identifier used in initialization segment URL",
+            ));
         }
     }
     if st.duration.is_some() && st.SegmentTimeline.is_some() {
-        errors.push(String::from("both SegmentTemplate.duration and SegmentTemplate.SegmentTimeline present"));
+        errors.push(String::from(
+            "both SegmentTemplate.duration and SegmentTemplate.SegmentTimeline present",
+        ));
     }
     errors
 }
-
 
 // Check the URL or URL path u for conformity. This is a very relaxed check because the Url crate is
 // very tolerant, in particular concerning the syntax accepted for the path component of an URL.
@@ -2558,12 +2707,12 @@ fn valid_url_p(u: &str) -> bool {
 
     match Url::parse(u) {
         Ok(url) => {
-            url.scheme() == "https" ||
-                url.scheme() == "http" ||
-                url.scheme() == "ftp" ||
-                url.scheme() == "file" ||
-                url.scheme() == "data"
-        },
+            url.scheme() == "https"
+                || url.scheme() == "http"
+                || url.scheme() == "ftp"
+                || url.scheme() == "file"
+                || url.scheme() == "data"
+        }
         Err(ParseError::RelativeUrlWithoutBase) => true,
         Err(_) => false,
     }
@@ -2578,12 +2727,18 @@ pub fn check_conformity(mpd: &MPD) -> Vec<String> {
     // Representation elements.
     for p in &mpd.periods {
         if p.adaptations.is_empty() {
-            errors.push(format!("Period with @id {} contains no AdaptationSet elements",
-                                p.id.clone().unwrap_or(String::from("<unspecified>"))));
+            errors.push(format!(
+                "Period with @id {} contains no AdaptationSet elements",
+                p.id.clone().unwrap_or(String::from("<unspecified>"))
+            ));
         }
         for a in &p.adaptations {
             if let Some(mh) = a.maxHeight {
-                if let Some(mr) = a.representations.iter().max_by_key(|r| r.height.unwrap_or(0)) {
+                if let Some(mr) = a
+                    .representations
+                    .iter()
+                    .max_by_key(|r| r.height.unwrap_or(0))
+                {
                     if mr.height.unwrap_or(0) > mh {
                         errors.push(String::from("invalid @maxHeight on AdaptationSet"));
                     }
@@ -2596,7 +2751,11 @@ pub fn check_conformity(mpd: &MPD) -> Vec<String> {
     for p in &mpd.periods {
         for a in &p.adaptations {
             if let Some(mw) = a.maxWidth {
-                if let Some(mr) = a.representations.iter().max_by_key(|r| r.width.unwrap_or(0)) {
+                if let Some(mr) = a
+                    .representations
+                    .iter()
+                    .max_by_key(|r| r.width.unwrap_or(0))
+                {
                     if mr.width.unwrap_or(0) > mw {
                         errors.push(String::from("invalid @maxWidth on AdaptationSet"));
                     }
@@ -2609,7 +2768,11 @@ pub fn check_conformity(mpd: &MPD) -> Vec<String> {
     for p in &mpd.periods {
         for a in &p.adaptations {
             if let Some(mb) = a.maxBandwidth {
-                if let Some(mr) = a.representations.iter().max_by_key(|r| r.bandwidth.unwrap_or(0)) {
+                if let Some(mr) = a
+                    .representations
+                    .iter()
+                    .max_by_key(|r| r.bandwidth.unwrap_or(0))
+                {
                     if mr.bandwidth.unwrap_or(0) > mb {
                         errors.push(String::from("invalid @maxBandwidth on AdaptationSet"));
                     }
@@ -2686,10 +2849,14 @@ pub fn check_conformity(mpd: &MPD) -> Vec<String> {
                                 errors.push(format!("invalid URL {su}"));
                             }
                             if su.contains("$Number") {
-                                errors.push(String::from("$Number$ identifier used in initialization segment URL"));
+                                errors.push(String::from(
+                                    "$Number$ identifier used in initialization segment URL",
+                                ));
                             }
                             if su.contains("$Time") {
-                                errors.push(String::from("$Time$ identifier used in initialization segment URL"));
+                                errors.push(String::from(
+                                    "$Time$ identifier used in initialization segment URL",
+                                ));
                             }
                         }
                     }
@@ -2713,10 +2880,14 @@ pub fn check_conformity(mpd: &MPD) -> Vec<String> {
                                 errors.push(format!("invalid URL {su}"));
                             }
                             if su.contains("$Number") {
-                                errors.push(String::from("$Number$ identifier used in initialization segment URL"));
+                                errors.push(String::from(
+                                    "$Number$ identifier used in initialization segment URL",
+                                ));
                             }
                             if su.contains("$Time") {
-                                errors.push(String::from("$Time$ identifier used in initialization segment URL"));
+                                errors.push(String::from(
+                                    "$Time$ identifier used in initialization segment URL",
+                                ));
                             }
                         }
                     }

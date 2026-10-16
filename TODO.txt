@@ -1,0 +1,200 @@
+TODO
+====
+
+1. Dynamic fragment production for live streams
+-----------------------------------------------
+
+Goal: play `MPD@type="dynamic"` manifests, where segments appear over time and
+old ones fall out of the time-shift window, without changing how static
+manifests behave. The list of media fragments stops being a fixed `Vec` that
+`DashManifest::fragments` builds once; `Fragments` produces media fragments on
+demand instead.
+
+What blocks it today
+
+- `Fragments.media` is a `Vec<Fragment>` built in full up front, and
+  `MediaTimeline.media_durations` is a separate `Vec` that has to line up with
+  it by index. Nothing enforces that: on a mismatch the schedule logs a warning
+  and turns retention off, and time seeks can land on the wrong fragment.
+- Media fragments are identified by their position in that `Vec`
+  (`Part::Media(usize)`, the retention window `Range<usize>`, `BufferHandle`'s
+  zipped spans). A live window slides, so the positions shift.
+- `Schedule` assumes the stream has an end: `complete`, `past_end`,
+  `total_len`, `SeekFrom::End`, the symphonia-compat length estimate, and
+  `BufferTotal`.
+- Manifest timing (`manifest/segments.rs`) needs a period end or `@endNumber`
+  to bound `S@r="-1"` and `@duration` addressing, and fails with
+  `DashManifestMissingDuration` without one. Live bounds them by the wall
+  clock instead.
+- `@type`, `availabilityStartTime`, `minimumUpdatePeriod`,
+  `timeShiftBufferDepth`, `suggestedPresentationDelay`, `publishTime` and
+  `availabilityTimeOffset` are parsed by the vendored dash_mpd_core but unused.
+
+Plan, in phases that each ship on their own
+
+Phase 1: one list for media and timing (static only; no behaviour change)
+- Replace the parallel `media` + `MediaTimeline` with one list of media
+  segments, each carrying its fragment and its timing:
+      pub struct MediaSegment { pub fragment: Fragment, pub start: u64, pub duration: u64 }
+      pub struct Fragments { pub init: Fragment, pub timescale: u32, pub media: Vec<MediaSegment> }
+  `start` is in timescale ticks (including `@presentationTimeOffset`), so
+  segments no longer need to be contiguous from zero.
+- Streams without timing (hand-built byte ranges in tests and in
+  tests/encryption.rs) need a decision: make timing optional per `Fragments`
+  (`timing: Option<...>`), or give such segments zero durations and treat them
+  as untimed. See the open questions.
+- `MediaTimeline` becomes a view computed from `Fragments` (or goes away), and
+  `DashManifest::media_timeline` follows it. `FragmentStream::new*` drop their
+  separate `timeline` argument. The length check in `Schedule::new` and the
+  span padding in `BufferHandle::new` go away, since a mismatch can no longer
+  be built.
+- `MediaTimeline::span_at` / `fragment_at` move onto the segment list: a binary
+  search on `start`.
+
+Phase 2: stable segment identity
+- Identify each media segment by a monotonically increasing sequence number
+  (DASH `$Number$`; for `$Time$`-only timelines, a counter assigned in timeline
+  order) instead of its `Vec` position: `Part::Media(SegmentNumber)`.
+- Store the schedule's materialised media in a `VecDeque` with a base number,
+  so segments can be appended at the back and dropped from the front. The
+  retention window becomes a range of segment numbers.
+- `BufferHandle` takes its segments and spans from the schedule instead of a
+  snapshot at construction.
+
+Phase 3: a fragment source behind `Fragments`
+- Make `Fragments` the handle to a source rather than the data itself, e.g.
+      pub struct Fragments { init: Fragment, source: Arc<dyn MediaSource> }
+      trait MediaSource: Send + Sync {
+          /// Segments overlapping a media-time range, as far as currently known.
+          fn segments(&self, range: Range<Duration>) -> Vec<MediaSegment>;
+          /// Available range now: `None` end while the presentation is live.
+          fn available(&self, now: SystemTime) -> Range<Duration>;  // plus an `end: Option<Duration>`
+          /// When the next segment becomes available, for workers to sleep until.
+          fn next_availability(&self, now: SystemTime) -> Option<SystemTime>;
+      }
+  A `Static` source wraps today's `Vec` and keeps static manifests exactly as
+  they are. The public fields of `Fragments` become accessor methods, a
+  breaking change.
+- The schedule asks the source for segments around the cursor as the window
+  moves, instead of holding them all from construction.
+- Decide whether the source is async-aware, or the blocking and async streams
+  each drive a pure source (preferred: keep it free of I/O, like `Schedule`,
+  and let the stream run the refresh I/O).
+
+Phase 4: the live source
+- Parse and keep the dynamic-MPD fields listed above in `DashManifest`
+  (an `is_live()` and the timing anchors).
+- `$Number$` + `@duration` templates: compute the live edge from
+  `availabilityStartTime + Period@start + (n - startNumber) * duration +
+  availabilityTimeOffset`, and the earliest available segment from
+  `timeShiftBufferDepth`.
+- `SegmentTimeline`: re-fetch the MPD every `minimumUpdatePeriod`, merge new
+  `S` entries by segment time, and drop entries older than the time-shift
+  window. The refresh needs the manifest URL and a `Transport`, both of which
+  the stream already has.
+- Start position: `suggestedPresentationDelay` behind the live edge (or a
+  caller-chosen delay), not time zero.
+- Inject a clock (`trait Clock { fn now(&self) -> SystemTime }`) so tests can
+  be deterministic.
+- `MPD@type` switching from dynamic to static on a refresh ends the stream
+  cleanly.
+
+Phase 5: stream semantics at the live edge
+- `Read` and the iterator wait for the next segment's availability instead of
+  returning EOF; EOF only once the source reports an end.
+- Byte offsets: byte 0 is the start of the init, then the first segment the
+  stream joined at. `prefix_len` only covers segments seen since joining, so
+  `SeekFrom::Start` works only within the materialised range and
+  `SeekFrom::End` errors while live. symphonia-compat length estimates are not
+  available live.
+- `seek_time_coarse` is limited to the time-shift window and reports an error
+  outside it (same kind as "ended before the requested media time").
+- Retention `behind` defaults to the time-shift window depth, so memory stays
+  bounded even with `Retention::default()`.
+- `BufferStatus.total` becomes optional (or reports the available window) while
+  live.
+- Rodio `DashSource`: `total_duration` is `None` while live, and seeks clamp
+  to the available window.
+
+Out of scope for this entry (note, don't solve)
+- Multi-period live, where a new period can bring a new init segment. Phase 2's
+  sequence numbers should leave room for a period index; the byte stream would
+  need to re-emit an init at the boundary, which most fMP4 demuxers only
+  accept by starting again.
+- Low-latency DASH (chunked transfer, `availabilityTimeComplete=false`); it
+  ties into the existing TODO in schedule.rs about publishing a `moof` before
+  its `mdat` arrives.
+- Adaptive bitrate switching.
+
+Open questions
+- Untimed streams (Phase 1): optional timing in `Fragments`, or zero
+  durations?
+- Should `Fragments` stay plain data that can be serialised (`Serialize` /
+  `Deserialize` today) with the source as a separate type, or become the
+  source handle? Plain data is easier to persist and test; one type makes the
+  "media is produced on demand" API in this entry's title literal.
+- Who owns the MPD refresh: the stream (it has a `Transport`) or
+  `DashManifest`, which would hand out live `Fragments` that share one
+  refreshing manifest across streams (audio + video)?
+
+
+2. Presentation time: timeline origins and decoder timestamps
+------------------------------------------------------------
+
+Goal: every media time the crate reports is presentation time on one shared
+clock, and a caller can map a decoder's timestamps onto it. This is what
+keeping a video stream in step with its audio needs.
+
+What is wrong today
+
+- `MediaTimeline` keeps only segment durations. Its time zero is the start of
+  the representation's first media fragment, whatever that fragment's
+  `S@t` or the representation's `@presentationTimeOffset` say.
+  `manifest/segments.rs` knows both (`Segment::time` includes the offset)
+  and drops them in `Segments::media_timeline`.
+- So two representations line up only when each one's first fragment starts
+  exactly at the period start. Usually true for on-demand content, but not
+  when a timeline starts late (`S@t` past the offset), audio and video
+  fragments start at different points, or a period starts after zero.
+- Everything that compares times across streams inherits this:
+  `BufferStatus::buffered_until_all` (documents the assumption),
+  `FragmentStream::starting_at` / `DashManifest::stream_at` when the start
+  is used to line up a second stream, and the video_player example's
+  audio-clock-to-video-frame matching.
+- Decoders report timestamps from the media itself (`tfdt` base media decode
+  time, plus composition offsets) in the representation's timescale,
+  including `@presentationTimeOffset`. A caller cannot turn those into the
+  crate's media time without the offset and the timescale, which aren't
+  exposed. The video_player example sidesteps this by assuming a constant
+  frame rate from the fragment start.
+
+Plan
+
+- Keep each segment's start, not just its duration (this is Phase 1 of
+  entry 1; do the two together so `MediaTimeline` is reshaped once). A
+  segment's presentation time is
+  `Period@start + (Segment::time - @presentationTimeOffset) / timescale`.
+- Report every time as presentation time from the start of the
+  presentation: `MediaTimeline::spans`, `fragment_at`, stream `Position`s,
+  `seek_time_coarse`, `starting_at`'s returned start, and `BufferStatus`
+  ranges. A gap before the first fragment is then visible as a start after
+  zero.
+- Expose the mapping for decoder timestamps, e.g.
+      impl MediaTimeline {
+          pub fn timescale(&self) -> u32;
+          pub fn presentation_time_offset(&self) -> u64;
+          /// Presentation time of a media timestamp in timescale ticks, as decoders report.
+          pub fn presentation_time(&self, media_ticks: u64) -> Duration;
+      }
+- Multi-period: add `Period@start` so representations from later periods
+  sit on the same clock (ties into entry 1's out-of-scope multi-period note).
+- Once this lands: drop the shared-origin caveat from
+  `BufferStatus::buffered_until_all`, and change the video_player example to
+  time frames by decoder timestamps (ffmpeg can print them with
+  `-vf showinfo` or `-copyts`) instead of counting frames.
+
+Open questions
+- Should times before the first fragment (a timeline starting after the
+  period start) be seekable, landing on the first fragment, or an error?
+- Breaking change to `MediaTimeline`: fold it into the Phase 1 segment list,
+  or keep it as a public view over that list?

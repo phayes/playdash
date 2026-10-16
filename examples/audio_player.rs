@@ -1,7 +1,7 @@
 //! Command-line player using the DASH-aware [`DashSource`] rodio adapter.
 //!
 //! ```text
-//! cargo run --example player -- [--id FORMAT] [MANIFEST]
+//! cargo run --example audio_player --features rodio -- [--id FORMAT] [MANIFEST]
 //! ```
 //!
 //! `MANIFEST` is an `http(s)` URL, MPEG-DASH XML, a `data:` URL, a file path, or
@@ -13,16 +13,16 @@
 //!
 //! ```text
 //! # Big Buck Bunny, HE-AAC, SegmentTemplate with $Number$
-//! cargo run --example player -- --id bbb_a64k https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd
+//! cargo run --example audio_player --features rodio -- --id bbb_a64k https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd
 //!
 //! # Envivio, AAC-LC, 48 kHz, SegmentTemplate with $Number$
-//! cargo run --example player -- --id v4_258 https://dash.akamaized.net/envivio/EnvivioDash3/manifest.mpd
+//! cargo run --example audio_player --features rodio -- --id v4_258 https://dash.akamaized.net/envivio/EnvivioDash3/manifest.mpd
 //!
 //! # Shaka Player's "Angel One", AAC-LC, SegmentBase (sidx index)
-//! cargo run --example player -- --id 4 https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd
+//! cargo run --example audio_player --features rodio -- --id 4 https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd
 //!
 //! # DASH-IF test vector, Elephants Dream, HE-AAC, SegmentBase; audio is listed first
-//! cargo run --example player -- https://dash.akamaized.net/dash264/TestCases/1a/netflix/exMPD_BIP_TC1.mpd
+//! cargo run --example audio_player --features rodio -- https://dash.akamaized.net/dash264/TestCases/1a/netflix/exMPD_BIP_TC1.mpd
 //! ```
 //!
 //! Symphonia decodes only the AAC-LC core of HE-AAC streams, so they play at
@@ -209,7 +209,7 @@ fn seek(player: &Player, delta_secs: i64) {
 fn print_usage() {
     println!(
         "\
-Usage: player [--id FORMAT] [MANIFEST]
+Usage: audio_player [--id FORMAT] [MANIFEST]
 
 Play an MPEG-DASH manifest through rodio's Symphonia decoder.
 

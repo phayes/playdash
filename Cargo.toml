@@ -1,6 +1,6 @@
 [package]
 name = "playdash"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Patrick Hayes <patrick.d.hayes@gmail.com>"]
 description = "Parse MPEG-DASH manifests and set them up for progressive streaming playback"
 license = "MIT OR Apache-2.0"
@@ -15,14 +15,21 @@ categories = ["multimedia::audio"]
 [dependencies]
 aes = { version = "0.9", optional = true }
 base64 = "0.23"
+bytes = { version = "1.10", optional = true }
 ctr = { version = "0.10", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 log = { version = "^0.4", optional = true }
+# rustls, like ureq's, for the client the async API makes when the caller brings none.
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls"] }
 rodio = { version = "0.22", optional = true, default-features = false, features = [
     "symphonia-isomp4",
 ] }
 thiserror = "^2.0"
-ureq = { version = "3.1", default-features = false, features = ["rustls"] }
+# The async stream's download tasks, and its `AsyncRead` and `AsyncSeek`.
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "sync"] }
+ureq = { version = "3.1", optional = true, default-features = false, features = ["rustls"] }
 url = "2.5"
+serde = { version = "1", features = ["derive"] }
 
 # Vendored dash-mpd-core (src/vendor/dash_mpd_core). It also uses `thiserror`, `url` and,
 # with our `log` feature, `log` from above.
@@ -31,13 +38,17 @@ iso8601 = "0.6.5"
 num-traits = "0.2.19"
 quick-xml = { version = "0.42.0", features = ["serialize", "overlapped-lists"] }
 regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
-serde = { version = "1.0.229", features = ["derive"] }
 serde_path_to_error = "0.1.20"
 serde_with = "3.23.0"
 
 [features]
-default = ["log"]
-rodio = ["dep:rodio"]
+default = ["sync"]
+# The blocking API: `FragmentStream`, `FragmentCache` and `Transport`, fetching through ureq.
+sync = ["dep:ureq", "dep:bytes"]
+# The async API in `playdash::nonblocking`: `DashManifest`, `FragmentStream`, `FragmentCache`
+# and `Transport`, fetching through reqwest on tokio.
+async = ["dep:reqwest", "dep:futures-util", "dep:bytes", "dep:tokio"]
+rodio = ["sync", "dep:rodio"]
 log = ["dep:log"]
 encryption = ["dep:aes", "dep:ctr"]
 
@@ -47,13 +58,24 @@ all-features = true
 [dev-dependencies]
 crossterm = "0.29"
 env_logger = "0.11"
+minifb = "0.29"
 rodio = { version = "0.22", default-features = false, features = [
     "symphonia-aac",
     "symphonia-flac",
     "symphonia-isomp4",
     "playback",
 ] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }
 
 [[example]]
-name = "player"
+name = "list_representations"
+required-features = ["sync"]
+
+[[example]]
+name = "audio_player"
+required-features = ["rodio"]
+
+[[example]]
+name = "video_player"
 required-features = ["rodio"]

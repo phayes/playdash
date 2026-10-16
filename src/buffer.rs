@@ -1,14 +1,13 @@
 //! Download progress of a DASH stream, by fragment, byte and media time.
 
-use crate::stream::{CacheListener, FragmentCache, FragmentData, MediaTimeline};
+use crate::store::{CacheListener, FragmentData, Store};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-/// How much of a stream its cache holds.
-///
-/// Only media fragments count; the initialization segment is not media.
+/// The stream's download progress: the portion of it that its cache holds.
 ///
 /// # Examples
 ///
@@ -33,7 +32,7 @@ use std::time::Duration;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferStatus {
     /// The whole stream.
     pub total: BufferTotal,
@@ -45,7 +44,7 @@ pub struct BufferStatus {
 }
 
 /// An amount of downloaded media.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferAmount {
     /// Media fragments.
     pub fragments: usize,
@@ -56,7 +55,7 @@ pub struct BufferAmount {
 }
 
 /// The size of a whole stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferTotal {
     /// Media fragments.
     pub fragments: usize,
@@ -77,6 +76,43 @@ impl BufferStatus {
             .iter()
             .find(|range| range.contains(&position))
             .map_or(position, |range| range.end)
+    }
+
+    /// Returns how far playback of several streams played together, such as
+    /// a video and its audio, can continue from `position` without waiting on
+    /// the network. 
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use playdash::{BufferAmount, BufferStatus, BufferTotal};
+    ///
+    /// let secs = Duration::from_secs;
+    /// // Ten-second streams buffered from the start to `buffered` seconds.
+    /// let buffered_to = |buffered| BufferStatus {
+    ///     total: BufferTotal { fragments: 5, bytes: None, time: secs(10) },
+    ///     downloaded: BufferAmount::default(),
+    ///     ranges: vec![secs(0)..secs(buffered)],
+    /// };
+    /// let (video, audio) = (buffered_to(4), buffered_to(8));
+    /// assert_eq!(BufferStatus::buffered_until_all([&video, &audio], secs(2)), secs(4));
+    /// ```
+    pub fn buffered_until_all<'a>(
+        statuses: impl IntoIterator<Item = &'a BufferStatus>,
+        position: Duration,
+    ) -> Duration {
+        let mut limit: Option<Duration> = None;
+        let mut latest_end: Option<Duration> = None;
+        for status in statuses {
+            let until = status.buffered_until(position);
+            latest_end = latest_end.max(Some(status.total.time));
+            // Buffered to its end, a stream has nothing left to wait for.
+            if until < status.total.time {
+                limit = Some(limit.map_or(until, |limit| limit.min(until)));
+            }
+        }
+        limit.or(latest_end).unwrap_or(position)
     }
 
     /// [`Self::buffered_until`] as a percentage (0 to 100) of the stream's
@@ -133,6 +169,7 @@ impl BufferStatus {
                 previous_downloaded = false;
                 continue;
             };
+            // Held now; a body a stream has forgotten no longer counts.
             status.downloaded.fragments += 1;
             status.downloaded.bytes += body.len() as u64;
             status.downloaded.time += span.end - span.start;
@@ -153,12 +190,11 @@ fn percent(part: f64, whole: f64) -> f64 {
     (part / whole * 100.0).min(100.0)
 }
 
-/// Live report of how much of a `DashSource`'s or
-/// [`StreamReader`](crate::StreamReader)'s stream its cache holds.
+/// Live report of how much of a stream's representation its cache holds.
 ///
-/// Get one from `DashSource::buffer` (with the `rodio` feature) or
-/// [`StreamReader::buffer`](crate::StreamReader::buffer). It reads only the
-/// cache, so it plays no part in playback and stays usable from any thread.
+/// Get one from `FragmentStream::buffer`, blocking or async, or from
+/// `DashSource::buffer` (with the `rodio` feature). It reads only the cache,
+/// so it plays no part in playback and stays usable from any thread.
 #[derive(Clone)]
 pub struct BufferHandle(Arc<BufferShared>);
 
@@ -172,14 +208,14 @@ struct BufferShared {
 }
 
 impl BufferHandle {
-    /// Tracks `media` fragments of `cache`, timed by `timeline`.
+    /// Tracks `media` fragments of `cache`, each spanning the same-index
+    /// entry of `spans`.
     pub(crate) fn new(
-        cache: &FragmentCache,
+        cache: &Store,
         media: Vec<Arc<FragmentData>>,
-        timeline: &MediaTimeline,
+        mut spans: Vec<Range<Duration>>,
     ) -> Self {
         // Fragments the timeline lacks take no time, at its end.
-        let mut spans = timeline.spans();
         let end = spans.last().map_or(Duration::ZERO, |span| span.end);
         spans.resize(media.len(), end..end);
 
@@ -193,7 +229,7 @@ impl BufferHandle {
         Self(shared)
     }
 
-    /// How much of the stream the cache holds now.
+    /// The stream's current download progress: the portion the cache holds now.
     pub fn status(&self) -> BufferStatus {
         self.0.status()
     }
@@ -252,7 +288,7 @@ impl fmt::Debug for BufferHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Fragment;
+    use crate::fragment::{Fragment, MediaTimeline};
 
     /// Three two-second fragments.
     fn spans() -> Vec<Range<Duration>> {
@@ -353,5 +389,50 @@ mod tests {
         let status = BufferStatus::measure(&unranged([None; 3]), &spans());
         assert_eq!(status.buffered_until(secs(60.0)), secs(6.0));
         assert_eq!(status.buffered_percent(secs(60.0)), 100.0);
+    }
+
+    #[test]
+    fn buffered_until_all_waits_on_the_least_buffered_stream() {
+        let video = BufferStatus::measure(&unranged([Some(1), Some(1), None]), &spans());
+        let audio = BufferStatus::measure(&unranged([Some(1), None, None]), &spans());
+        let until = |statuses: &[&BufferStatus], position| {
+            BufferStatus::buffered_until_all(statuses.iter().copied(), position)
+        };
+        assert_eq!(until(&[&video, &audio], secs(1.0)), secs(2.0));
+        assert_eq!(until(&[&video], secs(1.0)), secs(4.0));
+        // Past audio's buffer, playback waits right where it is.
+        assert_eq!(until(&[&video, &audio], secs(3.0)), secs(3.0));
+        assert_eq!(until(&[], secs(3.0)), secs(3.0));
+    }
+
+    #[test]
+    fn buffered_until_all_ignores_streams_buffered_to_their_end() {
+        // Audio ends at 4 seconds and is fully buffered; video runs to 6.
+        let short = MediaTimeline {
+            timescale: 10,
+            media_durations: vec![20, 20],
+        }
+        .spans();
+        let audio = BufferStatus::measure(&unranged([Some(1), Some(1), None])[..2], &short);
+        let video = BufferStatus::measure(&unranged([Some(1), Some(1), None]), &spans());
+        assert_eq!(
+            BufferStatus::buffered_until_all([&audio, &video], secs(4.5)),
+            secs(4.5)
+        );
+        assert_eq!(
+            BufferStatus::buffered_until_all([&audio, &video], secs(1.0)),
+            secs(4.0)
+        );
+
+        // Everything buffered to its end: the latest end.
+        let complete = BufferStatus::measure(&unranged([Some(1); 3]), &spans());
+        assert_eq!(
+            BufferStatus::buffered_until_all([&audio, &complete], secs(1.0)),
+            secs(6.0)
+        );
+        assert_eq!(
+            BufferStatus::buffered_until_all([&audio, &complete], secs(60.0)),
+            secs(6.0)
+        );
     }
 }

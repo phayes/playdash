@@ -7,13 +7,18 @@
 //! protected sample entry's type is restored from `enca` to its `frma`
 //! original, so Symphonia recognizes the codec.
 
+// Decryption runs where fragments are fetched, so without `sync` or `async`
+// only `ContentKeys` is reachable.
+#![cfg_attr(not(any(feature = "sync", feature = "async")), allow(dead_code))]
+
 use crate::error::Error;
-use crate::stream::Fragment;
+use crate::fragment::Fragment;
 use aes::Aes128;
 use aes::cipher::{BlockCipherDecrypt, KeyInit, KeyIvInit, StreamCipher};
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
+#[cfg(any(feature = "sync", feature = "async"))]
 use std::sync::Arc;
 
 /// `cenc` keystream: the IV's high 8 bytes are fixed and the low 8 bytes
@@ -309,8 +314,8 @@ enum Scheme {
     Cbcs,
 }
 
-/// How one protected audio track's samples are encrypted, from its `tenc`
-/// and `trex`.
+/// Encryption parameters for one protected audio track's samples, read from
+/// its `tenc` and `trex`.
 #[derive(Debug)]
 pub(crate) struct TrackProtection {
     track_id: u32,
@@ -325,7 +330,8 @@ pub(crate) struct TrackProtection {
     default_sample_size: u32,
 }
 
-/// What a fragment is to decryption, set by the reader that requests it.
+/// A fragment's role in decryption, set by the stream that requests it.
+#[cfg(any(feature = "sync", feature = "async"))]
 #[derive(Debug)]
 pub(crate) enum FragmentRole {
     /// The initialization segment: protected sample entries get their

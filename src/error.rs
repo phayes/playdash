@@ -69,8 +69,14 @@ pub enum Error {
     DashManifestUrl(String, #[source] url::ParseError),
 
     /// HTTP request for the MPEG-DASH manifest failed
+    #[cfg(feature = "sync")]
     #[error("Fetching MPEG-DASH manifest failed: {0}")]
     DashManifestFetch(#[source] ureq::Error),
+
+    /// HTTP request for the MPEG-DASH manifest failed
+    #[cfg(feature = "async")]
+    #[error("Requesting MPEG-DASH manifest failed: {0}")]
+    DashManifestRequest(#[source] reqwest::Error),
 
     /// An MPEG-DASH representation did not include a media URL template
     #[error("MPEG-DASH representation is missing a media URL template")]
@@ -95,17 +101,30 @@ pub enum Error {
         actual: u64,
     },
 
-    /// Failed to initialize audio stream
-    #[error("Stream initialization error: {0}")]
-    StreamInitializationError(String),
+    /// A reader, source or transport could not be set up, or cannot do what
+    /// was asked of it
+    #[error("Initialization error: {0}")]
+    Initialization(String),
 
     /// IO error while reading a media fragment body
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
     /// HTTP request for a media fragment failed
-    #[error("Stream HTTP request failed: {0}")]
-    StreamHttp(#[from] ureq::Error),
+    #[cfg(feature = "sync")]
+    #[error("Fetching fragment failed: {0}")]
+    FragmentFetch(#[from] ureq::Error),
+
+    /// HTTP request for a media fragment failed
+    #[cfg(feature = "async")]
+    #[error("Fragment {fragment} request failed: {source}")]
+    FragmentRequest {
+        /// The fragment URL and range
+        fragment: String,
+        /// Why the request failed
+        #[source]
+        source: reqwest::Error,
+    },
 
     /// Rodio could not initialize a decoder for the selected representation.
     #[cfg(feature = "rodio")]

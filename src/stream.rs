@@ -1,218 +1,21 @@
-//! Progressive in-memory reader over MPEG-DASH fragments.
+//! Progressive in-memory streaming of MPEG-DASH fragments: the blocking API of the `sync`
+//! feature.
 
 use crate::buffer::BufferHandle;
 #[cfg(feature = "encryption")]
-use crate::cenc::{self, ContentKeys, FragmentRole};
+use crate::cenc::ContentKeys;
 use crate::error::Error;
-use std::collections::HashMap;
+use crate::fragment::{Fragment, Fragments, MediaTimeline, slice_range};
+use crate::schedule::{
+    self, Cursor, Part, Position, Retention, Schedule, StreamTimeline, TimeAccuracy, WindowChange,
+};
+use crate::store::{FragmentData, Store};
+use bytes::Bytes;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::ops::{Range, RangeInclusive};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
-
-/// Media-segment timing used to map playback positions to fragments.
-///
-/// Durations are expressed in `timescale` ticks. For example, a timescale of
-/// `1_000` makes a duration of `2_500` equal to 2.5 seconds.
-///
-/// # Examples
-///
-/// ```
-/// use playdash::MediaTimeline;
-///
-/// let timeline = MediaTimeline {
-///     timescale: 1_000,
-///     media_durations: vec![2_500, 2_500],
-/// };
-///
-/// // Estimate storage for a 128 kbit/s, five-second stream.
-/// assert!(timeline.estimate_len(1_024, 128_000).is_some());
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MediaTimeline {
-    /// DASH timescale: ticks per second.
-    pub timescale: u32,
-    /// Duration of each media fragment, in timescale ticks, in playback order.
-    pub media_durations: Vec<u64>,
-}
-
-/// Padding applied to advertised media bytes when guessing total length.
-/// AAC `bandwidth` is near the real rate; FLAC's is often uncompressed PCM.
-const SYMPHONIA_COMPAT_MEDIA_FACTOR: u128 = 4;
-
-/// Extra bytes reserved per media fragment for `moof` / box overhead.
-const SYMPHONIA_COMPAT_BYTES_PER_FRAGMENT: u128 = 64 * 1024;
-
-impl MediaTimeline {
-    fn ticks_to_duration(&self, ticks: u64) -> Option<Duration> {
-        if self.timescale == 0 {
-            return None;
-        }
-        let timescale = u64::from(self.timescale);
-        let seconds = ticks / timescale;
-        let nanos = (u128::from(ticks % timescale) * 1_000_000_000 / u128::from(timescale)) as u32;
-        Some(Duration::new(seconds, nanos))
-    }
-
-    /// Media time spanned by each media fragment, in playback order. Empty
-    /// if the timescale is zero.
-    pub(crate) fn spans(&self) -> Vec<Range<Duration>> {
-        let mut ticks = 0u64;
-        self.media_durations
-            .iter()
-            .map_while(|&duration| {
-                let start = self.ticks_to_duration(ticks)?;
-                ticks = ticks.saturating_add(duration);
-                Some(start..self.ticks_to_duration(ticks)?)
-            })
-            .collect()
-    }
-
-    /// Start of the fragment at `fragment_index`, counting the
-    /// initialization fragment as index zero.
-    fn fragment_start(&self, fragment_index: usize) -> Option<Duration> {
-        let media_index = fragment_index.checked_sub(1)?;
-        Some(self.spans().get(media_index)?.start)
-    }
-
-    pub(crate) fn total_duration(&self) -> Option<Duration> {
-        self.ticks_to_duration(self.media_durations.iter().copied().sum())
-    }
-
-    /// Returns a conservative stream-length estimate for a demuxer that needs
-    /// a length before all fragments have been downloaded.
-    ///
-    /// Returns `None` when the bitrate, timescale, or media durations are empty.
-    pub fn estimate_len(&self, init_len: u64, bitrate_bps: u32) -> Option<u64> {
-        if bitrate_bps == 0 || self.timescale == 0 || self.media_durations.is_empty() {
-            return None;
-        }
-        let ticks: u128 = self.media_durations.iter().copied().map(u128::from).sum();
-        let fragments = u128::from(self.media_durations.len() as u64);
-        let denom = u128::from(self.timescale) * 8;
-        let media = (u128::from(bitrate_bps) * ticks).div_ceil(denom);
-        let padded = media
-            .saturating_mul(SYMPHONIA_COMPAT_MEDIA_FACTOR)
-            .saturating_add(fragments.saturating_mul(SYMPHONIA_COMPAT_BYTES_PER_FRAGMENT))
-            .saturating_add(u128::from(init_len));
-        Some(u64::try_from(padded).unwrap_or(u64::MAX))
-    }
-}
-
-/// Byte and media-time information for a stream position.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Position {
-    /// Absolute offset in the concatenated init + media byte stream.
-    ///
-    /// This is `None` when preceding fragment sizes are not yet known.
-    pub byte: Option<u64>,
-
-    /// Media timestamp corresponding to the position, when a timeline applies.
-    pub time: Option<TimePosition>,
-}
-
-/// Media timestamp and the accuracy with which it was resolved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TimePosition {
-    /// Actual media timestamp at which reading begins.
-    pub timestamp: Duration,
-
-    /// Whether `timestamp` is exact or the start of a containing fragment.
-    pub accuracy: TimeAccuracy,
-}
-
-/// Accuracy of a reported media timestamp.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimeAccuracy {
-    /// The byte position is known to land exactly at this media timestamp.
-    Exact,
-
-    /// The timestamp is the start of the fragment containing the requested position.
-    Coarse,
-}
-
-/// Parses an inclusive byte range in the DASH `@mediaRange` / `@range` and
-/// HTTP `first-last` form, such as `"0-837"`.
-pub(crate) fn parse_byte_range(value: &str) -> Result<RangeInclusive<u64>, Error> {
-    value
-        .trim()
-        .split_once('-')
-        .and_then(|(start, end)| {
-            let (start, end) = (start.parse().ok()?, end.parse().ok()?);
-            (start <= end).then_some(start..=end)
-        })
-        .ok_or_else(|| Error::InvalidByteRange(value.to_owned()))
-}
-
-/// A media resource, optionally limited to an inclusive byte range.
-///
-/// # Examples
-///
-/// ```
-/// use playdash::Fragment;
-///
-/// let whole = Fragment::new("https://media.example/init.mp4");
-/// assert_eq!(whole.known_size(), None);
-///
-/// let range = Fragment::with_range("https://media.example/audio.mp4", 100..=599);
-/// assert_eq!(range.known_size(), Some(500));
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Fragment {
-    /// Absolute URL of the resource.
-    pub url: String,
-    /// Inclusive byte range within the resource, as in an HTTP `Range`
-    /// header, or `None` for the whole body. Must not be empty.
-    pub range: Option<RangeInclusive<u64>>,
-}
-
-impl Fragment {
-    /// The whole body at `url`.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            range: None,
-        }
-    }
-
-    /// The bytes of `url` covered by `range`.
-    pub fn with_range(url: impl Into<String>, range: RangeInclusive<u64>) -> Self {
-        Self {
-            url: url.into(),
-            range: Some(range),
-        }
-    }
-
-    /// Byte length, when the range makes it known in advance.
-    pub fn known_size(&self) -> Option<u64> {
-        self.range
-            .as_ref()
-            .and_then(|range| range.end().checked_sub(*range.start())?.checked_add(1))
-    }
-}
-
-impl From<String> for Fragment {
-    fn from(url: String) -> Self {
-        Self::new(url)
-    }
-}
-
-impl From<&str> for Fragment {
-    fn from(url: &str) -> Self {
-        Self::new(url)
-    }
-}
-
-impl fmt::Display for Fragment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.range {
-            Some(range) => write!(f, "{} (bytes {}-{})", self.url, range.start(), range.end()),
-            None => f.write_str(&self.url),
-        }
-    }
-}
 
 /// Fetches fragment bodies and sizes for a [`FragmentCache`].
 ///
@@ -224,17 +27,18 @@ impl fmt::Display for Fragment {
 ///
 /// ```
 /// use std::sync::Arc;
+/// use bytes::Bytes;
 /// use playdash::{Error, Fragment, FragmentCache, Transport};
 ///
 /// struct MemoryTransport;
 ///
 /// impl Transport for MemoryTransport {
-///     fn get(&self, fragment: &Fragment, _: Option<u64>) -> Result<Arc<[u8]>, Error> {
-///         let bytes: &[u8] = match fragment.url.as_str() {
+///     fn get(&self, fragment: &Fragment, _: Option<u64>) -> Result<Bytes, Error> {
+///         let bytes: &'static [u8] = match fragment.url.as_str() {
 ///             "memory://init" => b"initialization data",
 ///             _ => b"media data",
 ///         };
-///         Ok(Arc::from(bytes))
+///         Ok(Bytes::from_static(bytes))
 ///     }
 /// }
 ///
@@ -247,14 +51,14 @@ pub trait Transport: Send + Sync {
     /// Must honor [`Fragment::range`] and return exactly those bytes; a ranged
     /// body of any other length fails the stream. `size_hint` is the length
     /// when already known, for preallocating the body.
-    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error>;
+    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error>;
 
     /// Byte length of `fragment`, typically from a HEAD `Content-Length`.
     ///
     /// Never called for ranged fragments, whose sizes are already known. An
     /// error disables HEAD probing for the stream; the default always errors.
     fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
-        Err(Error::StreamInitializationError(format!(
+        Err(Error::Initialization(format!(
             "transport cannot HEAD {fragment}"
         )))
     }
@@ -263,7 +67,7 @@ pub trait Transport: Send + Sync {
 impl Transport for ureq::Agent {
     /// Sends a `Range` header for ranged fragments; if a server ignores it and
     /// returns the whole body, the range is sliced out of that body.
-    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
+    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error> {
         let mut request = ureq::Agent::get(self, &fragment.url);
         if let Some(range) = &fragment.range {
             request = request.header(
@@ -278,15 +82,17 @@ impl Transport for ureq::Agent {
             .map(Vec::with_capacity)
             .unwrap_or_default();
         response.into_body().into_reader().read_to_end(&mut bytes)?;
+        let body = Bytes::from(bytes);
         match &fragment.range {
             Some(range) if !partial => {
                 #[cfg(feature = "log")]
                 log::warn!(
                     "server ignored the Range request for {fragment}; slicing the full body"
                 );
-                Ok(slice_range(&bytes, range).unwrap_or(&bytes).into())
+                Ok(slice_range(&body, range)
+                    .map_or_else(|| body.clone(), |part| body.slice_ref(part)))
             }
-            _ => Ok(bytes.into()),
+            _ => Ok(body),
         }
     }
 
@@ -299,61 +105,8 @@ impl Transport for ureq::Agent {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
             .ok_or_else(|| {
-                Error::StreamInitializationError(format!(
-                    "HEAD for {url} did not return Content-Length"
-                ))
+                Error::Initialization(format!("HEAD for {url} did not return Content-Length"))
             })
-    }
-}
-
-/// What is known about one [`Fragment`]: its body once fetched, and its
-/// length once a range, HEAD or GET establishes it. Shared by every reader of
-/// a [`FragmentCache`]; each value is set at most once.
-#[derive(Debug)]
-pub(crate) struct FragmentData {
-    fragment: Fragment,
-    body: OnceLock<Arc<[u8]>>,
-    /// Length from HEAD, before the body arrives.
-    probed_size: OnceLock<u64>,
-    /// Held across a GET so a second reader waits for that download instead
-    /// of starting its own.
-    get_lock: Mutex<()>,
-    /// Held across a HEAD, as `get_lock` is for GETs.
-    head_lock: Mutex<()>,
-    /// How a keyed cache turns this fragment's fetched bytes into plaintext.
-    /// A reader sets it before the first GET of the fragment.
-    #[cfg(feature = "encryption")]
-    role: OnceLock<FragmentRole>,
-}
-
-impl FragmentData {
-    pub(crate) fn new(fragment: Fragment) -> Self {
-        Self {
-            fragment,
-            body: OnceLock::new(),
-            probed_size: OnceLock::new(),
-            get_lock: Mutex::new(()),
-            head_lock: Mutex::new(()),
-            #[cfg(feature = "encryption")]
-            role: OnceLock::new(),
-        }
-    }
-
-    pub(crate) fn body(&self) -> Option<&Arc<[u8]>> {
-        self.body.get()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_body(&self, body: &[u8]) {
-        self.body.set(body.into()).expect("body set once");
-    }
-
-    /// Byte length from the range, else the body, else a probe.
-    pub(crate) fn size(&self) -> Option<u64> {
-        self.fragment
-            .known_size()
-            .or_else(|| self.body().map(|body| body.len() as u64))
-            .or_else(|| self.probed_size.get().copied())
     }
 }
 
@@ -370,21 +123,16 @@ impl FragmentData {
 ///
 /// # fn example(manifest: &DashManifest) -> Result<(), playdash::Error> {
 /// let cache = Arc::new(FragmentCache::default());
-/// let first = manifest.stream_with_cache("audio", false, cache.clone())?;
-/// let second = manifest.stream_with_cache("audio", false, cache)?;
-/// // Both readers reuse fragment bodies that either reader downloads.
+/// let first = manifest.stream_with_cache("audio", cache.clone())?;
+/// let second = manifest.stream_with_cache("audio", cache)?;
+/// // Both streams reuse fragment bodies that either one downloads.
 /// # drop((first, second));
 /// # Ok(())
 /// # }
 /// ```
 pub struct FragmentCache {
     transport: Arc<dyn Transport>,
-    fragments: Mutex<HashMap<Fragment, Arc<FragmentData>>>,
-    /// Called after a fragment's body or size becomes known. Held weakly, so
-    /// a listener lives as long as its subscriber keeps it.
-    listeners: Mutex<Vec<Weak<dyn CacheListener>>>,
-    #[cfg(feature = "encryption")]
-    keys: Option<Arc<ContentKeys>>,
+    pub(crate) store: Store,
 }
 
 impl FragmentCache {
@@ -392,10 +140,7 @@ impl FragmentCache {
     pub fn new(transport: Arc<dyn Transport>) -> Self {
         Self {
             transport,
-            fragments: Mutex::default(),
-            listeners: Mutex::default(),
-            #[cfg(feature = "encryption")]
-            keys: None,
+            store: Store::default(),
         }
     }
 
@@ -408,179 +153,67 @@ impl FragmentCache {
     /// its KID. Unprotected representations pass through unchanged.
     #[cfg(feature = "encryption")]
     pub fn with_keys(mut self, keys: ContentKeys) -> Self {
-        self.keys = Some(Arc::new(keys));
+        self.store.set_keys(keys);
         self
     }
 
     /// Whether this cache decrypts Common Encryption; see `with_keys`
     /// (requires the `encryption` feature).
     pub fn decrypts(&self) -> bool {
-        #[cfg(feature = "encryption")]
-        return self.keys.is_some();
-        #[cfg(not(feature = "encryption"))]
-        false
+        self.store.decrypts()
     }
 
-    /// The body of `fragment`, if it has been fetched. On a cache with
-    /// content keys, this is the decrypted body.
-    pub fn cached(&self, fragment: &Fragment) -> Option<Arc<[u8]>> {
-        self.lock().get(fragment)?.body().cloned()
+    /// The body of `fragment`, if it is held. On a cache with content keys,
+    /// this is the decrypted body.
+    pub fn cached(&self, fragment: &Fragment) -> Option<Bytes> {
+        self.store.cached(fragment)
     }
 
     /// The byte length of `fragment`, if its range, a HEAD or a GET has
     /// established it.
     pub fn known_size(&self, fragment: &Fragment) -> Option<u64> {
-        fragment
-            .known_size()
-            .or_else(|| self.lock().get(fragment)?.size())
-    }
-
-    fn lock(&self) -> MutexGuard<'_, HashMap<Fragment, Arc<FragmentData>>> {
-        self.fragments
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-    }
-
-    /// Tells `listener` after any fragment's body or size becomes known, on
-    /// the thread that learned it, until `listener` is dropped.
-    pub(crate) fn subscribe(&self, listener: Weak<dyn CacheListener>) {
-        self.listeners
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(listener);
-    }
-
-    fn notify(&self, data: &FragmentData) {
-        let listeners: Vec<_> = {
-            let mut listeners = self
-                .listeners
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            listeners.retain(|listener| listener.strong_count() > 0);
-            listeners.iter().filter_map(Weak::upgrade).collect()
-        };
-        for listener in listeners {
-            listener.fragment_changed(data);
-        }
+        self.store.known_size(fragment)
     }
 
     /// The shared entry for `fragment`, created empty if new.
     pub(crate) fn data(&self, fragment: Fragment) -> Arc<FragmentData> {
-        self.lock()
-            .entry(fragment)
-            .or_insert_with_key(|fragment| Arc::new(FragmentData::new(fragment.clone())))
-            .clone()
+        self.store.data(fragment)
     }
 
-    /// The body of `data`, fetching it unless it is cached or another reader
+    /// The body of `data`, fetching it unless it is held or another stream
     /// is already fetching it. A ranged body of the wrong length is an error
-    /// and is not cached.
-    fn get(&self, data: &FragmentData) -> Result<Arc<[u8]>, Error> {
+    /// and is not kept.
+    pub(crate) fn get(&self, data: &FragmentData) -> Result<Bytes, Error> {
         if let Some(body) = data.body() {
-            return Ok(body.clone());
+            return Ok(body);
         }
         let _in_flight = data
-            .get_lock
+            .blocking_fetch
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(body) = data.body() {
-            return Ok(body.clone());
-        }
-        let fragment = &data.fragment;
-        let body = self.transport.get(fragment, data.size())?;
-        if let Some(expected) = fragment.known_size()
-            && body.len() as u64 != expected
-        {
-            return Err(Error::FragmentLength {
-                fragment: fragment.to_string(),
-                expected,
-                actual: body.len() as u64,
-            });
-        }
-        #[cfg(feature = "encryption")]
-        let body = self.decrypt(data, body)?;
-        let body = data.body.get_or_init(|| body).clone();
-        self.notify(data);
-        Ok(body)
-    }
-
-    /// Decrypts `body` in place according to `data`'s role. Same length out
-    /// as in, so ranges, HEAD sizes and byte seeks are unaffected.
-    #[cfg(feature = "encryption")]
-    fn decrypt(&self, data: &FragmentData, mut body: Arc<[u8]>) -> Result<Arc<[u8]>, Error> {
-        let Some(keys) = &self.keys else {
             return Ok(body);
-        };
-        let role = match data.role.get() {
-            Some(FragmentRole::Media(tracks)) if tracks.is_empty() => return Ok(body),
-            Some(role) => role,
-            None => {
-                debug_assert!(
-                    false,
-                    "keyed cache fetched {} before a reader set its role",
-                    data.fragment
-                );
-                return Ok(body);
-            }
-        };
-        // ureq's `Vec -> Arc` body is already unique; only shared bodies copy.
-        if Arc::get_mut(&mut body).is_none() {
-            body = Arc::from(&*body);
         }
-        let bytes = Arc::get_mut(&mut body).expect("body was just made unique");
-        match role {
-            FragmentRole::Init => cenc::clear_sample_entries(bytes),
-            FragmentRole::Media(tracks) => cenc::decrypt_fragment(bytes, tracks, keys),
-        }
-        .map_err(|problem| problem.at(&data.fragment))?;
-        Ok(body)
+        let body = self.transport.get(&data.fragment, data.size())?;
+        self.store.accept(data, body)
     }
 
-    /// Tags `fragments[1..]` with the protection parsed from the already
-    /// fetched and cleared init body. Fails before any media GET if a
-    /// protected track's KID has no key.
-    #[cfg(feature = "encryption")]
-    fn assign_media_roles(&self, fragments: &[Arc<FragmentData>]) -> Result<(), Error> {
-        let Some(keys) = &self.keys else {
-            return Ok(());
-        };
-        let init = &fragments[0];
-        let body = init.body().expect("init fetched before media roles");
-        let tracks = cenc::track_protection(body).map_err(|problem| problem.at(&init.fragment))?;
-        if let Some(track) = tracks.iter().find(|track| !keys.contains(&track.kid)) {
-            return Err(Error::MissingContentKey(cenc::hex(&track.kid)));
-        }
-        let tracks: Arc<[_]> = tracks.into();
-        for data in &fragments[1..] {
-            // Already set if another reader of this cache got here first.
-            let _ = data.role.set(FragmentRole::Media(tracks.clone()));
-        }
-        Ok(())
-    }
-
-    /// HEADs `data` unless its size is already known or another reader is
+    /// HEADs `data` unless its size is already known or another stream is
     /// already probing it.
     fn probe(&self, data: &FragmentData) -> Result<(), Error> {
         if data.size().is_some() {
             return Ok(());
         }
         let _in_flight = data
-            .head_lock
+            .blocking_probe
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if data.size().is_none() {
             let size = self.transport.head(&data.fragment)?;
-            data.probed_size.get_or_init(|| size);
-            self.notify(data);
+            self.store.accept_probe(data, size);
         }
         Ok(())
     }
-}
-
-/// Subscriber to a [`FragmentCache`]; see [`FragmentCache::subscribe`].
-pub(crate) trait CacheListener: Send + Sync {
-    /// `data`'s body or size has just become known.
-    fn fragment_changed(&self, data: &FragmentData);
 }
 
 impl Default for FragmentCache {
@@ -593,19 +226,20 @@ impl Default for FragmentCache {
 impl fmt::Debug for FragmentCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FragmentCache")
-            .field("fragments", &self.lock().len())
+            .field("fragments", &self.store.len())
             .field("decrypts", &self.decrypts())
             .finish_non_exhaustive()
     }
 }
 
-/// How long to keep an idle HTTP connection in the ureq pool.
+/// Maximum idle time for an HTTP connection in the ureq pool.
 ///
 /// Fastly allows idle client reuse for up to 10 minutes. Stay well under
 /// that so we close first, and under typical NAT idle timeouts.
 const POOL_IDLE_AGE: Duration = Duration::from_secs(90);
 
-fn ureq_agent() -> ureq::Agent {
+/// A ureq agent with this crate's connection-pool settings.
+pub(crate) fn ureq_agent() -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .max_idle_age(POOL_IDLE_AGE)
@@ -613,19 +247,41 @@ fn ureq_agent() -> ureq::Agent {
     )
 }
 
-/// The `range` bytes of a full body, for servers that answer a Range request with 200.
-fn slice_range<'a>(body: &'a [u8], range: &RangeInclusive<u64>) -> Option<&'a [u8]> {
-    let start = usize::try_from(*range.start()).ok()?;
-    let end = usize::try_from(*range.end()).ok()?;
-    body.get(start..=end)
-}
-
-/// A progressive [`Read`] and [`Seek`] view of MPEG-DASH fragments.
+/// A representation's fragments, downloaded in the background and read in
+/// order: an [`Iterator`] of whole fragments, and a progressive [`Read`] and
+/// [`Seek`] view of the same bytes. The blocking counterpart of the `async`
+/// feature's `nonblocking::FragmentStream`.
 ///
-/// The reader presents the initialization segment followed by media segments
-/// as one byte stream. Use [`Self::seek_bytes`] for byte offsets or
-/// [`Self::seek_time_coarse`] to seek to the start of the fragment containing
-/// a timestamp. [`Read`] may block while the requested fragment downloads.
+/// The initialization segment comes first, then the media segments. Iterating
+/// and reading share one position: [`Iterator::next`] yields everything from
+/// the current position to the end of its fragment, which is a whole fragment
+/// unless [`Read`] or [`Self::seek_bytes`] left the position inside one. Use
+/// [`Self::seek_bytes`] for byte offsets or [`Self::seek_time_coarse`] to seek
+/// to the start of the fragment containing a timestamp. Both iterating and
+/// reading block while the fragment they need downloads.
+///
+/// It downloads on a background thread, one fragment at a time. By default it
+/// keeps the whole representation; [`Self::with_retention`] bounds how much it
+/// keeps behind its position and how far ahead it downloads, as long video
+/// needs.
+///
+/// After a download fails, iteration yields the error once and then ends, and
+/// [`Read`] keeps returning it.
+///
+/// **N.B.** [`Read`] and [`Iterator`] both define `take`, `chain` and
+/// `by_ref`, and `&mut FragmentStream` implements both traits too. With
+/// [`Read`] in scope, a method call such as `stream.take(3)` is ambiguous and
+/// will not compile. Name the trait you mean instead:
+///
+/// ```no_run
+/// # fn example(stream: playdash::FragmentStream) {
+/// use std::io::Read;
+///
+/// let first_three = Iterator::take(stream, 3); // fragments
+/// # let stream: playdash::FragmentStream = todo!();
+/// let first_kib = Read::take(stream, 1024); // bytes
+/// # }
+/// ```
 ///
 /// # Examples
 ///
@@ -636,8 +292,15 @@ fn slice_range<'a>(body: &'a [u8], range: &RangeInclusive<u64>) -> Option<&'a [u
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
-/// let mut stream = manifest.stream("audio", true)?;
 ///
+/// // Whole fragments.
+/// for fragment in manifest.stream("audio")? {
+///     let bytes = fragment?;
+///     # drop(bytes);
+/// }
+///
+/// // Bytes, from 30 seconds in.
+/// let mut stream = manifest.stream("audio")?;
 /// stream.seek_time_coarse(Duration::from_secs(30))?;
 /// let mut bytes = [0; 4096];
 /// let count = stream.read(&mut bytes)?;
@@ -646,229 +309,143 @@ fn slice_range<'a>(body: &'a [u8], range: &RangeInclusive<u64>) -> Option<&'a [u
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct StreamReader {
-    shared: Arc<ReaderShared>,
-    byte_position: Option<u64>,
-    fragment_index: usize,
-    offset_in_fragment: usize,
-    timeline: Option<MediaTimeline>,
-    /// When set, [`SeekFrom::End`]`(0)` may report [`Self::length_estimate`]
+pub struct FragmentStream {
+    shared: Arc<StreamShared>,
+    cursor: Cursor,
+    timeline: Option<StreamTimeline>,
+    /// Estimated stream length. When set, [`SeekFrom::End`]`(0)` may report it
     /// instead of waiting for every fragment size.
-    symphonia_compat: bool,
     length_estimate: Option<u64>,
+    /// Set once iteration has yielded an error, so it ends rather than
+    /// yielding the same error forever.
+    failed: bool,
 }
 
-/// A reader's state, shared with its GET and HEAD worker threads.
+/// A stream's state, shared with its GET and HEAD worker threads.
 #[derive(Debug)]
-struct ReaderShared {
-    state: Mutex<ReaderState>,
-    /// Notified after every change to `state`, or to a body or size in
-    /// `state.fragments` written by this reader's threads.
+struct StreamShared {
+    schedule: Mutex<Schedule>,
+    /// Notified after every change to `schedule`, or to a body or size in
+    /// `schedule.fragments` written by this stream's threads.
     condvar: Condvar,
     cancelled: AtomicBool,
     cache: Arc<FragmentCache>,
 }
 
-/// Which fragments a reader wants and how its workers schedule them.
-#[derive(Debug)]
-struct ReaderState {
-    /// Initialization fragment, then media fragments in timeline order.
-    fragments: Vec<Arc<FragmentData>>,
-    /// When false, byte seeks wait on downloaded bodies instead of HEAD.
-    head_available: bool,
-    /// Background HEAD prefetch is wanted. Does not gate on-demand seek HEADs.
-    eager_head: bool,
-    /// A HEAD worker thread is alive, possibly finishing an in-flight request.
-    head_worker_running: bool,
-    /// Read/seek playhead. The GET worker fills at or after this index first.
-    cursor_fragment: usize,
-    priority: Option<usize>,
-    complete: bool,
-    error: Option<String>,
-}
-
-impl ReaderState {
-    fn all_sizes_known(&self) -> bool {
-        self.total_len().is_some()
-    }
-
-    fn missing_body(&self, index: usize) -> bool {
-        self.fragments
-            .get(index)
-            .is_some_and(|data| data.body().is_none())
-    }
-
-    #[cfg_attr(not(feature = "log"), allow(unused_variables))]
-    fn disable_head(&mut self, reason: &str) {
-        if self.head_available {
-            self.head_available = false;
-            #[cfg(feature = "log")]
-            log::warn!("MPEG stream disabling HEAD size probes: {reason}");
-        }
-    }
-
-    fn next_get(&mut self) -> Option<(usize, Arc<FragmentData>)> {
-        let cursor = self.cursor_fragment.min(self.fragments.len());
-        let index = self
-            .priority
-            .take()
-            .filter(|&priority| self.missing_body(priority))
-            .or_else(|| {
-                (cursor..self.fragments.len())
-                    .chain(0..cursor)
-                    .find(|&index| self.missing_body(index))
-            })?;
-        Some((index, self.fragments[index].clone()))
-    }
-
-    fn next_head(&self) -> Option<(usize, Arc<FragmentData>)> {
-        if !self.head_available {
-            return None;
-        }
-        let index = self
-            .fragments
-            .iter()
-            .position(|data| data.size().is_none())?;
-        Some((index, self.fragments[index].clone()))
-    }
-
-    /// Sum of the first `count` fragment sizes, if all are known.
-    fn prefix_len(&self, count: usize) -> Option<u64> {
-        self.fragments[..count].iter().map(|data| data.size()).sum()
-    }
-
-    fn total_len(&self) -> Option<u64> {
-        self.prefix_len(self.fragments.len())
-    }
-
-    // TODO: Publish a media fragment's leading `moof` as soon as those bytes
-    // have arrived, instead of waiting for the trailing `mdat`. IsoMp4 open
-    // and the first packet only need the `moof`; `Read` currently blocks until
-    // this method sees the whole GET. Stream the body, parse top-level box
-    // sizes, and wake readers once the `moof` is complete.
-    /// Stops trusting HEAD if fragment `index`'s body disagrees with its probe.
-    fn check_probe(&mut self, index: usize) {
-        let data = &self.fragments[index];
-        if let (Some(&expected), Some(body)) = (data.probed_size.get(), data.body())
-            && expected != body.len() as u64
-        {
-            let len = body.len();
-            self.disable_head(&format!(
-                "GET length {len} != HEAD length {expected} for fragment {index}"
-            ));
-        }
-    }
-
-    /// Maps an absolute byte offset onto a fragment cursor once contiguous
-    /// sizes covering that offset are known.
-    fn resolve_cursor(&self, target: u64) -> Option<(usize, usize)> {
-        let mut acc = 0u64;
-        for (index, data) in self.fragments.iter().enumerate() {
-            let len = data.size()?;
-            if target < acc + len {
-                return Some((index, (target - acc) as usize));
-            }
-            acc += len;
-        }
-
-        let last = self.fragments.len().checked_sub(1)?;
-        Some((last, self.fragments[last].size().unwrap_or(0) as usize))
-    }
-}
-
-impl StreamReader {
-    /// Creates a reader using the default HTTP transport.
+impl FragmentStream {
+    /// Creates a stream of `fragments` using the default HTTP transport. The
+    /// initialization fragment is fetched before this returns.
     ///
-    /// `fragments` must contain the initialization fragment first, followed by
-    /// media fragments in playback order. Set `eager_head` to discover unknown
-    /// fragment sizes in the background for faster byte seeking.
-    pub fn new(
-        fragments: Vec<Fragment>,
-        timeline: Option<MediaTimeline>,
-        eager_head: bool,
-    ) -> Result<Self, Error> {
-        Self::new_with_cache(fragments, timeline, eager_head, Arc::default())
+    /// `timeline`, when given, must have one duration per media fragment.
+    /// Call [`Self::start_eager_head`] to discover unknown fragment sizes in
+    /// the background for faster byte seeking.
+    pub fn new(fragments: Fragments, timeline: Option<MediaTimeline>) -> Result<Self, Error> {
+        Self::new_with_cache(fragments, timeline, Arc::default())
     }
 
     /// Like [`Self::new`], but fetches through `transport` with a new
-    /// [`FragmentCache`] dedicated to this reader.
+    /// [`FragmentCache`] dedicated to this stream.
     pub fn new_with_transport(
-        fragments: Vec<Fragment>,
+        fragments: Fragments,
         timeline: Option<MediaTimeline>,
-        eager_head: bool,
         transport: Arc<dyn Transport>,
     ) -> Result<Self, Error> {
         let cache = FragmentCache::new(transport);
-        Self::new_with_cache(fragments, timeline, eager_head, Arc::new(cache))
+        Self::new_with_cache(fragments, timeline, Arc::new(cache))
     }
 
-    /// Creates a reader that reuses data from `cache`.
-    ///
-    /// The first item in `fragments` is treated as the initialization fragment
-    /// and is fetched before this method returns. Set `eager_head` to discover
-    /// unknown fragment sizes in the background.
+    /// Like [`Self::new`], but reuses data from `cache`.
     pub fn new_with_cache(
-        fragments: Vec<Fragment>,
+        fragments: Fragments,
         timeline: Option<MediaTimeline>,
-        eager_head: bool,
         cache: Arc<FragmentCache>,
     ) -> Result<Self, Error> {
-        if fragments.is_empty() {
-            return Err(Error::DashManifestMissingUrls);
-        }
+        let timeline = timeline.map(|timeline| StreamTimeline::new(timeline, 0));
+        Self::open(fragments, timeline, cache)
+    }
 
-        let fragments: Vec<_> = fragments
+    /// Creates a stream that reads the initialization fragment of
+    /// `fragments`, then its media from the fragment covering `time`, through
+    /// `cache`. Returns the stream and the start of that fragment, which is at
+    /// or before `time`. The initialization fragment is fetched before this
+    /// returns.
+    ///
+    /// The stream reports and seeks by `timeline`'s media time, as a stream
+    /// of every fragment would; seeking to a time before its start fails. A
+    /// `time` at or past the end starts at the last media fragment.
+    /// `timeline` must have one duration per media fragment.
+    ///
+    /// Fails with [`Error::Initialization`] if `timeline` has no media
+    /// durations or a zero timescale, or there are fewer media fragments than
+    /// the timeline puts before `time`.
+    pub fn starting_at(
+        fragments: Fragments,
+        timeline: MediaTimeline,
+        time: Duration,
+        cache: Arc<FragmentCache>,
+    ) -> Result<(Self, Duration), Error> {
+        let (fragments, timeline, start) = schedule::start_at(fragments, timeline, time)?;
+        Ok((Self::open(fragments, Some(timeline), cache)?, start))
+    }
+
+    /// A stream of `fragments`, timed by `timeline`, fetching through `cache`.
+    fn open(
+        fragments: Fragments,
+        timeline: Option<StreamTimeline>,
+        cache: Arc<FragmentCache>,
+    ) -> Result<Self, Error> {
+        // Fetch the initialization fragment, which tells how to decrypt the media.
+        let init = cache.data(fragments.init);
+        let media: Vec<_> = fragments
+            .media
             .into_iter()
             .map(|fragment| cache.data(fragment))
             .collect();
         #[cfg(feature = "encryption")]
-        let _ = fragments[0].role.set(FragmentRole::Init);
-        cache.get(&fragments[0])?;
+        cache.store.assign_init_role(&init);
+        cache.get(&init)?;
         #[cfg(feature = "encryption")]
-        cache.assign_media_roles(&fragments)?;
-        let complete = fragments.iter().all(|data| data.body().is_some());
+        cache.store.assign_media_roles(&init, &media)?;
 
-        let shared = Arc::new(ReaderShared {
-            state: Mutex::new(ReaderState {
-                fragments,
-                head_available: true,
-                eager_head: false,
-                head_worker_running: false,
-                cursor_fragment: 0,
-                priority: None,
-                complete,
-                error: None,
-            }),
+        // Keep everything until a retention says otherwise.
+        let spans = timeline
+            .as_ref()
+            .map(StreamTimeline::spans)
+            .unwrap_or_default();
+        let schedule = Schedule::new(init, media, spans);
+        cache.store.acquire(&schedule.kept());
+        let shared = Arc::new(StreamShared {
+            schedule: Mutex::new(schedule),
             condvar: Condvar::new(),
             cancelled: AtomicBool::new(false),
             cache,
         });
+        spawn_get_worker(shared.clone());
 
-        if !complete {
-            spawn_get_worker(shared.clone());
-        }
-
-        let reader = Self {
+        Ok(Self {
             shared,
-            byte_position: Some(0),
-            fragment_index: 0,
-            offset_in_fragment: 0,
+            cursor: Cursor::start(),
             timeline,
-            symphonia_compat: false,
             length_estimate: None,
-        };
-        if eager_head {
-            reader.start_eager_head();
-        }
-        Ok(reader)
+            failed: false,
+        })
     }
 
-    /// A handle reporting how much of this reader's media its cache holds.
-    /// `None` if the reader has no timeline.
+    /// Keeps only as much of the representation around the position as
+    /// `retention` says, and downloads only that far ahead. The default keeps
+    /// everything. See [`Retention`].
+    pub fn with_retention(self, retention: Retention) -> Self {
+        let change = self.shared.lock().set_retention(retention);
+        self.shared.window_moved(change);
+        self
+    }
+
+    /// A handle reporting how much of this stream's media its cache holds.
+    /// `None` if the stream has no timeline.
     pub fn buffer(&self) -> Option<BufferHandle> {
-        let timeline = self.timeline.as_ref()?;
-        let media = self.shared.lock().fragments[1..].to_vec();
-        Some(BufferHandle::new(&self.shared.cache, media, timeline))
+        let spans = self.timeline.as_ref()?.spans();
+        let media = self.shared.lock().media.clone();
+        Some(BufferHandle::new(&self.shared.cache.store, media, spans))
     }
 
     /// Starts background HEAD prefetch of unknown fragment sizes.
@@ -908,43 +485,13 @@ impl StreamReader {
     /// Requires a [`MediaTimeline`] and a non-zero bitrate.
     pub fn set_symphonia_compat(&mut self, enabled: bool, bitrate_bps: u32) -> Result<(), Error> {
         if !enabled {
-            self.symphonia_compat = false;
             self.length_estimate = None;
             return Ok(());
         }
-
-        let timeline = self.timeline.as_ref().ok_or_else(|| {
-            Error::StreamInitializationError(
-                "symphonia_compat requires a SegmentTimeline".to_owned(),
-            )
-        })?;
-        let init_len = {
-            let inner = self.shared.lock();
-            inner.fragments[0].size().unwrap_or(0)
-        };
-        let estimate = timeline
-            .estimate_len(init_len, bitrate_bps)
-            .ok_or_else(|| {
-                Error::StreamInitializationError(
-                    "symphonia_compat requires a non-zero bitrate and timescale".to_owned(),
-                )
-            })?;
-        self.symphonia_compat = true;
+        let init_len = self.shared.lock().init.size().unwrap_or(0);
+        let estimate = schedule::compat_estimate(self.timeline.as_ref(), init_len, bitrate_bps)?;
         self.length_estimate = Some(estimate);
         Ok(())
-    }
-
-    /// Exact total when every size is known; otherwise the compat overestimate.
-    fn reported_end_len(&self) -> Option<u64> {
-        let inner = self.shared.lock();
-        if let Some(exact) = inner.total_len() {
-            return Some(exact);
-        }
-        if !self.symphonia_compat {
-            return None;
-        }
-        let known: u64 = inner.fragments.iter().filter_map(|data| data.size()).sum();
-        self.length_estimate.map(|estimate| estimate.max(known))
     }
 
     /// Seeks to an exact offset in the concatenated initialization + media bytes.
@@ -960,69 +507,36 @@ impl StreamReader {
     /// boundary and otherwise reports the containing fragment's start as
     /// [`TimeAccuracy::Coarse`].
     pub fn seek_bytes(&mut self, from: SeekFrom) -> io::Result<Position> {
-        if let SeekFrom::End(0) = from
-            && let Some(len) = self.reported_end_len()
-        {
-            return self.park_at_reported_end(len);
+        // The end, as far as it is known or estimated.
+        let reported_end = match from {
+            SeekFrom::End(0) => self.shared.lock().reported_end_len(self.length_estimate),
+            _ => None,
+        };
+        if let Some(len) = reported_end {
+            return Ok(self.park_at_end(len));
         }
 
-        let target = match from {
-            SeekFrom::Start(offset) => offset,
-            SeekFrom::Current(offset) => {
-                let Some(position) = self.byte_position else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "MPEG stream absolute byte position is unknown; use seek_time_coarse or SeekFrom::Start",
-                    ));
-                };
-                if offset >= 0 {
-                    position.saturating_add(offset as u64)
-                } else {
-                    position.saturating_sub(offset.unsigned_abs())
-                }
-            }
-            SeekFrom::End(offset) => {
-                self.ensure_sizes(ReaderState::all_sizes_known)?;
-                let size = {
-                    let inner = self.shared.lock();
-                    inner.total_len().unwrap_or(0)
-                };
-                if offset >= 0 {
-                    size.saturating_add(offset as u64)
-                } else {
-                    size.saturating_sub(offset.unsigned_abs())
-                }
-            }
-        };
+        // Resolve the target to a fragment, learning sizes as needed.
+        if let SeekFrom::End(_) = from {
+            self.ensure_sizes(Schedule::all_sizes_known)?;
+        }
+        let total = self.shared.lock().total_len();
+        let target = schedule::seek_target(from, self.cursor.byte_position, total)?;
+        self.ensure_sizes(|schedule| schedule.resolve_cursor(target).is_some())?;
+        let (part, offset_in_fragment) =
+            self.shared.lock().resolve_cursor(target).ok_or_else(|| {
+                io::Error::other("MPEG stream ended before the requested byte offset")
+            })?;
 
-        self.ensure_sizes(|inner| inner.resolve_cursor(target).is_some())?;
-
-        let (fragment_index, offset_in_fragment) = {
-            let inner = self.shared.lock();
-            match inner.resolve_cursor(target) {
-                Some(cursor) => cursor,
-                None => {
-                    return Err(io::Error::other(
-                        "MPEG stream ended before the requested byte offset",
-                    ));
-                }
-            }
-        };
-
-        self.fragment_index = fragment_index;
-        self.offset_in_fragment = offset_in_fragment;
+        self.cursor.place(part, offset_in_fragment, Some(target));
         self.publish_cursor();
-        self.prioritize_fragment(fragment_index);
-        self.byte_position = Some(target);
+        self.prioritize_fragment(part);
         Ok(Position {
             byte: Some(target),
-            time: self.time_at_fragment(
-                fragment_index,
-                if offset_in_fragment == 0 {
-                    TimeAccuracy::Exact
-                } else {
-                    TimeAccuracy::Coarse
-                },
+            time: schedule::time_at_fragment(
+                self.timeline.as_ref(),
+                part,
+                schedule::accuracy_at(offset_in_fragment),
             ),
         })
     }
@@ -1036,79 +550,45 @@ impl StreamReader {
     /// prioritized and loaded before this method returns.
     ///
     /// This is segment-granular: playback may begin earlier than `time` by up
-    /// to one media-fragment duration. The returned [`TimePosition`] contains
+    /// to one media-fragment duration. The returned [`TimePosition`](crate::TimePosition) contains
     /// the actual fragment-start timestamp and marks it [`TimeAccuracy::Exact`]
     /// only when the requested time is exactly that boundary. The byte field is
     /// `None` until every earlier fragment size is known.
     pub fn seek_time_coarse(&mut self, time: Duration) -> io::Result<Position> {
-        let timeline = self.timeline.clone().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "MPEG stream has no SegmentTimeline",
-            )
-        })?;
-        if timeline.timescale == 0 || timeline.media_durations.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "MPEG stream timeline is missing a timescale or media durations",
-            ));
-        }
-
-        let total_ticks: u64 = timeline.media_durations.iter().sum();
-        let target_ticks =
-            ((time.as_secs_f64() * f64::from(timeline.timescale)).round() as u64).min(total_ticks);
-
-        let mut tick = 0u64;
-        let mut media_index = timeline.media_durations.len() - 1;
-
-        for (index, duration) in timeline.media_durations.iter().enumerate() {
-            let next = tick.saturating_add(*duration);
-            if target_ticks < next
-                || (target_ticks == total_ticks && index + 1 == timeline.media_durations.len())
-            {
-                media_index = index;
-                break;
-            }
-            tick = next;
-        }
-
-        let target_fragment = media_index + 1;
-        {
-            let mut inner = self.shared.lock();
-            if target_fragment >= inner.fragments.len() {
+        let (media_index, exact) = schedule::time_target(self.timeline.as_ref(), time)?;
+        let target = Part::Media(media_index);
+        let change = {
+            let mut schedule = self.shared.lock();
+            if schedule.past_end(target) {
                 return Err(io::Error::other(
                     "MPEG stream ended before the requested media time",
                 ));
             }
-            inner.cursor_fragment = target_fragment;
-            if inner.missing_body(target_fragment) {
-                inner.priority = Some(target_fragment);
-                self.shared.condvar.notify_all();
-            }
-        }
+            let change = schedule.move_cursor(target);
+            schedule.request(target);
+            change
+        };
+        self.shared.window_moved(change);
 
         let byte_position = {
-            let inner =
-                self.wait_until(|inner| !inner.missing_body(target_fragment) || inner.complete)?;
-            if inner.missing_body(target_fragment) {
+            let inner = self.wait_until(|inner| !inner.missing_body(target) || inner.complete)?;
+            if inner.missing_body(target) {
                 return Err(io::Error::other(
                     "MPEG stream ended before the requested media time",
                 ));
             }
-            inner.prefix_len(target_fragment)
+            inner.prefix_len(target)
         };
 
-        self.fragment_index = target_fragment;
-        self.offset_in_fragment = 0;
-        self.byte_position = byte_position;
+        self.cursor.place(target, 0, byte_position);
         Ok(Position {
             byte: byte_position,
-            time: self.time_at_fragment(
-                target_fragment,
-                if target_ticks == tick {
-                    TimeAccuracy::Exact
-                } else {
-                    TimeAccuracy::Coarse
+            time: schedule::time_at_fragment(
+                self.timeline.as_ref(),
+                target,
+                match exact {
+                    true => TimeAccuracy::Exact,
+                    false => TimeAccuracy::Coarse,
                 },
             ),
         })
@@ -1116,7 +596,7 @@ impl StreamReader {
 
     /// Fills unknown sizes until `known` holds, via on-demand HEAD or GET
     /// fallback. Also returns once every body is downloaded.
-    fn ensure_sizes(&self, known: impl Fn(&ReaderState) -> bool) -> io::Result<()> {
+    fn ensure_sizes(&self, known: impl Fn(&Schedule) -> bool) -> io::Result<()> {
         loop {
             let next_head = {
                 let inner = self.shared.lock();
@@ -1126,19 +606,21 @@ impl StreamReader {
                 inner.next_head()
             };
             // A failed HEAD disables probing, so `next_head` ends the loop.
-            let Some((index, data)) = next_head else {
+            let Some((part, data)) = next_head else {
                 break;
             };
-            self.shared.probe(index, &data);
+            self.shared.probe(part, &data);
         }
 
+        // Without HEAD, download the first fragment whose size is unknown,
+        // even outside the window: its size is kept after its body is dropped.
         {
-            let mut inner = self.shared.lock();
-            if known(&inner) {
+            let mut schedule = self.shared.lock();
+            if known(&schedule) {
                 return Ok(());
             }
-            if let Some(index) = (0..inner.fragments.len()).find(|&i| inner.missing_body(i)) {
-                inner.priority = Some(index);
+            if let Some(part) = schedule.first_unknown_size() {
+                schedule.request(part);
                 self.shared.condvar.notify_all();
             }
         }
@@ -1147,9 +629,9 @@ impl StreamReader {
             .map(drop)
     }
 
-    fn wait_until<F>(&self, mut ready: F) -> io::Result<MutexGuard<'_, ReaderState>>
+    fn wait_until<F>(&self, mut ready: F) -> io::Result<MutexGuard<'_, Schedule>>
     where
-        F: FnMut(&ReaderState) -> bool,
+        F: FnMut(&Schedule) -> bool,
     {
         let mut inner = self.shared.lock();
         loop {
@@ -1173,104 +655,103 @@ impl StreamReader {
         }
     }
 
-    fn prioritize_fragment(&self, index: usize) {
-        let mut inner = self.shared.lock();
-        if inner.missing_body(index) {
-            inner.priority = Some(index);
+    fn prioritize_fragment(&self, part: Part) {
+        let mut schedule = self.shared.lock();
+        if schedule.missing_body(part) {
+            schedule.request(part);
             self.shared.condvar.notify_all();
         }
     }
 
+    /// Tells the workers where the cursor is now, which moves the window.
     fn publish_cursor(&self) {
-        let mut inner = self.shared.lock();
-        inner.cursor_fragment = self.fragment_index;
+        let change = self.shared.lock().move_cursor(self.cursor.part);
+        self.shared.window_moved(change);
     }
 
-    fn time_at_fragment(
-        &self,
-        fragment_index: usize,
-        accuracy: TimeAccuracy,
-    ) -> Option<TimePosition> {
-        self.timeline
-            .as_ref()?
-            .fragment_start(fragment_index)
-            .map(|timestamp| TimePosition {
-                timestamp,
-                accuracy,
-            })
-    }
-
-    fn time_at_eof(&self) -> Option<TimePosition> {
-        self.timeline
-            .as_ref()?
-            .total_duration()
-            .map(|timestamp| TimePosition {
-                timestamp,
-                accuracy: TimeAccuracy::Exact,
-            })
-    }
-
-    /// Report EOF for [`SeekFrom::End`]`(0)` without retargeting the GET worker.
-    fn park_at_reported_end(&mut self, len: u64) -> io::Result<Position> {
-        let fragment_count = {
-            let inner = self.shared.lock();
-            inner.fragments.len()
-        };
-        self.fragment_index = fragment_count;
-        self.offset_in_fragment = 0;
-        self.byte_position = Some(len);
-        Ok(Position {
+    /// Reports the end for [`SeekFrom::End`]`(0)` without retargeting the GET
+    /// worker.
+    fn park_at_end(&mut self, len: u64) -> Position {
+        let end = self.shared.lock().end();
+        self.cursor.place(end, 0, Some(len));
+        Position {
             byte: Some(len),
-            time: self.time_at_eof(),
-        })
+            time: schedule::time_at_end(self.timeline.as_ref()),
+        }
     }
 }
 
-impl ReaderShared {
-    fn lock(&self) -> MutexGuard<'_, ReaderState> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
+impl StreamShared {
+    fn lock(&self) -> MutexGuard<'_, Schedule> {
+        self.schedule
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
-    /// HEADs fragment `index` unless its size is known, or disables HEAD
-    /// probing if the request fails.
-    fn probe(&self, index: usize, data: &FragmentData) {
+    /// Applies a window move to the cache, dropping bodies no stream keeps,
+    /// and wakes the GET worker for what entered the window.
+    fn window_moved(&self, change: WindowChange) {
+        self.cache.store.acquire(&change.acquired);
+        self.cache.store.release(&change.released, true);
+        self.condvar.notify_all();
+    }
+
+    /// HEADs `data`, the fragment at `part`, unless its size is known, or
+    /// disables HEAD probing if the request fails.
+    fn probe(&self, part: Part, data: &FragmentData) {
         let result = self.cache.probe(data);
         let mut state = self.lock();
         if let Err(error) = result {
-            state.disable_head(&format!("HEAD failed for fragment {index}: {error}"));
+            state.disable_head(&format!("HEAD failed for {part}: {error}"));
         }
         self.condvar.notify_all();
     }
 }
 
-fn spawn_get_worker(shared: Arc<ReaderShared>) {
+/// Downloads the stream's fragments one at a time, in the order its schedule
+/// says, parking whenever the window holds everything it should, until the
+/// stream is dropped or a download fails.
+fn spawn_get_worker(shared: Arc<StreamShared>) {
     std::thread::spawn(move || {
-        while !shared.cancelled.load(Ordering::SeqCst) {
-            let (index, data) = {
-                let mut state = shared.lock();
-                if state.error.is_some() {
-                    return;
-                }
-                let Some(work) = state.next_get() else {
-                    state.complete = true;
+        loop {
+            // Wait for something to fetch.
+            let (part, data) = {
+                let mut schedule = shared.lock();
+                loop {
+                    if shared.cancelled.load(Ordering::SeqCst) || schedule.error.is_some() {
+                        return;
+                    }
+                    if let Some(work) = schedule.next_get() {
+                        break work;
+                    }
+                    schedule.complete = true;
                     shared.condvar.notify_all();
-                    return;
-                };
-                work
+                    schedule = shared
+                        .condvar
+                        .wait(schedule)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
             };
 
+            // Fetch it, and drop it again if it was only wanted for its size.
             let result = shared.cache.get(&data);
-            let mut state = shared.lock();
-            match result {
-                Ok(_) => state.check_probe(index),
-                Err(error) => state.error = Some(error.to_string()),
+            let kept = {
+                let mut schedule = shared.lock();
+                match result {
+                    Ok(_) => schedule.check_probe(part),
+                    Err(error) => schedule.error = Some(error.to_string()),
+                }
+                schedule.keeps(part)
+            };
+            if !kept {
+                shared.cache.store.forget_if_unheld(&data);
             }
             shared.condvar.notify_all();
         }
     });
 }
 
-fn spawn_head_worker(shared: Arc<ReaderShared>) {
+fn spawn_head_worker(shared: Arc<StreamShared>) {
     std::thread::spawn(move || {
         loop {
             if shared.cancelled.load(Ordering::SeqCst) {
@@ -1279,7 +760,7 @@ fn spawn_head_worker(shared: Arc<ReaderShared>) {
 
             // Exit and spawn decisions share the lock so start/stop cannot
             // leave zero or two workers.
-            let Some((index, data)) = ({
+            let Some((part, data)) = ({
                 let mut inner = shared.lock();
                 let next = if inner.eager_head && inner.error.is_none() {
                     inner.next_head()
@@ -1295,69 +776,84 @@ fn spawn_head_worker(shared: Arc<ReaderShared>) {
             };
 
             // After a failure, `next_head` is `None` and the worker exits.
-            shared.probe(index, &data);
+            shared.probe(part, &data);
         }
     });
 }
 
-impl Read for StreamReader {
+impl Read for FragmentStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
 
         loop {
-            let fragment_count = {
-                let inner = self.shared.lock();
-                inner.fragments.len()
-            };
-            if self.fragment_index >= fragment_count {
-                let _inner = self.wait_until(|inner| inner.complete)?;
+            let part = self.cursor.part;
+            if self.shared.lock().past_end(part) {
+                let _schedule = self.wait_until(|schedule| schedule.complete)?;
                 return Ok(0);
             }
 
-            self.prioritize_fragment(self.fragment_index);
-
-            let index = self.fragment_index;
-            let offset = self.offset_in_fragment;
-            let (copied, fragment_len) = {
-                let inner =
-                    self.wait_until(|inner| !inner.missing_body(index) || inner.complete)?;
-                let Some(fragment) = inner.fragments[index].body() else {
-                    return Ok(0);
-                };
-                let fragment_len = fragment.len();
-                if offset >= fragment_len {
-                    (0, fragment_len)
-                } else {
-                    let copied = (fragment_len - offset).min(buf.len());
-                    buf[..copied].copy_from_slice(&fragment[offset..offset + copied]);
-                    (copied, fragment_len)
-                }
+            // Wait for the fragment under the cursor.
+            self.prioritize_fragment(part);
+            let body = self
+                .wait_until(|schedule| !schedule.missing_body(part) || schedule.complete)?
+                .checked_body(part);
+            let Some(body) = body else {
+                return Ok(0);
             };
 
-            if offset >= fragment_len {
-                self.fragment_index += 1;
-                self.offset_in_fragment = 0;
-                self.publish_cursor();
-                continue;
-            }
-
-            self.offset_in_fragment += copied;
-            if self.offset_in_fragment >= fragment_len {
-                self.fragment_index += 1;
-                self.offset_in_fragment = 0;
+            // Copy from it, moving on to the next fragment once it is used up.
+            let copied = self.cursor.read(&body, buf);
+            if self.cursor.part != part {
                 self.publish_cursor();
             }
-            if let Some(position) = self.byte_position {
-                self.byte_position = Some(position + copied as u64);
+            if copied > 0 {
+                return Ok(copied);
             }
-            return Ok(copied);
         }
     }
 }
 
-impl Seek for StreamReader {
+impl Iterator for FragmentStream {
+    type Item = Result<Bytes, Error>;
+
+    /// The rest of the current fragment: a whole fragment, unless reading or a
+    /// byte seek left the position inside one. Blocks while it downloads.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        loop {
+            let part = self.cursor.part;
+            if self.shared.lock().past_end(part) {
+                return None;
+            }
+
+            // Wait for the fragment under the cursor.
+            self.prioritize_fragment(part);
+            let waited = self
+                .wait_until(|schedule| !schedule.missing_body(part) || schedule.complete)
+                .map(|mut schedule| schedule.checked_body(part));
+            let body = match waited {
+                Ok(body) => body?,
+                Err(error) => {
+                    self.failed = true;
+                    return Some(Err(error.into()));
+                }
+            };
+
+            // Hand over what is left of it and move on to the next.
+            let rest = self.cursor.take_rest(body);
+            self.publish_cursor();
+            if let Some(rest) = rest {
+                return Some(Ok(rest));
+            }
+        }
+    }
+}
+
+impl Seek for FragmentStream {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
         self.seek_bytes(from)?
             .byte
@@ -1365,10 +861,14 @@ impl Seek for StreamReader {
     }
 }
 
-impl Drop for StreamReader {
+impl Drop for FragmentStream {
     fn drop(&mut self) {
         self.shared.cancelled.store(true, Ordering::SeqCst);
         self.shared.condvar.notify_all();
+        // Let go of what this stream kept without dropping it, so a stream
+        // rebuilt on the same cache, as after a seek, still finds it.
+        let kept = self.shared.lock().kept();
+        self.shared.cache.store.release(&kept, false);
     }
 }
 
@@ -1376,6 +876,8 @@ impl Drop for StreamReader {
 mod tests {
     use super::*;
     use crate::BufferStatus;
+    use crate::fragment::parse_byte_range;
+    use crate::schedule::TimePosition;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
     use std::time::Duration;
@@ -1391,8 +893,8 @@ mod tests {
         G: Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync,
         H: Fn(&Fragment) -> Result<u64, Error> + Send + Sync,
     {
-        fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
-            (self.get)(fragment, size_hint).map(Arc::from)
+        fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error> {
+            (self.get)(fragment, size_hint).map(Bytes::from)
         }
 
         fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
@@ -1400,20 +902,39 @@ mod tests {
         }
     }
 
-    /// A reader fetching through GET and HEAD closures.
+    /// A stream fetching through GET and HEAD closures, probing sizes in the
+    /// background from the start when `eager_head` is set.
     fn closure_reader<G, H>(
-        fragments: Vec<Fragment>,
+        fragments: Fragments,
         timeline: Option<MediaTimeline>,
         eager_head: bool,
         get: G,
         head: H,
-    ) -> Result<StreamReader, Error>
+    ) -> Result<FragmentStream, Error>
     where
         G: Fn(&Fragment, Option<u64>) -> Result<Vec<u8>, Error> + Send + Sync + 'static,
         H: Fn(&Fragment) -> Result<u64, Error> + Send + Sync + 'static,
     {
         let transport = Arc::new(FnTransport { get, head });
-        StreamReader::new_with_transport(fragments, timeline, eager_head, transport)
+        let stream = FragmentStream::new_with_transport(fragments, timeline, transport)?;
+        if eager_head {
+            stream.start_eager_head();
+        }
+        Ok(stream)
+    }
+
+    /// [`FragmentStream::new_with_cache`], probing sizes in the background
+    /// from the start when `eager_head` is set.
+    fn cached_stream(
+        fragments: Fragments,
+        eager_head: bool,
+        cache: Arc<FragmentCache>,
+    ) -> Result<FragmentStream, Error> {
+        let stream = FragmentStream::new_with_cache(fragments, None, cache)?;
+        if eager_head {
+            stream.start_eager_head();
+        }
+        Ok(stream)
     }
 
     fn position(byte: Option<u64>, time: Option<(Duration, TimeAccuracy)>) -> Position {
@@ -1435,7 +956,7 @@ mod tests {
                 .iter()
                 .find(|(name, _)| *name == url)
                 .map(|(_, bytes)| bytes.to_vec())
-                .ok_or_else(|| Error::StreamInitializationError(format!("unknown url {url}")))
+                .ok_or_else(|| Error::Initialization(format!("unknown url {url}")))
         }
     }
 
@@ -1448,20 +969,20 @@ mod tests {
                 .iter()
                 .find(|(name, _)| *name == url)
                 .map(|(_, bytes)| bytes.len() as u64)
-                .ok_or_else(|| Error::StreamInitializationError(format!("unknown url {url}")))
+                .ok_or_else(|| Error::Initialization(format!("unknown url {url}")))
         }
     }
 
     fn failing_head() -> impl Fn(&Fragment) -> Result<u64, Error> + Send + Sync {
-        move |_fragment: &Fragment| Err(Error::StreamInitializationError("HEAD unavailable".into()))
+        move |_fragment: &Fragment| Err(Error::Initialization("HEAD unavailable".into()))
     }
 
     fn start_instant(
-        urls: Vec<Fragment>,
+        fragments: Fragments,
         payloads: &'static [(&'static str, &'static [u8])],
-    ) -> Result<StreamReader, Error> {
+    ) -> Result<FragmentStream, Error> {
         closure_reader(
-            urls,
+            fragments,
             None,
             true,
             instant_get(payloads),
@@ -1487,7 +1008,7 @@ mod tests {
     #[test]
     fn reads_init_then_media_fragments() {
         let mut reader = start_instant(
-            vec!["init".into(), "a".into(), "b".into()],
+            Fragments::new("init", ["a", "b"]),
             &[("init", b"INIT"), ("a", b"AAAA"), ("b", b"BB")],
         )
         .unwrap();
@@ -1501,7 +1022,7 @@ mod tests {
     fn blocks_until_later_fragments_arrive() {
         let allow_rest = Arc::new(AtomicBool::new(false));
         let mut reader = closure_reader(
-            vec!["init".into(), "more".into()],
+            Fragments::new("init", ["more"]),
             None,
             true,
             gated_get(allow_rest.clone(), |url| url.as_bytes().to_vec()),
@@ -1529,7 +1050,7 @@ mod tests {
     #[test]
     fn seek_bytes_within_downloaded_data() {
         let mut reader = start_instant(
-            vec!["init".into(), "body".into()],
+            Fragments::new("init", ["body"]),
             &[("init", b"0123"), ("body", b"4567")],
         )
         .unwrap();
@@ -1557,7 +1078,7 @@ mod tests {
     fn seek_bytes_from_end_falls_back_without_head() {
         let allow_rest = Arc::new(AtomicBool::new(false));
         let mut reader = closure_reader(
-            vec!["init".into(), "tail".into()],
+            Fragments::new("init", ["tail"]),
             None,
             true,
             gated_get(allow_rest.clone(), |url| vec![url.as_bytes()[0]; 4]),
@@ -1585,7 +1106,7 @@ mod tests {
         let get_order = Arc::new(Mutex::new(Vec::new()));
         let head_calls = Arc::new(Mutex::new(Vec::new()));
         let mut reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into()],
+            Fragments::new("init", ["a", "b"]),
             None,
             true,
             {
@@ -1637,7 +1158,7 @@ mod tests {
     fn seek_bytes_disables_head_on_length_mismatch() {
         let allow_get = Arc::new(AtomicBool::new(false));
         let mut reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into()],
+            Fragments::new("init", ["a", "b"]),
             None,
             true,
             {
@@ -1653,9 +1174,7 @@ mod tests {
                         "init" => Ok(b"INIT".to_vec()),
                         "a" => Ok(b"AAAA".to_vec()),
                         "b" => Ok(b"BBBB".to_vec()),
-                        other => Err(Error::StreamInitializationError(format!(
-                            "unknown url {other}"
-                        ))),
+                        other => Err(Error::Initialization(format!("unknown url {other}"))),
                     }
                 }
             },
@@ -1666,9 +1185,7 @@ mod tests {
                     "init" => Ok(4),
                     "a" => Ok(99),
                     "b" => Ok(4),
-                    other => Err(Error::StreamInitializationError(format!(
-                        "unknown url {other}"
-                    ))),
+                    other => Err(Error::Initialization(format!("unknown url {other}"))),
                 }
             },
         )
@@ -1687,12 +1204,55 @@ mod tests {
     }
 
     #[test]
+    fn reading_a_body_another_stream_fetched_disables_head_on_length_mismatch() {
+        let allow_get = Arc::new(AtomicBool::new(false));
+        let a_gets = Arc::new(AtomicUsize::new(0));
+        let get = {
+            let gated = gated_get(allow_get.clone(), |url| url.to_uppercase().into_bytes());
+            let a_gets = a_gets.clone();
+            move |fragment: &Fragment, size_hint: Option<u64>| {
+                if fragment.url == "a" {
+                    a_gets.fetch_add(1, Ordering::SeqCst);
+                }
+                gated(fragment, size_hint)
+            }
+        };
+        // Lie about "a" so its GET will disagree with its HEAD.
+        let head = |fragment: &Fragment| match fragment.url.as_str() {
+            "a" => Ok(99),
+            url => Ok(url.len() as u64),
+        };
+        let cache = Arc::new(FragmentCache::new(Arc::new(FnTransport { get, head })));
+        let fragments = || Fragments::new("init", ["a"]);
+
+        // The first stream probes "a", then fetches it.
+        let mut first = cached_stream(fragments(), true, cache.clone()).unwrap();
+        wait_for(|| cache.known_size(&"a".into()) == Some(99));
+        allow_get.store(true, Ordering::SeqCst);
+        let mut bytes = Vec::new();
+        first.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"INITA");
+
+        // The second stream finds "a" already held, so its worker never
+        // fetches it and only its reader sees the body.
+        let mut second = cached_stream(fragments(), false, cache.clone()).unwrap();
+        bytes.clear();
+        second.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"INITA");
+        assert_eq!(a_gets.load(Ordering::SeqCst), 1);
+        assert!(
+            !second.shared.lock().head_available,
+            "HEAD should be disabled once the reader sees a GET/HEAD length mismatch"
+        );
+    }
+
+    #[test]
     fn seek_bytes_current_requires_known_position() {
         let allow_a = Arc::new(AtomicBool::new(false));
         let allow_b = Arc::new(AtomicBool::new(false));
         let allow_c = Arc::new(AtomicBool::new(false));
         let mut reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into(), "c".into()],
+            Fragments::new("init", ["a", "b", "c"]),
             Some(MediaTimeline {
                 timescale: 1,
                 media_durations: vec![1, 1, 1],
@@ -1722,9 +1282,7 @@ mod tests {
                         }
                         Ok(b"CCCC".to_vec())
                     }
-                    other => Err(Error::StreamInitializationError(format!(
-                        "unknown url {other}"
-                    ))),
+                    other => Err(Error::Initialization(format!("unknown url {other}"))),
                 }
             },
             failing_head(),
@@ -1764,7 +1322,7 @@ mod tests {
             media_durations: vec![100, 100],
         };
         let mut reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into()],
+            Fragments::new("init", ["a", "b"]),
             Some(timeline),
             true,
             instant_get(&[("init", b"INIT"), ("a", b"AAAA"), ("b", b"BBBB")]),
@@ -1807,7 +1365,7 @@ mod tests {
         let a_started = Arc::new(AtomicBool::new(false));
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into(), "c".into()],
+            Fragments::new("init", ["a", "b", "c"]),
             Some(MediaTimeline {
                 timescale: 1,
                 media_durations: vec![1, 1, 1],
@@ -1843,9 +1401,7 @@ mod tests {
                         order.lock().unwrap().push("c");
                         Ok(b"CCCC".to_vec())
                     }
-                    other => Err(Error::StreamInitializationError(format!(
-                        "unknown url {other}"
-                    ))),
+                    other => Err(Error::Initialization(format!("unknown url {other}"))),
                 }
             },
             failing_head(),
@@ -1890,13 +1446,7 @@ mod tests {
         let release_media = Arc::new(AtomicBool::new(false));
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut reader = closure_reader(
-            vec![
-                "init".into(),
-                "a".into(),
-                "b".into(),
-                "c".into(),
-                "d".into(),
-            ],
+            Fragments::new("init", ["a", "b", "c", "d"]),
             Some(MediaTimeline {
                 timescale: 1,
                 media_durations: vec![1, 1, 1, 1],
@@ -1924,7 +1474,7 @@ mod tests {
         let release_media_when_seeked = release_media.clone();
         thread::spawn(move || {
             loop {
-                if cache.lock().cursor_fragment >= 3 {
+                if cache.lock().cursor >= Part::Media(2) {
                     release_media_when_seeked.store(true, Ordering::SeqCst);
                     return;
                 }
@@ -1951,7 +1501,7 @@ mod tests {
             media_durations: vec![1, 1],
         };
         let mut reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into()],
+            Fragments::new("init", ["a", "b"]),
             Some(timeline),
             true,
             instant_get(&[("init", b"INIT"), ("a", b"AAAA"), ("b", b"BBBB")]),
@@ -1970,7 +1520,7 @@ mod tests {
     fn seek_bytes_backfills_leading_fragments_without_head() {
         let allow_rest = Arc::new(AtomicBool::new(false));
         let mut reader = closure_reader(
-            vec!["init".into(), "aaaa".into(), "bbbb".into()],
+            Fragments::new("init", ["aaaa", "bbbb"]),
             None,
             true,
             gated_get(allow_rest.clone(), |url| vec![url.as_bytes()[0]; 4]),
@@ -1994,14 +1544,22 @@ mod tests {
 
     #[test]
     fn seek_time_coarse_requires_timeline() {
-        let mut reader = start_instant(vec!["init".into()], &[("init", b"xyz")]).unwrap();
+        let mut reader = start_instant(
+            Fragments::new("init", Vec::<Fragment>::new()),
+            &[("init", b"xyz")],
+        )
+        .unwrap();
         let error = reader.seek_time_coarse(Duration::ZERO).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn eof_after_complete_download() {
-        let mut reader = start_instant(vec!["init".into()], &[("init", b"xyz")]).unwrap();
+        let mut reader = start_instant(
+            Fragments::new("init", Vec::<Fragment>::new()),
+            &[("init", b"xyz")],
+        )
+        .unwrap();
 
         let mut buf = [0u8; 8];
         assert_eq!(reader.read(&mut buf).unwrap(), 3);
@@ -2019,15 +1577,13 @@ mod tests {
                 if n == 0 {
                     Ok(b"INIT".to_vec())
                 } else {
-                    Err(Error::StreamInitializationError(format!(
-                        "failed to fetch {url}"
-                    )))
+                    Err(Error::Initialization(format!("failed to fetch {url}")))
                 }
             }
         };
 
         let mut reader = closure_reader(
-            vec!["init".into(), "bad".into()],
+            Fragments::new("init", ["bad"]),
             None,
             true,
             get,
@@ -2049,10 +1605,91 @@ mod tests {
         assert!(error.to_string().contains("failed to fetch bad"));
     }
 
+    const PAYLOADS: &[(&str, &[u8])] = &[("init", b"INIT"), ("a", b"aaaa"), ("b", b"bb")];
+
+    fn abc() -> Fragments {
+        Fragments::new("init", ["a", "b"])
+    }
+
+    fn texts(items: impl Iterator<Item = Result<Bytes, Error>>) -> Vec<String> {
+        items
+            .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+            .collect()
+    }
+
     #[test]
-    fn empty_url_list_is_rejected() {
-        let result = closure_reader(Vec::new(), None, true, instant_get(&[]), failing_head());
-        assert!(matches!(result, Err(Error::DashManifestMissingUrls)));
+    fn iterates_whole_fragments() {
+        let stream = start_instant(abc(), PAYLOADS).unwrap();
+        assert_eq!(texts(stream), ["INIT", "aaaa", "bb"]);
+    }
+
+    #[test]
+    fn iterating_and_reading_share_one_position() {
+        let mut stream = start_instant(abc(), PAYLOADS).unwrap();
+        let mut head = [0; 6];
+        stream.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"INITaa");
+
+        // The rest of the fragment the read stopped in, then reading resumes after it.
+        assert_eq!(stream.next().unwrap().unwrap(), &b"aa"[..]);
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"bb");
+
+        // A byte seek moves iteration too.
+        assert_eq!(stream.seek_bytes(SeekFrom::Start(0)).unwrap().byte, Some(0));
+        assert_eq!(texts(stream), ["INIT", "aaaa", "bb"]);
+    }
+
+    #[test]
+    fn iterates_from_a_coarse_seek() {
+        let timeline = MediaTimeline {
+            timescale: 1,
+            media_durations: vec![1, 1],
+        };
+        let mut stream = closure_reader(
+            abc(),
+            Some(timeline),
+            false,
+            instant_get(PAYLOADS),
+            failing_head(),
+        )
+        .unwrap();
+        stream
+            .seek_time_coarse(Duration::from_millis(1_500))
+            .unwrap();
+        assert_eq!(texts(stream), ["bb"]);
+    }
+
+    #[test]
+    fn iteration_ends_after_a_download_failure() {
+        let release = Arc::new(AtomicBool::new(false));
+        let get = {
+            let release = release.clone();
+            move |fragment: &Fragment, _expected_len: Option<u64>| match fragment.url.as_str() {
+                "init" => Ok(b"INIT".to_vec()),
+                url => {
+                    while !release.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(Error::Initialization(format!("failed to fetch {url}")))
+                }
+            }
+        };
+        let mut stream = closure_reader(
+            Fragments::new("init", ["bad", "never"]),
+            None,
+            false,
+            get,
+            failing_head(),
+        )
+        .unwrap();
+
+        assert_eq!(stream.next().unwrap().unwrap(), &b"INIT"[..]);
+        release.store(true, Ordering::SeqCst);
+        let error = stream.next().unwrap().unwrap_err();
+        assert!(error.to_string().contains("failed to fetch bad"));
+        assert!(stream.next().is_none());
     }
 
     #[test]
@@ -2061,14 +1698,7 @@ mod tests {
         let head_calls = Arc::new(Mutex::new(Vec::new()));
         let get_expected = Arc::new(Mutex::new(Vec::new()));
         let reader = closure_reader(
-            vec![
-                "init".into(),
-                "a".into(),
-                "b".into(),
-                "c".into(),
-                "d".into(),
-                "e".into(),
-            ],
+            Fragments::new("init", ["a", "b", "c", "d", "e"]),
             None,
             true,
             {
@@ -2100,12 +1730,10 @@ mod tests {
         .unwrap();
 
         let inner = reader
-            .wait_until(|inner| {
-                inner.fragments[4].size().is_some() && inner.fragments[5].size().is_some()
-            })
+            .wait_until(|inner| inner.media[3].size().is_some() && inner.media[4].size().is_some())
             .unwrap();
         assert!(
-            inner.missing_body(4) && inner.missing_body(5),
+            inner.missing_body(Part::Media(3)) && inner.missing_body(Part::Media(4)),
             "HEAD worker should learn sizes before those bodies are fetched"
         );
         drop(inner);
@@ -2130,7 +1758,7 @@ mod tests {
         let allow_get = Arc::new(AtomicBool::new(false));
         let head_calls = Arc::new(Mutex::new(Vec::new()));
         let reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into(), "c".into()],
+            Fragments::new("init", ["a", "b", "c"]),
             None,
             true,
             {
@@ -2158,7 +1786,7 @@ mod tests {
 
         let inner = reader.wait_until(|inner| inner.all_sizes_known()).unwrap();
         assert!(
-            (1..=3).all(|index| inner.missing_body(index)),
+            (0..3).all(|index| inner.missing_body(Part::Media(index))),
             "HEAD worker should fill sizes without waiting for a body buffer"
         );
         drop(inner);
@@ -2174,7 +1802,7 @@ mod tests {
     fn get_worker_proceeds_while_head_is_blocked() {
         let allow_heads = Arc::new(AtomicBool::new(false));
         let reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into(), "c".into()],
+            Fragments::new("init", ["a", "b", "c"]),
             None,
             true,
             instant_get(&[
@@ -2204,13 +1832,7 @@ mod tests {
         let allow_get = Arc::new(AtomicBool::new(false));
         let head_calls = Arc::new(AtomicUsize::new(0));
         let reader = closure_reader(
-            vec![
-                "init".into(),
-                "a".into(),
-                "b".into(),
-                "c".into(),
-                "d".into(),
-            ],
+            Fragments::new("init", ["a", "b", "c", "d"]),
             None,
             true,
             {
@@ -2229,7 +1851,7 @@ mod tests {
                 let head_calls = head_calls.clone();
                 move |_fragment: &Fragment| {
                     head_calls.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::StreamInitializationError("HEAD unavailable".into()))
+                    Err(Error::Initialization("HEAD unavailable".into()))
                 }
             },
         )
@@ -2259,7 +1881,7 @@ mod tests {
     fn stopped_eager_head_spawns_no_worker() {
         let head_calls = Arc::new(Mutex::new(Vec::new()));
         let reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into()],
+            Fragments::new("init", ["a", "b"]),
             None,
             false,
             instant_get(&[("init", b"INIT"), ("a", b"AAAA"), ("b", b"BBBB")]),
@@ -2278,7 +1900,7 @@ mod tests {
         let allow_get = Arc::new(AtomicBool::new(false));
         let head_calls = Arc::new(Mutex::new(Vec::new()));
         let reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into(), "c".into()],
+            Fragments::new("init", ["a", "b", "c"]),
             None,
             false,
             {
@@ -2302,11 +1924,7 @@ mod tests {
 
         reader.start_eager_head();
         let inner = reader.wait_until(|inner| inner.all_sizes_known()).unwrap();
-        assert!(
-            inner.fragments[1..]
-                .iter()
-                .all(|data| data.body().is_none())
-        );
+        assert!(inner.media.iter().all(|data| data.body().is_none()));
         drop(inner);
         let _inner = reader
             .wait_until(|inner| !inner.head_worker_running)
@@ -2322,13 +1940,7 @@ mod tests {
         let head_entered = Arc::new(AtomicUsize::new(0));
         let release_head = Arc::new(AtomicBool::new(false));
         let reader = closure_reader(
-            vec![
-                "init".into(),
-                "a".into(),
-                "b".into(),
-                "c".into(),
-                "d".into(),
-            ],
+            Fragments::new("init", ["a", "b", "c", "d"]),
             None,
             true,
             {
@@ -2368,15 +1980,11 @@ mod tests {
             .unwrap();
         assert_eq!(head_entered.load(Ordering::SeqCst), 1);
         assert_eq!(
-            inner.fragments[1].size(),
+            inner.media[0].size(),
             Some(4),
             "in-flight HEAD should be kept"
         );
-        assert!(
-            inner.fragments[2..]
-                .iter()
-                .all(|data| data.size().is_none())
-        );
+        assert!(inner.media[1..].iter().all(|data| data.size().is_none()));
         drop(inner);
 
         allow_get.store(true, Ordering::SeqCst);
@@ -2389,7 +1997,7 @@ mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into(), "c".into()],
+            Fragments::new("init", ["a", "b", "c"]),
             None,
             true,
             {
@@ -2440,7 +2048,7 @@ mod tests {
     fn start_eager_head_is_noop_when_head_disabled() {
         let head_calls = Arc::new(Mutex::new(Vec::new()));
         let reader = closure_reader(
-            vec!["init".into(), "a".into()],
+            Fragments::new("init", ["a"]),
             None,
             false,
             gated_get(Arc::new(AtomicBool::new(false)), |url| {
@@ -2460,7 +2068,7 @@ mod tests {
     fn stopped_eager_head_still_heads_on_demand_for_seeks() {
         let head_calls = Arc::new(Mutex::new(Vec::new()));
         let mut reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into()],
+            Fragments::new("init", ["a", "b"]),
             None,
             false,
             gated_get(Arc::new(AtomicBool::new(false)), |url| {
@@ -2484,24 +2092,10 @@ mod tests {
     }
 
     #[test]
-    fn estimate_len_errs_larger_than_advertised_media() {
-        let timeline = two_second_timeline();
-        let init_len = 4;
-        let bitrate = 128_000;
-        let raw_media = u64::from(bitrate) * 2 / 8;
-        let estimate = timeline.estimate_len(init_len, bitrate).unwrap();
-        assert!(
-            estimate >= init_len + raw_media * 4 + 2 * 64 * 1024,
-            "estimate {estimate} should pad raw media {raw_media}"
-        );
-        assert!(timeline.estimate_len(init_len, 0).is_none());
-    }
-
-    #[test]
     fn symphonia_compat_end_zero_does_not_wait_for_bodies() {
         let allow_rest = Arc::new(AtomicBool::new(false));
         let mut reader = closure_reader(
-            vec!["init".into(), "a".into(), "b".into()],
+            Fragments::new("init", ["a", "b"]),
             Some(two_second_timeline()),
             true,
             gated_get(allow_rest.clone(), |url| vec![url.as_bytes()[0]; 4]),
@@ -2535,7 +2129,7 @@ mod tests {
     #[test]
     fn symphonia_compat_end_zero_uses_exact_len_once_known() {
         let mut reader = closure_reader(
-            vec!["init".into(), "a".into()],
+            Fragments::new("init", ["a"]),
             Some(two_second_timeline()),
             true,
             instant_get(&[("init", b"INIT"), ("a", b"AAAA")]),
@@ -2556,34 +2150,13 @@ mod tests {
     #[test]
     fn symphonia_compat_requires_timeline() {
         let mut reader = start_instant(
-            vec!["init".into(), "a".into()],
+            Fragments::new("init", ["a"]),
             &[("init", b"INIT"), ("a", b"AAAA")],
         )
         .unwrap();
         let error = reader.set_symphonia_compat(true, 128_000).unwrap_err();
         assert!(
-            matches!(error, Error::StreamInitializationError(message) if message.contains("SegmentTimeline"))
-        );
-    }
-
-    #[test]
-    fn byte_range_parses_dash_form() {
-        let range = parse_byte_range(" 100-199 ").unwrap();
-        assert_eq!(range, 100..=199);
-        assert_eq!(
-            Fragment::with_range("a", range.clone()).known_size(),
-            Some(100)
-        );
-        assert_eq!(Fragment::with_range("a", 5..=5).known_size(), Some(1));
-        for invalid in ["", "5", "5-", "-5", "9-3", "a-b"] {
-            assert!(
-                matches!(parse_byte_range(invalid), Err(Error::InvalidByteRange(value)) if value == invalid),
-                "{invalid:?} should be rejected"
-            );
-        }
-        assert_eq!(
-            Fragment::with_range("media.mp4", range).to_string(),
-            "media.mp4 (bytes 100-199)"
+            matches!(error, Error::Initialization(message) if message.contains("SegmentTimeline"))
         );
     }
 
@@ -2607,12 +2180,14 @@ mod tests {
         let allow_media = Arc::new(AtomicBool::new(false));
         let head_calls = Arc::new(Mutex::new(Vec::new()));
         let mut reader = closure_reader(
-            vec![
+            Fragments::new(
                 ranged("file", 0, 3),
-                ranged("file", 4, 7),
-                ranged("file", 8, 13),
-                ranged("file", 14, 15),
-            ],
+                [
+                    ranged("file", 4, 7),
+                    ranged("file", 8, 13),
+                    ranged("file", 14, 15),
+                ],
+            ),
             None,
             true,
             {
@@ -2635,7 +2210,7 @@ mod tests {
         // Every size comes from a range, so byte seeks resolve before any media body arrives.
         assert_eq!(reader.seek_bytes(SeekFrom::End(0)).unwrap().byte, Some(16));
         assert_eq!(reader.seek_bytes(SeekFrom::Start(9)).unwrap().byte, Some(9));
-        assert!(reader.shared.lock().missing_body(2));
+        assert!(reader.shared.lock().missing_body(Part::Media(1)));
 
         allow_media.store(true, Ordering::SeqCst);
         let mut rest = Vec::new();
@@ -2651,7 +2226,7 @@ mod tests {
     #[test]
     fn ranged_fragment_with_wrong_length_fails() {
         let result = closure_reader(
-            vec![ranged("file", 0, 7)],
+            Fragments::new(ranged("file", 0, 7), Vec::<Fragment>::new()),
             None,
             false,
             |_fragment: &Fragment, _expected_len: Option<u64>| Ok(b"INIT".to_vec()),
@@ -2664,7 +2239,7 @@ mod tests {
         ));
 
         let mut reader = closure_reader(
-            vec![ranged("file", 0, 3), ranged("file", 4, 7)],
+            Fragments::new(ranged("file", 0, 3), [ranged("file", 4, 7)]),
             None,
             false,
             |fragment: &Fragment, _expected_len: Option<u64>| match *fragment
@@ -2729,14 +2304,15 @@ mod tests {
     #[test]
     fn default_transport_sends_range_and_slices_ignored_ranges() {
         let base = spawn_range_server(3);
-        let mut reader = StreamReader::new(
-            vec![
+        let mut reader = FragmentStream::new(
+            Fragments::new(
                 ranged(&format!("{base}/ranged"), 0, 3),
-                ranged(&format!("{base}/plain"), 8, 13),
-                ranged(&format!("{base}/ranged"), 14, 15),
-            ],
+                [
+                    ranged(&format!("{base}/plain"), 8, 13),
+                    ranged(&format!("{base}/ranged"), 14, 15),
+                ],
+            ),
             None,
-            false,
         )
         .unwrap();
         let mut bytes = Vec::new();
@@ -2778,14 +2354,14 @@ mod tests {
             Ok(fragment.url.len() as u64)
         }
 
-        fn get(&self, fragment: &Fragment, _size_hint: Option<u64>) -> Result<Arc<[u8]>, Error> {
+        fn get(&self, fragment: &Fragment, _size_hint: Option<u64>) -> Result<Bytes, Error> {
             self.gets.lock().unwrap().push(fragment.url.clone());
             if self.gated.contains(&fragment.url.as_str()) {
                 while !self.released.load(Ordering::SeqCst) {
                     thread::sleep(Duration::from_millis(5));
                 }
             }
-            Ok(fragment.url.as_bytes().into())
+            Ok(Bytes::copy_from_slice(fragment.url.as_bytes()))
         }
     }
 
@@ -2810,25 +2386,15 @@ mod tests {
     #[test]
     fn fragment_cache_reuses_bodies_across_readers() {
         let (cache, transport) = counting_cache(&[]);
-        let mut first = StreamReader::new_with_cache(
-            vec!["init".into(), "a".into(), "b".into()],
-            None,
-            false,
-            cache.clone(),
-        )
-        .unwrap();
+        let mut first =
+            FragmentStream::new_with_cache(Fragments::new("init", ["a", "b"]), None, cache.clone())
+                .unwrap();
         let mut bytes = Vec::new();
         first.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"initab");
 
         // A rebuilt reader, as after a seek, gets everything from memory.
-        let mut second = StreamReader::new_with_cache(
-            vec!["init".into(), "b".into()],
-            None,
-            true,
-            cache.clone(),
-        )
-        .unwrap();
+        let mut second = cached_stream(Fragments::new("init", ["b"]), true, cache.clone()).unwrap();
         bytes.clear();
         second.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"initb");
@@ -2840,13 +2406,12 @@ mod tests {
     #[test]
     fn buffer_reports_cache_changes() {
         let (cache, transport) = counting_cache(&["bb"]);
-        let reader = StreamReader::new_with_cache(
-            vec!["init".into(), "aa".into(), "bb".into()],
+        let reader = FragmentStream::new_with_cache(
+            Fragments::new("init", ["aa", "bb"]),
             Some(MediaTimeline {
                 timescale: 10,
                 media_durations: vec![10, 10],
             }),
-            false,
             cache,
         )
         .unwrap();
@@ -2877,38 +2442,109 @@ mod tests {
         assert_eq!(status.downloaded.bytes, 4);
     }
 
+    /// Fragments of 1.5, 2 and 1 seconds, whose bodies are their names.
+    fn uneven() -> (Fragments, MediaTimeline) {
+        let timeline = MediaTimeline {
+            timescale: 10,
+            media_durations: vec![15, 20, 10],
+        };
+        (Fragments::new("init", ["a", "b", "c"]), timeline)
+    }
+
+    #[test]
+    fn starting_at_reads_init_then_media_from_the_covering_fragment() {
+        let (cache, transport) = counting_cache(&[]);
+        let (fragments, timeline) = uneven();
+        let (mut stream, start) =
+            FragmentStream::starting_at(fragments, timeline, Duration::from_millis(2_750), cache)
+                .unwrap();
+        assert_eq!(start, Duration::from_millis(1_500));
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"initbc");
+        assert_eq!(transport.gets(), ["init", "b", "c"]);
+
+        // Times stay the representation's: buffered ranges, seeks and positions.
+        let status = stream.buffer().unwrap().status();
+        assert_eq!(
+            status.ranges,
+            [Duration::from_millis(1_500)..Duration::from_millis(4_500)]
+        );
+        assert_eq!(status.total.fragments, 2);
+        assert_eq!(
+            stream
+                .seek_time_coarse(Duration::from_millis(3_500))
+                .unwrap(),
+            position(
+                Some(5),
+                Some((Duration::from_millis(3_500), TimeAccuracy::Exact))
+            )
+        );
+        assert_eq!(stream.next().unwrap().unwrap(), &b"c"[..]);
+        let before_start = stream.seek_time_coarse(Duration::from_secs(1)).unwrap_err();
+        assert_eq!(before_start.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn starting_at_past_the_end_starts_at_the_last_fragment() {
+        let (cache, _transport) = counting_cache(&[]);
+        let (fragments, timeline) = uneven();
+        let (stream, start) =
+            FragmentStream::starting_at(fragments, timeline, Duration::from_secs(60), cache)
+                .unwrap();
+        assert_eq!(start, Duration::from_millis(3_500));
+        assert_eq!(texts(stream), ["init", "c"]);
+    }
+
+    #[test]
+    fn starting_at_needs_media_where_the_timeline_puts_it() {
+        let (cache, _transport) = counting_cache(&[]);
+        let (_, timeline) = uneven();
+        let empty = MediaTimeline {
+            media_durations: Vec::new(),
+            ..timeline.clone()
+        };
+        let no_timeline = FragmentStream::starting_at(
+            Fragments::new("init", ["a"]),
+            empty,
+            Duration::ZERO,
+            cache.clone(),
+        );
+        assert!(matches!(no_timeline, Err(Error::Initialization(_))));
+
+        // The timeline puts 2 seconds in the second fragment, which is missing.
+        let too_few = FragmentStream::starting_at(
+            Fragments::new("init", ["a"]),
+            timeline,
+            Duration::from_secs(2),
+            cache,
+        );
+        assert!(matches!(too_few, Err(Error::Initialization(_))));
+    }
+
     #[test]
     fn buffer_needs_a_timeline() {
         let (cache, _transport) = counting_cache(&[]);
         let reader =
-            StreamReader::new_with_cache(vec!["init".into(), "a".into()], None, false, cache)
-                .unwrap();
+            FragmentStream::new_with_cache(Fragments::new("init", ["a"]), None, cache).unwrap();
         assert!(reader.buffer().is_none());
     }
 
     #[test]
     fn fragment_cache_keeps_in_flight_bodies_after_reader_drop() {
         let (cache, transport) = counting_cache(&["b"]);
-        let first = StreamReader::new_with_cache(
-            vec!["init".into(), "a".into(), "b".into()],
-            None,
-            false,
-            cache.clone(),
-        )
-        .unwrap();
+        let first =
+            FragmentStream::new_with_cache(Fragments::new("init", ["a", "b"]), None, cache.clone())
+                .unwrap();
         wait_for(|| transport.gets().contains(&"b".to_owned()));
         drop(first);
 
         transport.released.store(true, Ordering::SeqCst);
         wait_for(|| cache.cached(&"b".into()).is_some());
 
-        let mut second = StreamReader::new_with_cache(
-            vec!["init".into(), "b".into()],
-            None,
-            false,
-            cache.clone(),
-        )
-        .unwrap();
+        let mut second =
+            FragmentStream::new_with_cache(Fragments::new("init", ["b"]), None, cache.clone())
+                .unwrap();
         let mut bytes = Vec::new();
         second.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"initb");
@@ -2918,24 +2554,16 @@ mod tests {
     #[test]
     fn fragment_cache_joins_a_get_already_in_flight() {
         let (cache, transport) = counting_cache(&["b"]);
-        let first = StreamReader::new_with_cache(
-            vec!["init".into(), "a".into(), "b".into()],
-            None,
-            false,
-            cache.clone(),
-        )
-        .unwrap();
+        let first =
+            FragmentStream::new_with_cache(Fragments::new("init", ["a", "b"]), None, cache.clone())
+                .unwrap();
         wait_for(|| transport.gets().contains(&"b".to_owned()));
         drop(first);
 
         // The rebuilt reader waits on the dropped reader's GET of "b".
-        let mut second = StreamReader::new_with_cache(
-            vec!["init".into(), "b".into()],
-            None,
-            false,
-            cache.clone(),
-        )
-        .unwrap();
+        let mut second =
+            FragmentStream::new_with_cache(Fragments::new("init", ["b"]), None, cache.clone())
+                .unwrap();
         transport.released.store(true, Ordering::SeqCst);
         let mut bytes = Vec::new();
         second.read_to_end(&mut bytes).unwrap();
@@ -3006,31 +2634,23 @@ mod tests {
     #[test]
     fn fragment_cache_reuses_pooled_connections_across_readers() {
         let (base, connections) = spawn_keep_alive_server();
-        let fragments = |paths: &[&str]| -> Vec<Fragment> {
-            paths
-                .iter()
-                .map(|path| format!("{base}/{path}").into())
-                .collect()
-        };
-        let read_all = |mut reader: StreamReader| {
+        let fragments =
+            |media: &str| Fragments::new(format!("{base}/init"), [format!("{base}/{media}")]);
+        let read_all = |mut reader: FragmentStream| {
             let mut bytes = Vec::new();
             reader.read_to_end(&mut bytes).unwrap();
             bytes
         };
 
         let cache = Arc::new(FragmentCache::default());
-        let first =
-            StreamReader::new_with_cache(fragments(&["init", "a"]), None, false, cache.clone())
-                .unwrap();
+        let first = FragmentStream::new_with_cache(fragments("a"), None, cache.clone()).unwrap();
         assert_eq!(read_all(first), b"inita");
-        let second =
-            StreamReader::new_with_cache(fragments(&["init", "b"]), None, false, cache.clone())
-                .unwrap();
+        let second = FragmentStream::new_with_cache(fragments("b"), None, cache.clone()).unwrap();
         assert_eq!(read_all(second), b"initb");
         assert_eq!(connections.load(Ordering::SeqCst), 1);
 
         // Separate agents cannot share the connection.
-        let third = StreamReader::new(fragments(&["init", "c"]), None, false).unwrap();
+        let third = FragmentStream::new(fragments("c"), None).unwrap();
         assert_eq!(read_all(third), b"initc");
         assert_eq!(connections.load(Ordering::SeqCst), 2);
     }
@@ -3038,14 +2658,13 @@ mod tests {
     #[test]
     fn fragment_cache_remembers_head_lengths_across_readers() {
         let (cache, transport) = counting_cache(&["a", "bb"]);
-        let fragments = || vec!["init".into(), "a".into(), "bb".into()];
-        let first = StreamReader::new_with_cache(fragments(), None, true, cache.clone()).unwrap();
+        let fragments = || Fragments::new("init", ["a", "bb"]);
+        let first = cached_stream(fragments(), true, cache.clone()).unwrap();
         wait_for(|| cache.known_size(&"bb".into()).is_some());
         drop(first);
 
         // The rebuilt reader starts with every size and sends no HEAD at all.
-        let mut second =
-            StreamReader::new_with_cache(fragments(), None, true, cache.clone()).unwrap();
+        let mut second = cached_stream(fragments(), true, cache.clone()).unwrap();
         assert!(second.shared.lock().all_sizes_known());
         assert_eq!(second.seek_bytes(SeekFrom::End(0)).unwrap().byte, Some(7));
         assert_eq!(transport.heads(), ["a", "bb"]);
@@ -3055,5 +2674,67 @@ mod tests {
         transport.released.store(true, Ordering::SeqCst);
         wait_for(|| cache.cached(&"bb".into()).is_some());
         assert_eq!(cache.known_size(&"bb".into()), Some(2));
+    }
+
+    /// The init and five one-second media fragments named "1" to "5", whose
+    /// bodies are their names.
+    fn one_second_stream(cache: Arc<FragmentCache>) -> FragmentStream {
+        let fragments = Fragments::new("init", ["1", "2", "3", "4", "5"]);
+        let timeline = MediaTimeline {
+            timescale: 1,
+            media_durations: vec![1; 5],
+        };
+        FragmentStream::new_with_cache(fragments, Some(timeline), cache).unwrap()
+    }
+
+    fn seconds(behind: Option<u64>, ahead: Option<u64>) -> Retention {
+        Retention {
+            behind: behind.map(Duration::from_secs),
+            ahead: ahead.map(Duration::from_secs),
+        }
+    }
+
+    #[test]
+    fn retention_downloads_only_its_window_ahead() {
+        let (cache, transport) = counting_cache(&["1", "2", "3", "4", "5"]);
+        let stream = one_second_stream(cache).with_retention(seconds(None, Some(2)));
+        transport.released.store(true, Ordering::SeqCst);
+
+        // Two seconds ahead of the start is fragments 1 and 2, then it waits.
+        wait_for(|| stream.shared.lock().complete);
+        assert_eq!(transport.gets(), ["init", "1", "2"]);
+    }
+
+    #[test]
+    fn retention_forgets_behind_and_downloads_again_on_a_seek_back() {
+        let (cache, transport) = counting_cache(&[]);
+        let mut stream = one_second_stream(cache.clone()).with_retention(seconds(Some(1), Some(2)));
+        assert_eq!(texts(Iterator::take(&mut stream, 3)), ["init", "1", "2"]);
+
+        // At fragment 3, one second behind keeps 2 and lets 1 go.
+        wait_for(|| cache.cached(&"3".into()).is_some());
+        assert_eq!(cache.cached(&"1".into()), None);
+        assert!(cache.cached(&"2".into()).is_some());
+        assert!(cache.cached(&"init".into()).is_some());
+        assert_eq!(cache.known_size(&"1".into()), Some(1));
+
+        stream.seek_time_coarse(Duration::ZERO).unwrap();
+        assert_eq!(stream.next().unwrap().unwrap(), &b"1"[..]);
+        let fetches_of_1 = transport.gets().iter().filter(|url| *url == "1").count();
+        assert_eq!(fetches_of_1, 2);
+    }
+
+    #[test]
+    fn retention_keeps_what_another_stream_of_the_cache_keeps() {
+        let (cache, _transport) = counting_cache(&[]);
+        let everything = one_second_stream(cache.clone());
+        wait_for(|| everything.shared.lock().complete);
+
+        let windowed = one_second_stream(cache.clone()).with_retention(seconds(Some(0), Some(1)));
+        assert_eq!(texts(windowed), ["init", "1", "2", "3", "4", "5"]);
+        for name in ["1", "2", "3", "4", "5"] {
+            assert!(cache.cached(&name.into()).is_some(), "{name} was dropped");
+        }
+        drop(everything);
     }
 }
