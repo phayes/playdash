@@ -140,7 +140,7 @@ player.sleep_until_end();
 
 ## Buffer progress
 
-`FragmentStream::buffer` returns a handle that reports how much of the stream its cache holds, in fragments, bytes and media time. `DashSource::buffer` reports the same for a rodio source. 
+`FragmentStream::buffer` returns a handle that reports how much of the stream its cache holds, in fragments, bytes and media time. `DashSource::buffer` reports the same for a rodio source.
 
 ```rust,ignore
 use playdash::{DashManifest, DashSource};

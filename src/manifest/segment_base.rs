@@ -375,7 +375,6 @@ fn invalid(reason: String) -> Error {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::fragment::Fragments;
     use crate::manifest::tests::ranged;
 
     /// A `sidx` box with `first_offset` and one `(size, duration)` reference each.
@@ -511,7 +510,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg(feature = "sync")]
     fn segment_base_index_becomes_ranged_fragments() {
-        use crate::fragment::MediaTimeline;
+        use crate::fragment::{Fragments, MediaTimeline};
         use crate::stream::FragmentCache;
         use std::io::Read;
         use std::sync::Arc;

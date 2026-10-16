@@ -80,7 +80,7 @@ impl BufferStatus {
 
     /// Returns how far playback of several streams played together, such as
     /// a video and its audio, can continue from `position` without waiting on
-    /// the network. 
+    /// the network.
     ///
     /// # Examples
     ///
