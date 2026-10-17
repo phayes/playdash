@@ -2,14 +2,16 @@
 //! fragment, and what a fetched body goes through before readers see it. Nothing here does
 //! I/O.
 
+use super::Fragment;
 #[cfg(feature = "encryption")]
 use crate::cenc::{self, ContentKeys, FragmentRole};
 use crate::error::Error;
-use crate::fragment::Fragment;
 use bytes::Bytes;
 #[cfg(feature = "encryption")]
 use bytes::BytesMut;
 use std::collections::HashMap;
+#[cfg(feature = "encryption")]
+use std::sync::RwLock;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 /// Fragment data after it's been fetched, shared between streams.
@@ -142,20 +144,59 @@ pub(crate) struct Store {
     /// Called after a fragment's body or size changes. Held weakly, so a
     /// listener lives as long as its subscriber keeps it.
     listeners: Mutex<Vec<Weak<dyn CacheListener>>>,
+    /// Set once, before any fragment is known; later only merged into. Replaced as a whole,
+    /// so a reader's clone stays consistent.
     #[cfg(feature = "encryption")]
-    keys: Option<Arc<ContentKeys>>,
+    keys: RwLock<Option<Arc<ContentKeys>>>,
 }
 
 impl Store {
     #[cfg(feature = "encryption")]
     pub(crate) fn set_keys(&mut self, keys: ContentKeys) {
-        self.keys = Some(Arc::new(keys));
+        *self
+            .keys
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(keys));
+    }
+
+    /// Merges `keys` into the store's keys. A store without keys takes them only if it
+    /// knows no fragments yet: one that does may hold bodies it kept undecrypted.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn add_keys(&self, keys: ContentKeys) -> Result<(), Error> {
+        // Held throughout, so no stream can start using the store meanwhile.
+        let fragments = self.lock();
+        let mut current = self.keys.write().unwrap_or_else(|error| error.into_inner());
+        match current.as_deref() {
+            Some(existing) => {
+                let mut merged = existing.clone();
+                merged.merge(keys);
+                *current = Some(Arc::new(merged));
+            }
+            None if fragments.is_empty() => *current = Some(Arc::new(keys)),
+            None => {
+                return Err(Error::Initialization(
+                    "content keys cannot be added to a cache that has been used without \
+                     them; give it the keys with FragmentCache::with_keys when creating it"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The keys fetched bodies are decrypted with, if any.
+    #[cfg(feature = "encryption")]
+    fn keys(&self) -> Option<Arc<ContentKeys>> {
+        self.keys
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     /// Whether fetched bodies are decrypted before they are kept.
     pub(crate) fn decrypts(&self) -> bool {
         #[cfg(feature = "encryption")]
-        return self.keys.is_some();
+        return self.keys().is_some();
         #[cfg(not(feature = "encryption"))]
         false
     }
@@ -263,7 +304,7 @@ impl Store {
         init: &FragmentData,
         media: &[Arc<FragmentData>],
     ) -> Result<(), Error> {
-        let Some(keys) = &self.keys else {
+        let Some(keys) = self.keys() else {
             return Ok(());
         };
         let body = init.body().expect("init fetched before media roles");
@@ -287,7 +328,7 @@ impl Store {
     /// ranges, HEAD sizes and byte seeks are unaffected.
     #[cfg(feature = "encryption")]
     fn decrypt(&self, data: &FragmentData, body: Bytes) -> Result<Bytes, Error> {
-        let Some(keys) = &self.keys else {
+        let Some(keys) = self.keys() else {
             return Ok(body);
         };
         let role = match data.role.get() {
@@ -314,7 +355,7 @@ impl Store {
                     .range
                     .as_ref()
                     .map_or(0, |range| *range.start());
-                cenc::decrypt_fragment(&mut bytes, body_start, protection, keys)
+                cenc::decrypt_fragment(&mut bytes, body_start, protection, &keys)
             }
         }
         .map_err(|problem| problem.at(&data.fragment))?;

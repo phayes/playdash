@@ -13,11 +13,12 @@ use bytes::Bytes;
 /// # Examples
 ///
 /// ```no_run
-/// use playdash::{ContentKind, DashManifest, PacketStream};
+/// use playdash::packet::PacketStream;
+/// use playdash::{ContentKind, DashManifest};
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/muxed.mpd")?;
-/// let stream = manifest.stream("muxed")?;
+/// let stream = manifest.fragment_stream("muxed")?;
 /// let audio = stream
 ///     .tracks()?
 ///     .into_iter()

@@ -1,5 +1,6 @@
 //! AV1 as decoders read it: the low-overhead bitstream format, MP4's samples with their
-//! temporal delimiters restored and every OBU sized; or the samples as MP4 stores them.
+//! temporal delimiters restored and every OBU sized; or the samples as MP4 stores them,
+//! with every OBU sized.
 
 use super::{
     DecoderFormat, DecoderInitialization, MediaPacket, config_error, unsupported_format, video,
@@ -74,7 +75,7 @@ impl Av1Adapter {
 
     /// Converts `packet`, one of the track's, to the adapter's format: a temporal unit
     /// that starts with a temporal delimiter and gives every OBU a size field, or the
-    /// sample as it is.
+    /// sample with every OBU given a size field.
     ///
     /// Fails with [`Error::MalformedDecoderInput`] if the packet's OBUs do not fit its
     /// data.
@@ -86,10 +87,16 @@ impl Av1Adapter {
             reason,
         };
         if format == DecoderFormat::Av1Samples {
+            // Kept as stored unless an OBU, which can only be the last, lacks a size field.
+            let mut all_sized = true;
             for obu in obus(&packet.data) {
-                obu.map_err(malformed)?;
+                all_sized &= obu.map_err(malformed)?.sized;
             }
-            let data = packet.data.clone();
+            let data = if all_sized {
+                packet.data.clone()
+            } else {
+                Bytes::from(sized_obus(&packet.data).map_err(malformed)?)
+            };
             return Ok(MediaPacket::from_packet(packet, data));
         }
         let sized = sized_obus(&packet.data).map_err(malformed)?;
@@ -287,10 +294,19 @@ mod tests {
         assert_eq!(adapter.initialization().format, DecoderFormat::Av1Samples);
         assert_eq!(adapter.initialization().data, config);
 
-        // Kept as stored, an unsized last OBU included, but still checked.
+        // Kept as stored when every OBU is sized.
+        let mut data = FRAME.to_vec();
+        data.extend(FRAME);
+        assert_eq!(adapter.convert(packet(data.clone())).unwrap().data, data);
+
+        // An unsized last OBU gains a size field, without a temporal delimiter.
         let mut data = FRAME.to_vec();
         data.extend([0x30, 0x55, 0x55]);
-        assert_eq!(adapter.convert(packet(data.clone())).unwrap().data, data);
+        let mut expected = FRAME.to_vec();
+        expected.extend([0x32, 0x02, 0x55, 0x55]);
+        assert_eq!(adapter.convert(packet(data)).unwrap().data, expected);
+
+        // Still checked.
         assert!(matches!(
             adapter.convert(packet(vec![0x32, 0x05, 0xaa])),
             Err(Error::MalformedDecoderInput {

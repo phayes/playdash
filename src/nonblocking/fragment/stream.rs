@@ -2,15 +2,15 @@
 //! `Stream` of whole fragments or as `AsyncRead` and `AsyncSeek` bytes.
 
 use super::{FragmentCache, Transport};
-use crate::buffer::BufferHandle;
 use crate::error::Error;
-use crate::fragment::{Fragments, MediaTimeline};
-use crate::mp4::track::{self, Track};
-use crate::schedule::{
+use crate::fragment::buffer::BufferHandle;
+use crate::fragment::schedule::{
     self, Cursor, Part, PartBody, Position, Retention, Schedule, StreamTimeline, TimeAccuracy,
     WindowChange,
 };
-use crate::store::FragmentData;
+use crate::fragment::store::FragmentData;
+use crate::fragment::{Fragments, MediaTimeline};
+use crate::mp4::track::{self, Track};
 use bytes::Bytes;
 use futures_util::Stream;
 use std::fmt;
@@ -33,7 +33,7 @@ type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + 
 /// A representation's fragments, downloaded in the background and read in
 /// order: a [`Stream`] of whole fragments, and a progressive [`AsyncRead`] and
 /// [`AsyncSeek`] view of the same bytes. The async counterpart of the `sync`
-/// feature's `playdash::FragmentStream`.
+/// feature's `playdash::fragment::FragmentStream`.
 ///
 /// The initialization segment comes first, then the media segments. Streaming
 /// and reading share one position: each item is everything from the current
@@ -57,7 +57,7 @@ type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + 
 /// mean instead:
 ///
 /// ```no_run
-/// # async fn example(mut stream: playdash::nonblocking::FragmentStream) {
+/// # async fn example(mut stream: playdash::nonblocking::fragment::FragmentStream) {
 /// use futures_util::StreamExt;
 /// use tokio::io::AsyncReadExt;
 ///
@@ -80,14 +80,14 @@ type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + 
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd").await?;
 ///
 /// // Whole fragments.
-/// let mut stream = manifest.stream("audio").await?;
+/// let mut stream = manifest.fragment_stream("audio").await?;
 /// while let Some(fragment) = stream.next().await {
 ///     let bytes = fragment?;
 ///     # drop(bytes);
 /// }
 ///
 /// // Bytes, from 30 seconds in.
-/// let mut stream = manifest.stream("audio").await?;
+/// let mut stream = manifest.fragment_stream("audio").await?;
 /// stream.seek_time(Duration::from_secs(30)).await?;
 /// let mut bytes = [0; 4096];
 /// let count = stream.read(&mut bytes).await?;
@@ -257,7 +257,7 @@ impl FragmentStream {
     }
 
     /// The tracks of the representation's initialization fragment, as a
-    /// [`PacketStream`](super::PacketStream) reads them.
+    /// [`PacketStream`](crate::nonblocking::packet::PacketStream) reads them.
     ///
     /// Fails with [`Error::MalformedMedia`] or [`Error::UnsupportedMedia`] if the
     /// initialization fragment is not MP4 this crate reads.

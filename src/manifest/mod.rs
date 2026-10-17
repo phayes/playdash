@@ -402,6 +402,17 @@ impl DashManifest {
             .media_timeline())
     }
 
+    /// A representation's fragments and media timeline, from one selection.
+    #[cfg(any(feature = "sync", feature = "async"))]
+    pub(crate) fn stream_parts(
+        &self,
+        representation_id: &str,
+    ) -> Result<(Fragments, MediaTimeline), Error> {
+        let (selected, segments) = self.select_segments(representation_id)?;
+        let fragments = selected.fragments(self.base_url.as_ref(), &segments)?;
+        Ok((fragments, segments.media_timeline()))
+    }
+
     /// MIME type of a representation, inherited from its adaptation set if absent.
     pub fn mime_type(&self, representation_id: impl AsRef<str>) -> Result<Option<&str>, Error> {
         Ok(self.select(representation_id.as_ref())?.mime_type())

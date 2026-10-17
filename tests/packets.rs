@@ -5,10 +5,9 @@
 mod common;
 
 use common::{BASE, Fixtures, Probe, Probed, assert_matches, fixture, fragment_stream, muxed};
-use playdash::{
-    Codec, ContentKind, DashManifest, Error, FragmentCache, FragmentStream, Packet, PacketStream,
-    Retention, Seeked, TimeAccuracy,
-};
+use playdash::fragment::FragmentStream;
+use playdash::packet::{Packet, PacketSeeked, PacketStream};
+use playdash::{Codec, ContentKind, DashManifest, Error, FragmentCache, Retention};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,9 +97,9 @@ fn presenting(expected: &[Probed], ticks: i64) -> usize {
         .expect("a packet presents at the time")
 }
 
-/// `time` in ticks of `timescale`.
+/// `time` in ticks of `timescale`, rounded to the nearest as seeks round it.
 fn ticks(time: Duration, timescale: u32) -> i64 {
-    (time.as_nanos() * u128::from(timescale) / 1_000_000_000) as i64
+    ((time.as_nanos() * u128::from(timescale) + 500_000_000) / 1_000_000_000) as i64
 }
 
 /// Where audio seeks go.
@@ -112,7 +111,7 @@ fn check_audio_seek(
     name: &str,
     timescale: u32,
     preroll: Duration,
-    seeked: &Seeked,
+    seeked: &PacketSeeked,
     rest: &[Packet],
 ) {
     let ticks = ticks(AUDIO_SEEK, timescale);
@@ -153,9 +152,58 @@ fn audio_seeks_land_on_the_packet_at_the_time_after_its_preroll() {
     for name in AUDIO {
         let mut stream = packets(name);
         let (timescale, preroll) = (stream.timescale(), stream.preroll());
-        let seeked = stream.seek_time(AUDIO_SEEK, TimeAccuracy::Packet).unwrap();
+        let seeked = stream.seek_time(AUDIO_SEEK).unwrap();
         let rest: Vec<Packet> = stream.map(Result::unwrap).collect();
         check_audio_seek(name, timescale, preroll, &seeked, &rest);
+    }
+}
+
+/// Checks a keyframe seek of fixture `name` to [`AUDIO_SEEK`], on a stream of
+/// `timescale` decoding `preroll` first, returned `seeked` and then the packets `rest`.
+/// Every packet of the audio fixtures is a keyframe.
+fn check_audio_keyframe_seek(
+    name: &str,
+    timescale: u32,
+    preroll: Duration,
+    seeked: &PacketSeeked,
+    rest: &[Packet],
+) {
+    let ticks = ticks(AUDIO_SEEK, timescale);
+    let preroll = self::ticks(preroll, timescale);
+    let expected = probed(name);
+    // Decoding starts at the last packet a pre-roll before the time, and lands a
+    // pre-roll after it.
+    let first = expected
+        .iter()
+        .rposition(|packet| packet.pts <= ticks - preroll)
+        .unwrap();
+    let at = presenting(&expected, expected[first].pts + preroll);
+
+    assert_eq!(seeked.requested, AUDIO_SEEK, "{name}");
+    assert_eq!(
+        (seeked.landed, seeked.discard_before),
+        (expected[at].pts, expected[at].pts),
+        "{name}"
+    );
+    assert!(seeked.landed <= ticks, "{name} lands at or before the time");
+    assert_eq!(seeked.preroll.len(), at - first, "{name}");
+    for (offset, packet) in seeked.preroll.iter().enumerate() {
+        assert_matches(name, first + offset, packet, &expected, true);
+    }
+    assert_eq!(rest.len(), expected.len() - at, "{name}");
+    for (offset, packet) in rest.iter().enumerate() {
+        assert_matches(name, at + offset, packet, &expected, true);
+    }
+}
+
+#[test]
+fn audio_keyframe_seeks_land_a_preroll_after_the_packet_decoding_starts_at() {
+    for name in AUDIO {
+        let mut stream = packets(name);
+        let (timescale, preroll) = (stream.timescale(), stream.preroll());
+        let seeked = stream.seek_keyframe(AUDIO_SEEK).unwrap();
+        let rest: Vec<Packet> = stream.map(Result::unwrap).collect();
+        check_audio_keyframe_seek(name, timescale, preroll, &seeked, &rest);
     }
 }
 
@@ -182,7 +230,7 @@ fn is_rasl(name: &str, packet: &Packet) -> bool {
 
 /// Checks a packet-accurate seek of fixture `name` to [`VIDEO_SEEK`], on a stream of
 /// `timescale`, returned `seeked` and then the packets `rest`.
-fn check_video_seek(name: &str, timescale: u32, seeked: &Seeked, rest: &[Packet]) {
+fn check_video_seek(name: &str, timescale: u32, seeked: &PacketSeeked, rest: &[Packet]) {
     let ticks = ticks(VIDEO_SEEK, timescale);
     let expected = probed(name);
     let keyframe = expected
@@ -223,9 +271,55 @@ fn video_seeks_decode_from_the_keyframe_before_the_time() {
     for name in VIDEO {
         let mut stream = packets(name);
         let timescale = stream.timescale();
-        let seeked = stream.seek_time(VIDEO_SEEK, TimeAccuracy::Packet).unwrap();
+        let seeked = stream.seek_time(VIDEO_SEEK).unwrap();
         let rest: Vec<Packet> = stream.map(Result::unwrap).collect();
         check_video_seek(name, timescale, &seeked, &rest);
+    }
+}
+
+/// Checks a keyframe seek of fixture `name` to [`VIDEO_SEEK`], on a stream of
+/// `timescale`, returned `seeked` and then the packets `rest`.
+fn check_video_keyframe_seek(name: &str, timescale: u32, seeked: &PacketSeeked, rest: &[Packet]) {
+    let ticks = ticks(VIDEO_SEEK, timescale);
+    let expected = probed(name);
+    let keyframe = expected
+        .iter()
+        .rposition(|packet| packet.flags.starts_with('K') && packet.pts <= ticks)
+        .unwrap();
+
+    assert_eq!(seeked.requested, VIDEO_SEEK, "{name}");
+    let pts = expected[keyframe].pts;
+    assert_eq!((seeked.landed, seeked.discard_before), (pts, pts), "{name}");
+    // Nothing to pre-roll, unless the keyframe has leading pictures it would show: then
+    // decoding starts at an earlier keyframe, all of whose output is before it.
+    if let Some(first) = seeked.preroll.first() {
+        assert!(first.keyframe, "{name}");
+        assert!(
+            seeked.preroll.iter().all(|packet| packet.pts < pts),
+            "{name}"
+        );
+    }
+    // The stream carries on from the keyframe, but for its RASL pictures when decoding
+    // starts there.
+    assert!(rest[0].keyframe, "{name}");
+    assert_matches(name, keyframe, &rest[0], &expected, false);
+    if seeked.preroll.is_empty() {
+        assert!(
+            rest.iter()
+                .all(|packet| !is_rasl(name, packet) || packet.pts > pts),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn video_keyframe_seeks_land_on_the_keyframe_before_the_time() {
+    for name in VIDEO {
+        let mut stream = packets(name);
+        let timescale = stream.timescale();
+        let seeked = stream.seek_keyframe(VIDEO_SEEK).unwrap();
+        let rest: Vec<Packet> = stream.map(Result::unwrap).collect();
+        check_video_keyframe_seek(name, timescale, &seeked, &rest);
     }
 }
 
@@ -234,22 +328,34 @@ fn seeks_land_on_the_next_packet_even_past_the_timelines_fragment() {
     // The single-file fixtures' SegmentList @duration only approximates their fragments, so
     // some times fall after the last packet of the fragment the timeline names.
     for name in AUDIO.iter().chain(&VIDEO) {
+        let first_pts = packets(name).next().unwrap().unwrap().pts;
         for millis in (0..1_500).step_by(20) {
-            for accuracy in [TimeAccuracy::Packet, TimeAccuracy::Fragment] {
-                let context = format!("{name} {millis}ms {accuracy:?}");
+            for keyframe in [false, true] {
+                let context = format!("{name} {millis}ms keyframe {keyframe}");
+                let time = Duration::from_millis(millis);
                 let mut stream = packets(name);
-                let seeked = stream
-                    .seek_time(Duration::from_millis(millis), accuracy)
-                    .unwrap();
+                let seeked = match keyframe {
+                    false => stream.seek_time(time),
+                    true => stream.seek_keyframe(time),
+                }
+                .unwrap();
                 let next = stream.next().expect(&context).unwrap();
                 assert_eq!(seeked.landed, next.pts, "{context}");
+                // At or before the time, unless that is before the first packet.
+                if keyframe {
+                    let ticks = ticks(time, stream.timescale()).max(first_pts);
+                    assert!(
+                        seeked.landed <= ticks,
+                        "{context} lands at or before the time"
+                    );
+                }
             }
         }
     }
 }
 
 #[test]
-fn fragment_seeks_stay_in_the_fragment_and_packet_seeks_reach_back() {
+fn keyframe_seeks_land_before_the_time_and_exact_seeks_reach_back() {
     let transport = Arc::new(Fixtures::default());
     let stream = fragment_stream("aac", transport.clone()).with_retention(Retention {
         behind: Some(Duration::ZERO),
@@ -259,20 +365,23 @@ fn fragment_seeks_stay_in_the_fragment_and_packet_seeks_reach_back() {
     stream.next().unwrap().unwrap();
     assert_eq!(transport.gets_of("aac_1.m4s"), 1);
 
-    // The second segment starts at its first packet; one frame of pre-roll lands
-    // on the next.
+    // 600ms is in the second segment, which starts at 23552: one frame of pre-roll from
+    // the frame at 27648 lands on the next, before the time.
     let expected = probed("aac");
     let second = expected
         .iter()
         .position(|packet| packet.pts >= 23_552)
         .unwrap();
-    let seeked = stream
-        .seek_time(Duration::from_millis(600), TimeAccuracy::Fragment)
+    let decode_from = expected
+        .iter()
+        .position(|packet| packet.pts == 27_648)
         .unwrap();
-    assert_eq!(seeked.landed, expected[second + 1].pts);
+    let seeked = stream.seek_keyframe(Duration::from_millis(600)).unwrap();
+    assert_eq!(seeked.landed, expected[decode_from + 1].pts);
+    assert!(seeked.landed < 28_800);
     assert_eq!(seeked.discard_before, seeked.landed);
     assert_eq!(seeked.preroll.len(), 1);
-    assert_eq!(seeked.preroll[0].pts, expected[second].pts);
+    assert_eq!(seeked.preroll[0].pts, expected[decode_from].pts);
     assert_eq!(
         transport.gets_of("aac_1.m4s"),
         1,
@@ -280,9 +389,9 @@ fn fragment_seeks_stay_in_the_fragment_and_packet_seeks_reach_back() {
     );
     assert_eq!(stream.next().unwrap().unwrap().pts, seeked.landed);
 
-    // A packet-accurate seek to the start of the second segment needs the first's last frame.
+    // An exact seek to the start of the second segment needs the first's last frame.
     let start = Duration::from_secs_f64(expected[second].pts as f64 / 48_000.0);
-    let seeked = stream.seek_time(start, TimeAccuracy::Packet).unwrap();
+    let seeked = stream.seek_time(start).unwrap();
     assert_eq!(seeked.landed, expected[second].pts);
     assert_eq!(seeked.preroll.len(), 1);
     assert_eq!(seeked.preroll[0].pts, expected[second - 1].pts);
@@ -309,7 +418,7 @@ fn a_read_stream_or_encrypted_samples_are_refused() {
         .with_base_url(&format!("{BASE}encryption/shaka_cenc.mpd"))
         .unwrap();
     let stream = manifest
-        .stream_with_cache(
+        .fragment_stream_with_cache(
             "0",
             Arc::new(FragmentCache::new(Arc::new(Fixtures::default()))),
         )
@@ -399,7 +508,7 @@ fn decrypted_packets_are_the_plain_packets() {
             .with_base_url(&format!("{BASE}encryption/{name}.mpd"))
             .unwrap();
         assert_eq!(
-            data(manifest.stream_with_cache("0", cache()).unwrap()),
+            data(manifest.fragment_stream_with_cache("0", cache()).unwrap()),
             plain,
             "{name}"
         );
@@ -413,7 +522,7 @@ fn decrypted_packets_are_the_plain_packets() {
     );
 }
 
-/// The same packets and seeks through `nonblocking::PacketStream`.
+/// The same packets and seeks through `nonblocking::packet::PacketStream`.
 #[cfg(feature = "async")]
 mod nonblocking {
     use super::*;
@@ -421,13 +530,13 @@ mod nonblocking {
     use futures_util::StreamExt;
     use playdash::nonblocking;
 
-    async fn packets(name: &str) -> nonblocking::PacketStream {
-        nonblocking::PacketStream::new(async_fragment_stream(name).await)
+    async fn packets(name: &str) -> nonblocking::packet::PacketStream {
+        nonblocking::packet::PacketStream::new(async_fragment_stream(name).await)
             .await
             .unwrap()
     }
 
-    async fn collect(stream: nonblocking::PacketStream) -> Vec<Packet> {
+    async fn collect(stream: nonblocking::packet::PacketStream) -> Vec<Packet> {
         stream.map(Result::unwrap).collect().await
     }
 
@@ -445,29 +554,33 @@ mod nonblocking {
         for name in AUDIO {
             let mut stream = packets(name).await;
             let (timescale, preroll) = (stream.timescale(), stream.preroll());
-            let seeked = stream
-                .seek_time(AUDIO_SEEK, TimeAccuracy::Packet)
-                .await
-                .unwrap();
+            let seeked = stream.seek_time(AUDIO_SEEK).await.unwrap();
             check_audio_seek(name, timescale, preroll, &seeked, &collect(stream).await);
+
+            let mut stream = packets(name).await;
+            let seeked = stream.seek_keyframe(AUDIO_SEEK).await.unwrap();
+            let rest = collect(stream).await;
+            check_audio_keyframe_seek(name, timescale, preroll, &seeked, &rest);
         }
         for name in VIDEO {
             let mut stream = packets(name).await;
             let timescale = stream.timescale();
-            let seeked = stream
-                .seek_time(VIDEO_SEEK, TimeAccuracy::Packet)
-                .await
-                .unwrap();
+            let seeked = stream.seek_time(VIDEO_SEEK).await.unwrap();
             check_video_seek(name, timescale, &seeked, &collect(stream).await);
+
+            let mut stream = packets(name).await;
+            let seeked = stream.seek_keyframe(VIDEO_SEEK).await.unwrap();
+            check_video_keyframe_seek(name, timescale, &seeked, &collect(stream).await);
         }
     }
 
     #[tokio::test]
     async fn muxed_tracks_match_blocking_ones() {
-        let cache = Arc::new(nonblocking::FragmentCache::new(Arc::new(
+        let cache = Arc::new(nonblocking::fragment::FragmentCache::new(Arc::new(
             Fixtures::default(),
         )));
-        let stream = || nonblocking::FragmentStream::new_with_cache(muxed(), None, cache.clone());
+        let stream =
+            || nonblocking::fragment::FragmentStream::new_with_cache(muxed(), None, cache.clone());
         let blocking = FragmentStream::new_with_cache(
             muxed(),
             None,
@@ -477,10 +590,10 @@ mod nonblocking {
 
         let video_stream = stream().await.unwrap();
         assert_eq!(video_stream.tracks().unwrap(), blocking.tracks().unwrap());
-        let video = nonblocking::PacketStream::with_track(video_stream, 1)
+        let video = nonblocking::packet::PacketStream::with_track(video_stream, 1)
             .await
             .unwrap();
-        let audio = nonblocking::PacketStream::with_track(stream().await.unwrap(), 2)
+        let audio = nonblocking::packet::PacketStream::with_track(stream().await.unwrap(), 2)
             .await
             .unwrap();
         check_packets("muxed_v", &collect(video).await, false);
@@ -488,7 +601,7 @@ mod nonblocking {
     }
 
     #[tokio::test]
-    async fn codecs_and_fragment_seeks_match_blocking_ones() {
+    async fn codecs_and_keyframe_seeks_match_blocking_ones() {
         for name in AUDIO.iter().chain(&VIDEO) {
             let mut stream = packets(name).await;
             let mut blocking = super::packets(name);
@@ -496,11 +609,8 @@ mod nonblocking {
             assert_eq!(stream.preroll(), blocking.preroll(), "{name}");
             let time = Duration::from_millis(600);
             assert_eq!(
-                stream
-                    .seek_time(time, TimeAccuracy::Fragment)
-                    .await
-                    .unwrap(),
-                blocking.seek_time(time, TimeAccuracy::Fragment).unwrap(),
+                stream.seek_keyframe(time).await.unwrap(),
+                blocking.seek_keyframe(time).unwrap(),
                 "{name}"
             );
             assert_eq!(

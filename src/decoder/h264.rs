@@ -21,12 +21,13 @@ const FORMATS: [DecoderFormat; 2] = [DecoderFormat::H264AnnexB, DecoderFormat::H
 /// # Examples
 ///
 /// ```no_run
-/// use playdash::{DashManifest, DecoderFormat, PacketStream};
 /// use playdash::decoder::H264Adapter;
+/// use playdash::packet::PacketStream;
+/// use playdash::{DashManifest, DecoderFormat};
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
-/// let packets = PacketStream::new(manifest.stream("video")?)?;
+/// let packets = PacketStream::new(manifest.fragment_stream("video")?)?;
 /// let adapter = H264Adapter::new(packets.codec(), DecoderFormat::H264AnnexB)?;
 /// let parameter_sets = &adapter.initialization().data;
 /// # let _ = parameter_sets;

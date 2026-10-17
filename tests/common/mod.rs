@@ -2,9 +2,9 @@
 //! ffprobe's, shared by the integration tests.
 #![allow(dead_code)]
 
-use playdash::{
-    Bytes, DashManifest, Error, Fragment, FragmentCache, FragmentStream, Packet, Transport,
-};
+use playdash::fragment::{Fragment, FragmentStream, Fragments};
+use playdash::packet::Packet;
+use playdash::{Bytes, DashManifest, Error, FragmentCache, Transport};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -71,12 +71,12 @@ pub fn fragment_stream_through(name: &str, transport: Arc<dyn Transport>) -> Fra
     let manifest = manifest(name);
     let id = manifest.representations().next().unwrap().id.to_owned();
     manifest
-        .stream_with_cache(id, Arc::new(FragmentCache::new(transport)))
+        .fragment_stream_with_cache(id, Arc::new(FragmentCache::new(transport)))
         .unwrap()
 }
 
 #[cfg(feature = "async")]
-impl playdash::nonblocking::Transport for Fixtures {
+impl playdash::nonblocking::fragment::Transport for Fixtures {
     fn get<'a>(
         &'a self,
         fragment: &'a Fragment,
@@ -89,18 +89,22 @@ impl playdash::nonblocking::Transport for Fixtures {
 /// The representation in `tests/files/packets/<name>.mpd`, read by the async API through
 /// fresh [`Fixtures`].
 #[cfg(feature = "async")]
-pub async fn async_fragment_stream(name: &str) -> playdash::nonblocking::FragmentStream {
-    use playdash::nonblocking::{DashManifest, FragmentCache};
+pub async fn async_fragment_stream(name: &str) -> playdash::nonblocking::fragment::FragmentStream {
+    use playdash::nonblocking::DashManifest;
+    use playdash::nonblocking::fragment::FragmentCache;
 
     let manifest = DashManifest::from(manifest(name));
     let id = manifest.representations().next().unwrap().id.to_owned();
     let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures::default())));
-    manifest.stream_with_cache(id, cache).await.unwrap()
+    manifest
+        .fragment_stream_with_cache(id, cache)
+        .await
+        .unwrap()
 }
 
 /// The fragments of `file`, a single fragmented MP4 file at `url`: the `ftyp`+`moov`
 /// byte range, then each `moof`+`mdat`.
-pub fn split_fragments(url: &str, file: &[u8]) -> playdash::Fragments {
+pub fn split_fragments(url: &str, file: &[u8]) -> Fragments {
     let mut ranges = Vec::new();
     let (mut start, mut pos) = (0, 0);
     while pos < file.len() {
@@ -117,11 +121,11 @@ pub fn split_fragments(url: &str, file: &[u8]) -> playdash::Fragments {
         .into_iter()
         .map(|range| Fragment::with_range(url, range));
     let init = fragments.next().expect("a moov");
-    playdash::Fragments::new(init, fragments)
+    Fragments::new(init, fragments)
 }
 
 /// The fragments of `tests/files/packets/muxed.mp4`: H.264 and AAC in one representation.
-pub fn muxed() -> playdash::Fragments {
+pub fn muxed() -> Fragments {
     let url = format!("{BASE}packets/muxed.mp4");
     split_fragments(&url, &fixture("packets/muxed.mp4"))
 }

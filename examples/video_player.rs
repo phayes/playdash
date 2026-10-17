@@ -32,9 +32,10 @@ use std::thread;
 use std::time::Duration;
 
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use playdash::fragment::FragmentStream;
 use playdash::{
     BufferHandle, BufferStatus, ContentKind, DashManifest, DashSource, FragmentCache,
-    FragmentStream, Representation, Retention,
+    Representation, Retention,
 };
 use rodio::{DeviceSinkBuilder, Player};
 
@@ -202,7 +203,8 @@ impl Decoder {
     ) -> Result<Self, Box<dyn Error>> {
         // A stream from `time`: the init segment, then the media from the
         // fragment containing `time`, as ffmpeg needs.
-        let (stream, start) = manifest.stream_at_with_cache(id, time, Arc::clone(cache))?;
+        let (stream, start) =
+            manifest.fragment_stream_at_with_cache(id, time, Arc::clone(cache))?;
         let stream = stream.with_retention(Retention {
             behind: Some(Duration::from_secs(30)),
             ahead: Some(Duration::from_secs(60)),

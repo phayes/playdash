@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Duration;
 
-use playdash::{DashManifest, DecoderFormat, TimeAccuracy};
+use playdash::{DashManifest, DecoderFormat};
 
 fn main() {
     if let Err(error) = run() {
@@ -51,11 +51,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(seconds) => {
             // FLAC frames decode on their own, so there is no pre-roll to write.
             let time = Duration::from_secs_f64(seconds);
-            let (input, seeked) = builder.open_at(time, TimeAccuracy::Packet)?;
-            println!(
-                "starting at {:.3}s",
-                seeked.landed as f64 / f64::from(input.timescale())
-            );
+            let (input, seeked) = builder.open_at(time)?;
+            let landed = seeked.landed_time().unwrap_or_default();
+            println!("starting at {:.3}s", landed.as_secs_f64());
             input
         }
         None => builder.open()?,

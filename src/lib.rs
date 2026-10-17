@@ -1,8 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
-#[cfg(any(feature = "sync", feature = "async"))]
-mod buffer;
 #[cfg(feature = "encryption")]
 mod cenc;
 #[cfg(any(feature = "sync", feature = "async"))]
@@ -10,64 +8,47 @@ pub mod codec;
 #[cfg(any(feature = "sync", feature = "async"))]
 pub mod decoder;
 mod error;
-mod fragment;
+pub mod fragment;
 mod manifest;
 mod mp4;
 #[cfg(feature = "async")]
 pub mod nonblocking;
-#[cfg(feature = "sync")]
-mod packet_stream;
+#[cfg(any(feature = "sync", feature = "async"))]
+pub mod packet;
 #[cfg(feature = "rodio")]
 mod rodio;
-#[cfg(any(feature = "sync", feature = "async"))]
-mod schedule;
-#[cfg(any(feature = "sync", feature = "async"))]
-mod store;
-#[cfg(feature = "sync")]
-mod stream;
 mod vendor;
 
-#[cfg(any(feature = "sync", feature = "async"))]
-#[doc(inline)]
-pub use buffer::{BufferAmount, BufferHandle, BufferStatus, BufferTotal};
 #[cfg(feature = "encryption")]
 #[doc(inline)]
 pub use cenc::ContentKeys;
 #[cfg(any(feature = "sync", feature = "async"))]
 #[doc(inline)]
 pub use decoder::{
-    DecoderFormat, DecoderInitialization, DecoderParameters, DecoderStyle, MediaPacket, MediaSeeked,
+    DecoderFormat, DecoderInitialization, DecoderParameters, DecoderStyle, MediaPacket, Seeked,
 };
 #[cfg(feature = "sync")]
 #[doc(inline)]
 pub use decoder::{MediaStream, MediaStreamBuilder};
 #[doc(inline)]
 pub use error::Error;
+#[cfg(any(feature = "sync", feature = "async"))]
 #[doc(inline)]
-pub use fragment::{Fragment, Fragments, MediaTimeline};
+pub use fragment::buffer::{BufferAmount, BufferHandle, BufferStatus, BufferTotal};
+#[cfg(any(feature = "sync", feature = "async"))]
+#[doc(inline)]
+pub use fragment::schedule::{Retention, TimeAccuracy};
+#[cfg(feature = "sync")]
+#[doc(inline)]
+pub use fragment::{FragmentCache, Transport};
 #[doc(inline)]
 pub use manifest::{ContentKind, DashManifest, FrameRate, Representation};
 #[cfg(any(feature = "sync", feature = "async"))]
 #[doc(inline)]
 pub use mp4::codec::Codec;
-#[cfg(any(feature = "sync", feature = "async"))]
-#[doc(inline)]
-pub use mp4::packet::{Packet, Seeked};
-#[cfg(any(feature = "sync", feature = "async"))]
-#[doc(inline)]
-pub use mp4::track::Track;
-#[cfg(feature = "sync")]
-#[doc(inline)]
-pub use packet_stream::PacketStream;
 #[cfg(feature = "rodio")]
 #[doc(inline)]
 pub use rodio::DashSource;
-#[cfg(any(feature = "sync", feature = "async"))]
-#[doc(inline)]
-pub use schedule::{Position, Retention, TimeAccuracy, TimePosition};
-#[cfg(feature = "sync")]
-#[doc(inline)]
-pub use stream::{FragmentCache, FragmentStream, Transport};
 
 /// The byte buffer fragment bodies come in, re-exported for implementing a
 /// `Transport` without depending on the `bytes` crate directly.

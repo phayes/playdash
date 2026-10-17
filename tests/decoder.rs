@@ -6,10 +6,11 @@
 mod common;
 
 use common::{Fixtures, fragment_stream, fragment_stream_through, muxed};
+use playdash::fragment::{Fragment, FragmentStream};
+use playdash::packet::{Packet, PacketSeeked, PacketStream};
 use playdash::{
-    Bytes, Codec, ContentKind, DecoderFormat, DecoderParameters, DecoderStyle, Error, Fragment,
-    FragmentCache, FragmentStream, MediaPacket, MediaStream, MediaStreamBuilder, Packet,
-    PacketStream, TimeAccuracy, Transport,
+    Bytes, Codec, ContentKind, DecoderFormat, DecoderParameters, DecoderStyle, Error,
+    FragmentCache, MediaPacket, MediaStream, MediaStreamBuilder, Seeked, Transport,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,34 @@ fn packets(name: &str) -> PacketStream {
 
 fn media_stream(name: &str) -> MediaStream {
     packets(name).into_media_stream().unwrap()
+}
+
+/// Seeks `stream` to `time`, or to the last keyframe at or before it if `keyframe`.
+fn seek(stream: &mut MediaStream, time: Duration, keyframe: bool) -> Seeked {
+    match keyframe {
+        false => stream.seek_time(time),
+        true => stream.seek_keyframe(time),
+    }
+    .unwrap()
+}
+
+/// Seeks `stream` to `time`, or to the last keyframe at or before it if `keyframe`.
+fn seek_packets(stream: &mut PacketStream, time: Duration, keyframe: bool) -> PacketSeeked {
+    match keyframe {
+        false => stream.seek_time(time),
+        true => stream.seek_keyframe(time),
+    }
+    .unwrap()
+}
+
+/// Opens `builder` seeked to `time`, or to the last keyframe at or before it if
+/// `keyframe`.
+fn open_at(builder: MediaStreamBuilder, time: Duration, keyframe: bool) -> (MediaStream, Seeked) {
+    match keyframe {
+        false => builder.open_at(time),
+        true => builder.open_at_keyframe(time),
+    }
+    .unwrap()
 }
 
 /// The format fixture `name` converts to.
@@ -252,18 +281,18 @@ fn every_codec_converts_the_mp4_packets() {
 #[test]
 fn seek_preroll_is_converted_like_every_other_packet() {
     for name in AUDIO.iter().chain(&VIDEO) {
-        for (time, accuracy) in [
-            (Duration::from_millis(1_300), TimeAccuracy::Packet),
-            (Duration::from_millis(700), TimeAccuracy::Packet),
-            (Duration::from_millis(600), TimeAccuracy::Fragment),
+        for (time, keyframe) in [
+            (Duration::from_millis(1_300), false),
+            (Duration::from_millis(700), false),
+            (Duration::from_millis(600), true),
         ] {
-            let context = format!("{name} {time:?} {accuracy:?}");
+            let context = format!("{name} {time:?} keyframe {keyframe}");
             let format = format_of(name);
             let mut stream = media_stream(name);
             let mut plain = packets(name);
 
-            let seeked = stream.seek_time(time, accuracy).unwrap();
-            let expected = plain.seek_time(time, accuracy).unwrap();
+            let seeked = seek(&mut stream, time, keyframe);
+            let expected = seek_packets(&mut plain, time, keyframe);
             assert_eq!(
                 (seeked.requested, seeked.landed, seeked.discard_before),
                 (expected.requested, expected.landed, expected.discard_before),
@@ -330,8 +359,8 @@ fn config_record_style_gives_the_mp4_packets_with_their_record() {
         assert_all_converted(name, format, &converted, &expected);
 
         let time = Duration::from_millis(1_300);
-        let seeked = stream.seek_time(time, TimeAccuracy::Packet).unwrap();
-        let expected = packets(name).seek_time(time, TimeAccuracy::Packet).unwrap();
+        let seeked = stream.seek_time(time).unwrap();
+        let expected = packets(name).seek_time(time).unwrap();
         assert_all_converted(name, format, &seeked.preroll, &expected.preroll);
     }
 }
@@ -472,9 +501,7 @@ fn a_malformed_packet_ends_iteration_until_a_seek() {
     );
 
     // A seek starts iteration again, up to the same packet.
-    let seeked = stream
-        .seek_time(Duration::ZERO, TimeAccuracy::Packet)
-        .unwrap();
+    let seeked = stream.seek_time(Duration::ZERO).unwrap();
     assert!(seeked.preroll.is_empty());
     assert_eq!(stream.by_ref().take_while(Result::is_ok).count(), 25);
     assert!(stream.next().is_none());
@@ -560,21 +587,17 @@ fn the_manifest_builder_converts_to_the_style_or_format_asked_for() {
 }
 
 #[test]
-fn open_at_seeks_as_open_then_seek_time_does() {
+fn open_at_seeks_as_open_then_a_seek_does() {
     for name in AUDIO.iter().chain(&VIDEO) {
-        for (time, accuracy) in [
-            (Duration::from_millis(1_010), TimeAccuracy::Packet),
-            (Duration::from_millis(1_300), TimeAccuracy::Packet),
-            (Duration::from_millis(600), TimeAccuracy::Fragment),
+        for (time, keyframe) in [
+            (Duration::from_millis(1_010), false),
+            (Duration::from_millis(1_300), false),
+            (Duration::from_millis(600), true),
         ] {
-            let context = format!("{name} {time:?} {accuracy:?}");
-            let (stream, seeked) = built(name, |builder| builder.open_at(time, accuracy).unwrap());
+            let context = format!("{name} {time:?} keyframe {keyframe}");
+            let (stream, seeked) = built(name, |builder| open_at(builder, time, keyframe));
             let mut expected = media_stream(name);
-            assert_eq!(
-                seeked,
-                expected.seek_time(time, accuracy).unwrap(),
-                "{context}"
-            );
+            assert_eq!(seeked, seek(&mut expected, time, keyframe), "{context}");
             assert_same_stream(&context, stream, expected);
         }
     }
@@ -585,9 +608,7 @@ fn open_at_takes_preroll_from_an_earlier_fragment() {
     // Opus's second fragment spans ticks 23688 to 47688 at 48 kHz, and its third holds
     // 1.01s; the 80ms of pre-roll before 1.01s starts in the second.
     let (stream, seeked) = built("opus", |builder| {
-        builder
-            .open_at(Duration::from_millis(1_010), TimeAccuracy::Packet)
-            .unwrap()
+        builder.open_at(Duration::from_millis(1_010)).unwrap()
     });
     assert_eq!(stream.timescale(), 48_000);
     let first = seeked.preroll.first().expect("pre-roll");
@@ -602,23 +623,15 @@ fn open_at_takes_preroll_from_an_earlier_fragment() {
 fn the_manifest_builder_sets_the_preroll() {
     let time = Duration::from_millis(1_300);
     let (_, seeked) = built("opus", |builder| {
-        builder
-            .preroll(Duration::ZERO)
-            .open_at(time, TimeAccuracy::Packet)
-            .unwrap()
+        builder.preroll(Duration::ZERO).open_at(time).unwrap()
     });
     let mut expected = packets("opus")
         .with_preroll(Duration::ZERO)
         .into_media_stream()
         .unwrap();
-    assert_eq!(
-        seeked,
-        expected.seek_time(time, TimeAccuracy::Packet).unwrap()
-    );
+    assert_eq!(seeked, expected.seek_time(time).unwrap());
 
-    let (_, default) = built("opus", |builder| {
-        builder.open_at(time, TimeAccuracy::Packet).unwrap()
-    });
+    let (_, default) = built("opus", |builder| builder.open_at(time).unwrap());
     assert!(seeked.preroll.len() < default.preroll.len());
 }
 
@@ -670,7 +683,7 @@ mod nonblocking {
     use playdash::nonblocking;
 
     async fn media_stream(name: &str) -> nonblocking::MediaStream {
-        nonblocking::PacketStream::new(async_fragment_stream(name).await)
+        nonblocking::packet::PacketStream::new(async_fragment_stream(name).await)
             .await
             .unwrap()
             .into_media_stream()
@@ -693,20 +706,25 @@ mod nonblocking {
     #[tokio::test]
     async fn seeks_match_the_blocking_stream() {
         for name in AUDIO.iter().chain(&VIDEO) {
-            for (time, accuracy) in [
-                (Duration::from_millis(1_300), TimeAccuracy::Packet),
-                (Duration::from_millis(600), TimeAccuracy::Fragment),
+            for (time, keyframe) in [
+                (Duration::from_millis(1_300), false),
+                (Duration::from_millis(600), true),
             ] {
+                let context = format!("{name} {time:?} keyframe {keyframe}");
                 let mut stream = media_stream(name).await;
                 let mut blocking = super::media_stream(name);
+                let seeked = match keyframe {
+                    false => stream.seek_time(time).await,
+                    true => stream.seek_keyframe(time).await,
+                };
                 assert_eq!(
-                    stream.seek_time(time, accuracy).await.unwrap(),
-                    blocking.seek_time(time, accuracy).unwrap(),
-                    "{name} {time:?} {accuracy:?}"
+                    seeked.unwrap(),
+                    seek(&mut blocking, time, keyframe),
+                    "{context}"
                 );
                 let packets: Vec<MediaPacket> = stream.map(Result::unwrap).collect().await;
                 let expected: Vec<MediaPacket> = blocking.map(Result::unwrap).collect();
-                assert_eq!(packets, expected, "{name} {time:?} {accuracy:?}");
+                assert_eq!(packets, expected, "{context}");
             }
         }
     }
@@ -714,7 +732,7 @@ mod nonblocking {
     #[tokio::test]
     async fn config_record_style_matches_the_blocking_stream() {
         for name in AUDIO.iter().chain(&VIDEO) {
-            let stream = nonblocking::PacketStream::new(async_fragment_stream(name).await)
+            let stream = nonblocking::packet::PacketStream::new(async_fragment_stream(name).await)
                 .await
                 .unwrap()
                 .into_media_stream_for(DecoderStyle::ConfigRecord)
@@ -735,8 +753,8 @@ mod nonblocking {
     }
 
     /// A cache that fetches through fresh [`Fixtures`], for the async API.
-    fn fixtures_cache() -> Arc<nonblocking::FragmentCache> {
-        Arc::new(nonblocking::FragmentCache::new(Arc::new(
+    fn fixtures_cache() -> Arc<nonblocking::fragment::FragmentCache> {
+        Arc::new(nonblocking::fragment::FragmentCache::new(Arc::new(
             Fixtures::default(),
         )))
     }
@@ -779,19 +797,20 @@ mod nonblocking {
     #[tokio::test]
     async fn open_at_matches_the_blocking_open_at() {
         for name in AUDIO.iter().chain(&VIDEO) {
-            for (time, accuracy) in [
-                (Duration::from_millis(1_010), TimeAccuracy::Packet),
-                (Duration::from_millis(600), TimeAccuracy::Fragment),
+            for (time, keyframe) in [
+                (Duration::from_millis(1_010), false),
+                (Duration::from_millis(600), true),
             ] {
-                let context = format!("{name} {time:?} {accuracy:?}");
-                let (stream, seeked) = manifest(name)
-                    .media_stream("0")
-                    .cache(fixtures_cache())
-                    .open_at(time, accuracy)
-                    .await
-                    .unwrap();
+                let context = format!("{name} {time:?} keyframe {keyframe}");
+                let manifest = manifest(name);
+                let builder = manifest.media_stream("0").cache(fixtures_cache());
+                let (stream, seeked) = match keyframe {
+                    false => builder.open_at(time).await,
+                    true => builder.open_at_keyframe(time).await,
+                }
+                .unwrap();
                 let (expected, expected_seeked) =
-                    built(name, |builder| builder.open_at(time, accuracy).unwrap());
+                    built(name, |builder| open_at(builder, time, keyframe));
                 assert_eq!(seeked, expected_seeked, "{context}");
                 assert_same_stream(&context, stream, expected).await;
             }
@@ -823,7 +842,7 @@ mod nonblocking {
 
     #[tokio::test]
     async fn mismatched_formats_are_refused() {
-        let packets = nonblocking::PacketStream::new(async_fragment_stream("h264").await)
+        let packets = nonblocking::packet::PacketStream::new(async_fragment_stream("h264").await)
             .await
             .unwrap();
         assert!(matches!(
@@ -1100,13 +1119,14 @@ mod ffmpeg {
             let all: Vec<MediaPacket> = media_stream(name).map(Result::unwrap).collect();
             let timescale = all[0].timescale;
 
-            // A packet-accurate seek to every frame's presentation time.
-            for target in all.iter().filter(|packet| packet.pts >= 0) {
+            // An exact and a keyframe seek to every frame's presentation time.
+            let targets = all.iter().filter(|packet| packet.pts >= 0);
+            for (target, keyframe) in targets.flat_map(|target| [(target, false), (target, true)]) {
                 let time = Duration::from_secs_f64(target.pts as f64 / f64::from(timescale));
-                let context = format!("{name} seeking to {}", target.pts);
+                let context = format!("{name} seeking to {} keyframe {keyframe}", target.pts);
                 let mut stream = media_stream(name);
                 let initialization = stream.initialization().data.clone();
-                let seeked = stream.seek_time(time, TimeAccuracy::Packet).unwrap();
+                let seeked = seek(&mut stream, time, keyframe);
                 let rest: Vec<MediaPacket> = stream.map(Result::unwrap).collect();
                 let fed: Vec<&MediaPacket> = seeked.preroll.iter().chain(&rest).collect();
                 let (input_args, input) = feed(name, &initialization, &fed);
@@ -1119,7 +1139,7 @@ mod ffmpeg {
                 assert!(fed[0].keyframe, "{context}");
                 let shown = all
                     .iter()
-                    .filter(|packet| packet.pts >= seeked.discard_before)
+                    .filter(|packet| !seeked.discards(packet.pts, packet.duration))
                     .count();
                 assert!(
                     decoded.len() >= shown,

@@ -412,8 +412,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg(feature = "sync")]
     fn segment_base_index_becomes_ranged_fragments() {
-        use crate::fragment::{Fragments, MediaTimeline};
-        use crate::stream::FragmentCache;
+        use crate::fragment::{FragmentCache, Fragments, MediaTimeline};
         use std::io::Read;
         use std::sync::Arc;
 
@@ -455,7 +454,7 @@ pub(crate) mod tests {
         );
 
         let mut reader = manifest
-            .stream_with_cache("FLAC", Arc::new(FragmentCache::new(transport)))
+            .fragment_stream_with_cache("FLAC", Arc::new(FragmentCache::new(transport)))
             .unwrap();
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();

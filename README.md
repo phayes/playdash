@@ -15,7 +15,7 @@ playdash = "0.2"
 
 | Feature | Default | What it adds |
 |---|---|---|
-| `sync` | yes | The blocking API: `FragmentStream`, `PacketStream`, `MediaStream`, `FragmentCache` and `Transport`, fetching through ureq |
+| `sync` | yes | The blocking API: `MediaStream`, `fragment::FragmentStream`, `packet::PacketStream`, `FragmentCache` and `Transport`, fetching through ureq |
 | `async` | no | `playdash::nonblocking`: the same API, async, fetching through reqwest on tokio |
 | `rodio` | no | `DashSource`, a ready-to-play rodio source (implies `sync`) |
 | `encryption` | no | Common Encryption (`cenc`, `cbcs`) decryption with keys you supply |
@@ -23,7 +23,7 @@ playdash = "0.2"
 
 ## Streaming
 
-`DashManifest::stream` returns a `FragmentStream`, which downloads the representation in the
+`DashManifest::fragment_stream` returns a `playdash::fragment::FragmentStream`, which downloads the representation in the
 background. It is an `Iterator` of whole fragments, and it implements `std::io::Read` and
 `std::io::Seek` over the same bytes, so it can feed an MP4 demuxer or playback system. The two
 share one position: after a partial `read`, `next` yields the rest of that fragment.
@@ -36,12 +36,12 @@ use playdash::DashManifest;
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 
 // Whole fragments: the init segment, then every media segment.
-for fragment in manifest.stream("FLAC")? {
+for fragment in manifest.fragment_stream("FLAC")? {
     let bytes = fragment?;
 }
 
 // Bytes, for a demuxer.
-let mut stream = manifest.stream("FLAC")?;
+let mut stream = manifest.fragment_stream("FLAC")?;
 let mut mpeg_buffer = [0u8; 4096];
 stream.read(&mut mpeg_buffer)?;
 
@@ -57,19 +57,21 @@ for bytes.
 
 ## Packets
 
-`PacketStream` demuxes a `FragmentStream` into packets for your decoder, so you don't need an
+`playdash::packet::PacketStream` demuxes a `FragmentStream` into packets for your decoder, so you don't need an
 MP4 demuxer. It reads single-track representations, and `codec()` reports the codec (AAC, MP3, FLAC etc) with its decoder configuration. Packets come in decode order, timestamped in `timescale()` ticks.
 
 ```rust,ignore
 use std::time::Duration;
-use playdash::{DashManifest, PacketStream, TimeAccuracy};
+use playdash::packet::PacketStream;
+use playdash::DashManifest;
 
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
-let mut packets = PacketStream::new(manifest.stream("FLAC")?)?;
+let mut packets = PacketStream::new(manifest.fragment_stream("FLAC")?)?;
 let codec = packets.codec().clone();
 
-// The packet at 90 seconds, after its pre-roll.
-let seeked = packets.seek_time(Duration::from_secs(90), TimeAccuracy::Packet)?;
+// The packet at 90 seconds, after its pre-roll. `seek_keyframe` lands on the keyframe
+// before instead, with less to decode.
+let seeked = packets.seek_time(Duration::from_secs(90))?;
 for packet in seeked.preroll {
     decoder.decode(&packet.data)?; // output discarded
 }
@@ -101,29 +103,39 @@ you choose and run the decoder.
 
 ```rust,ignore
 use std::time::Duration;
-use playdash::{DashManifest, TimeAccuracy};
+use playdash::DashManifest;
 
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 let mut input = manifest.media_stream("video").open()?;
 decoder.configure(input.initialization())?;
 
 // Seeking converts the pre-roll too. Reconfigure the decoder after resetting it.
-let seeked = input.seek_time(Duration::from_secs(90), TimeAccuracy::Packet)?;
+let seeked = input.seek_time(Duration::from_secs(90))?;
 decoder.reset()?;
 decoder.configure(input.initialization())?;
-for packet in seeked.preroll {
+for packet in &seeked.preroll {
     decoder.decode(&packet.data)?; // output discarded
 }
 for packet in input {
-    decoder.decode(&packet?.data)?;
+    for frame in decoder.decode(&packet?.data)? {
+        // B-frames after the landing point can present before the time asked for.
+        if !seeked.discards(frame.pts, frame.duration) {
+            show(frame);
+        }
+    }
 }
 ```
 
-That is the `Elementary` style, the default: initialization followed by the packets is a
-valid elementary stream, as bitstream decoders such as dav1d, openh264 and libFLAC read.
-Decoders configured the way MP4 is, such as VideoToolbox, MediaCodec and WebCodecs, take
-H.264, HEVC and AV1 as MP4 stores them, with the `avcC`, `hvcC` or `av1C` record as
-initialization. Ask for that style, whatever the codec:
+For audio, drop `seeked.trim_start_of(&packet)` ticks from the start of each packet's
+output instead, which covers its encoder priming too. `seeked.landed_time()` gives where
+the seek landed as a `Duration`.
+
+That is the `Elementary` style, the default: for H.264, HEVC, AV1, FLAC, MP3 and PCM,
+initialization followed by the packets is a valid elementary stream, as bitstream decoders
+such as dav1d, openh264 and libFLAC read.
+Decoders configured the way MP4 is, such as VideoToolbox, take H.264, HEVC and AV1 as MP4
+stores them, with the `avcC`, `hvcC` or `av1C` record as initialization. `DecoderStyle`'s
+docs list the style common decoders take. Ask for that style, whatever the codec:
 
 ```rust,ignore
 use playdash::DecoderStyle;
@@ -139,7 +151,7 @@ Other codecs have one format for both styles. `format` asks for one particular
 
 ```rust,ignore
 use std::time::Duration;
-use playdash::{ContentKind, Retention, TimeAccuracy};
+use playdash::{ContentKind, Retention};
 
 let video = manifest.highest_bandwidth(ContentKind::Video).ok_or("no video")?;
 let (input, seeked) = manifest
@@ -148,11 +160,13 @@ let (input, seeked) = manifest
     .retention(Retention { behind: Some(Duration::from_secs(30)), ahead: Some(Duration::from_secs(60)) })
     .track(ContentKind::Video)     // or .track_id(1), for a representation with several tracks
     .preroll(Duration::from_millis(80))
-    .open_at(Duration::from_secs(90), TimeAccuracy::Packet)?;
+    .open_at(Duration::from_secs(90))?; // or .open_at_keyframe(..)
 // decode seeked.preroll, then the stream
 ```
 
-With the `encryption` feature, `.keys(keys)` decrypts through a cache of its own.
+With the `encryption` feature, `.keys(keys)` decrypts, adding the keys to the cache given or
+to a new one. A cache that already decrypts takes extra keys at any time; one without keys
+takes them only before any stream has used it.
 
 To work at a lower level, `PacketStream::into_media_stream`, `into_media_stream_for` and
 `into_media_stream_as` convert a `PacketStream` you have built, and the per-codec adapters
@@ -168,8 +182,9 @@ cargo run --example save_flac -- MANIFEST_URL output.flac
 ## Async streaming
 
 The `async` feature adds `playdash::nonblocking`, the same API for applications on a tokio
-runtime: `DashManifest`, `FragmentStream`, `PacketStream`, `MediaStream`,
-`FragmentCache` and `Transport`.
+runtime, laid out the same way: `DashManifest` and `MediaStream` in `nonblocking`,
+`FragmentStream`, `FragmentCache` and `Transport` in `nonblocking::fragment`, and
+`PacketStream` in `nonblocking::packet`.
 
 ```toml
 [dependencies]
@@ -185,13 +200,13 @@ use tokio::io::AsyncReadExt;
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd").await?;
 
 // Whole fragments: the init segment, then every media segment.
-let mut stream = manifest.stream("FLAC").await?;
+let mut stream = manifest.fragment_stream("FLAC").await?;
 while let Some(fragment) = stream.next().await {
     let bytes = fragment?;
 }
 
 // Bytes, from 90 seconds in.
-let mut stream = manifest.stream("FLAC").await?;
+let mut stream = manifest.fragment_stream("FLAC").await?;
 stream.seek_time(Duration::from_secs(90)).await?;
 let mut buffer = [0u8; 4096];
 stream.read(&mut buffer).await?;
@@ -220,7 +235,7 @@ again. A fragment another stream sharing the cache still keeps is never dropped.
 use std::time::Duration;
 use playdash::Retention;
 
-let stream = manifest.stream("1080p")?.with_retention(Retention {
+let stream = manifest.fragment_stream("1080p")?.with_retention(Retention {
     behind: Some(Duration::from_secs(30)),
     ahead: Some(Duration::from_secs(60)),
 });

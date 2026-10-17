@@ -10,8 +10,13 @@
   - `codec()` returns a `Codec`: AAC (including HE-AAC), MP3, AC-3, E-AC-3, FLAC, Opus,
     PCM, H.264, HEVC, AV1 or VP9 with their decoder configuration, or `Codec::Unknown`.
     The configuration types, such as `AacConfig`, are in `playdash::codec`.
-  - `seek_time` returns a `Seeked`, holding the pre-roll packets to decode before the
-    stream's next packet. Pre-roll comes from `with_preroll`, the media's `roll` and `prol`
+  - `seek_time` lands on the packet presenting at a time, and `seek_keyframe` on the last
+    keyframe at or before it, with less to decode. Both return a `PacketSeeked`, holding the
+    pre-roll packets to decode before the stream's next packet, where it landed, and the
+    time before which to discard decoded output. Its `landed_time` and
+    `discard_before_time` give those as `Duration`s, `discards` says whether a decoded
+    frame is before it, and `trim_start_of` how much of an audio packet's output to drop.
+    Pre-roll comes from `with_preroll`, the media's `roll` and `prol`
     sample groups, or `Codec::default_preroll`. A seek reads on into the next fragment when
     a timeline that only approximates fragment boundaries puts the time past the end of the
     fragment it names. Leading pictures that cannot be decoded from where decoding starts,
@@ -22,19 +27,20 @@
   `PacketStream::into_media_stream`, `into_media_stream_for` or `into_media_stream_as`.
   It yields `MediaPacket`s with the same timing as `Packet`s,
   and `initialization()` gives the `DecoderInitialization` to configure a decoder with: a
-  `DecoderFormat`, its initialization bytes and `DecoderParameters`. `seek_time` returns a
-  `MediaSeeked` whose pre-roll is converted the same way.
+  `DecoderFormat`, its initialization bytes and `DecoderParameters`. `seek_time` and
+  `seek_keyframe` return a `Seeked` whose pre-roll is converted the same way, with
+  the same methods as `PacketSeeked`.
   - `DecoderStyle` chooses the kind of format for any codec: `Elementary`, the default,
     for bitstream decoders, or `ConfigRecord` for decoders configured the way MP4 is, such
-    as VideoToolbox, MediaCodec and WebCodecs.
+    as VideoToolbox. `DecoderStyle`'s docs list the style common decoders take.
   - H.264 and HEVC become Annex B, with their parameter sets as initialization, or, as
     `DecoderFormat::H264LengthPrefixed` and `HevcLengthPrefixed`, stay length-prefixed, with
     the `avcC` or `hvcC` record as initialization. Either way, `DecoderParameters::Video`
     also lists the VPS, SPS and PPS units unframed, as MediaCodec's `csd-0` and `csd-1`
     and VideoToolbox's parameter-set API take them.
   - AV1 becomes low-overhead OBUs with temporal delimiters, with av1C's configuration
-    OBUs as initialization, or, as `DecoderFormat::Av1Samples`, stays as stored, with the
-    `av1C` record.
+    OBUs as initialization, or, as `DecoderFormat::Av1Samples`, stays as stored but with a
+    size field on every OBU, with the `av1C` record.
   - AAC is raw access units with the AudioSpecificConfig, or, as `DecoderFormat::AacAdts`,
     each access unit after an ADTS header, for streams ADTS can describe; FLAC is frames with a `fLaC`
     stream header, and the bare STREAMINFO in `DecoderParameters::Flac`; Opus is raw
@@ -43,9 +49,10 @@
   - Unknown codecs fail with `Error::UnsupportedDecoderInput`.
   - `DashManifest::media_stream` returns a `MediaStreamBuilder`, which opens a
     representation as a `MediaStream` in one call. Its options are `cache`, `keys` (with
-    the `encryption` feature), `retention`, `track` (by `ContentKind`) or `track_id`,
-    `preroll`, and `style` or `format`. Finish it with `open`, or with `open_at`, which also
-    seeks and returns the `MediaSeeked`.
+    the `encryption` feature, added to the given cache or a new one), `retention`, `track`
+    (by `ContentKind`) or `track_id`,
+    `preroll`, and `style` or `format`. Finish it with `open`, or with `open_at` or
+    `open_at_keyframe`, which also seek and return the `Seeked`.
   - `playdash::decoder` has the per-codec adapters, `H264Adapter`, `HevcAdapter`,
     `Av1Adapter`, `AacAdapter` and `PassthroughAdapter`, which convert packets one at a
     time.
@@ -55,6 +62,8 @@
 - `FragmentStream::tracks` (blocking and async): the representation's tracks as `Track`s,
   each with its ID, kind, codec and timescale, read from the initialization fragment.
   `PacketStream::with_track` reads one of them, as a muxed representation needs.
+- `FragmentCache::add_keys` (blocking and async, with the `encryption` feature): adds
+  content keys to a cache that already decrypts, or to one no stream has used yet.
 - `FragmentStream::media_fragment` (blocking and async): fetches any of the stream's media
   fragments without moving its position or retention window.
 - `MediaTimeline::origin`: the media time at the start of the first media fragment, from
@@ -70,6 +79,17 @@
   the requested time to see how far back it landed.
 - `FragmentStream::seek_time_coarse` is now `seek_time` (blocking and async).
 - `MediaTimeline` has a new public field, `origin`.
+- The crate root now holds the `MediaStream` API and what it takes. Fragment streaming
+  moves to `playdash::fragment`: `Fragment`, `Fragments`, `MediaTimeline`,
+  `FragmentStream`, `Position` and `TimePosition`, with `FragmentCache` and `Transport`
+  there and at the root. Packets move to `playdash::packet`: `PacketStream`, `Packet`,
+  `PacketSeeked` and `Track`.
+- `playdash::nonblocking` is laid out the same way: `DashManifest`, `MediaStream` and
+  `MediaStreamBuilder` in `nonblocking`, `FragmentStream`, `FragmentCache` and `Transport`
+  in `nonblocking::fragment`, and `PacketStream` in `nonblocking::packet`.
+- `DashManifest::stream`, `stream_with_cache`, `stream_at` and `stream_at_with_cache` are
+  now `fragment_stream`, `fragment_stream_with_cache`, `fragment_stream_at` and
+  `fragment_stream_at_with_cache` (blocking and async).
 
 ### Fixed
 

@@ -1,19 +1,19 @@
 //! A representation's packets: the blocking `PacketStream` over a `FragmentStream`.
 
-use crate::buffer::BufferHandle;
+use super::{Packet, PacketSeeked};
 use crate::decoder::{Choice, DecoderFormat, DecoderStyle, MediaStream};
 use crate::error::Error;
+use crate::fragment::FragmentStream;
+use crate::fragment::buffer::BufferHandle;
+use crate::fragment::schedule::{Part, PartBody};
 use crate::mp4::codec::Codec;
-use crate::mp4::demux::{Demuxer, Loaded, Split};
-use crate::mp4::packet::{Packet, Seeked};
-use crate::schedule::{Part, PartBody, TimeAccuracy};
-use crate::stream::FragmentStream;
+use crate::mp4::demux::{Demuxer, Landing, Loaded, Split};
 use std::time::Duration;
 
 /// A representation's coded frames, demuxed from the fragmented MP4 a
 /// [`FragmentStream`] downloads: an [`Iterator`] of [`Packet`]s in decode order, with
 /// time seeking. The blocking counterpart of the `async` feature's
-/// `nonblocking::PacketStream`.
+/// `nonblocking::packet::PacketStream`.
 ///
 /// It reads one track: a representation's only one, or one chosen from
 /// [`FragmentStream::tracks`]. Protected media must come through a
@@ -25,15 +25,16 @@ use std::time::Duration;
 ///
 /// ```no_run
 /// use std::time::Duration;
-/// use playdash::{DashManifest, PacketStream, TimeAccuracy};
+/// use playdash::packet::PacketStream;
+/// use playdash::DashManifest;
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
-/// let mut packets = PacketStream::new(manifest.stream("audio")?)?;
+/// let mut packets = PacketStream::new(manifest.fragment_stream("audio")?)?;
 /// println!("{:?}", packets.codec());
 ///
 /// // Prime a decoder with the pre-roll, then decode from the landing point.
-/// let seeked = packets.seek_time(Duration::from_secs(30), TimeAccuracy::Packet)?;
+/// let seeked = packets.seek_time(Duration::from_secs(30))?;
 /// for packet in seeked.preroll {
 ///     # let _ = packet;
 ///     // decode, and discard the output
@@ -139,17 +140,35 @@ impl PacketStream {
     /// Seeks to `time` on the representation's media timeline, and returns the
     /// packets to decode before the stream's next one.
     ///
-    /// With [`TimeAccuracy::Packet`], the stream's next packet is the first one in
-    /// decode order that presents at or after `time`. Pre-roll may reach into earlier
-    /// fragments, which are fetched without moving the underlying stream's retention
-    /// window. With [`TimeAccuracy::Fragment`], the next packet is the first one of
-    /// the fragment containing `time` past that fragment's own pre-roll, and earlier
-    /// fragments are only fetched if the fragment does not start at a keyframe.
+    /// The stream's next packet is the first one in decode order that presents at or
+    /// after `time`. The pre-roll runs from the keyframe decoding starts at, which may be
+    /// in earlier fragments; those are fetched without moving the underlying stream's
+    /// retention window.
     ///
     /// Fails like [`FragmentStream::seek_time`], and with the errors of fetching
     /// and parsing the fragments it reads.
-    pub fn seek_time(&mut self, time: Duration, accuracy: TimeAccuracy) -> Result<Seeked, Error> {
-        let range = self.demuxer.seek_range(time, accuracy)?;
+    pub fn seek_time(&mut self, time: Duration) -> Result<PacketSeeked, Error> {
+        self.seek(time, Landing::Exact)
+    }
+
+    /// Seeks to the last keyframe at or before `time` on the representation's media
+    /// timeline, and returns the packets to decode before the stream's next one.
+    ///
+    /// The stream's next packet is that keyframe, or for a codec with pre-roll, the
+    /// first packet past the pre-roll from it. The returned [`PacketSeeked::landed`] is at or
+    /// before `time`, by up to the keyframe interval, or at the first packet for a
+    /// `time` before it. The pre-roll holds only the
+    /// codec's own, unless the keyframe's leading pictures would be shown, when decoding
+    /// starts at the keyframe before.
+    ///
+    /// Fails like [`Self::seek_time`].
+    pub fn seek_keyframe(&mut self, time: Duration) -> Result<PacketSeeked, Error> {
+        self.seek(time, Landing::Keyframe)
+    }
+
+    /// Seeks to `time`, landing as `landing` says.
+    fn seek(&mut self, time: Duration, landing: Landing) -> Result<PacketSeeked, Error> {
+        let range = self.demuxer.seek_range(time)?;
         let first = self.fragments.first_index();
 
         // The fragment containing `time`, where the stream then carries on.
@@ -177,10 +196,7 @@ impl PacketStream {
         loop {
             let earliest = loaded[0].index();
             let at_first = earliest <= first;
-            match self
-                .demuxer
-                .seek(time, accuracy, &loaded, at_first, at_last)
-            {
+            match self.demuxer.seek(time, landing, &loaded, at_first, at_last) {
                 Split::Done(seeked) => {
                     self.failed = false;
                     return Ok(seeked);

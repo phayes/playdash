@@ -3,11 +3,11 @@
 
 use super::{
     AacAdapter, Av1Adapter, DecoderFormat, DecoderInitialization, DecoderStyle, H264Adapter,
-    HevcAdapter, MediaPacket, MediaSeeked, PassthroughAdapter, unsupported_format,
+    HevcAdapter, MediaPacket, PassthroughAdapter, Seeked, unsupported_format,
 };
 use crate::error::Error;
 use crate::mp4::codec::Codec;
-use crate::mp4::packet::{Packet, Seeked};
+use crate::mp4::packet::{Packet, PacketSeeked};
 
 /// What a media stream was asked to produce.
 #[derive(Clone, Copy, Debug)]
@@ -101,21 +101,23 @@ impl Adapter {
     }
 
     /// `seeked` with its pre-roll converted.
-    pub(crate) fn seeked(&self, seeked: Seeked) -> Result<MediaSeeked, Error> {
-        let Seeked {
+    pub(crate) fn seeked(&self, seeked: PacketSeeked) -> Result<Seeked, Error> {
+        let PacketSeeked {
             requested,
             landed,
             discard_before,
+            timescale,
             preroll,
         } = seeked;
         let preroll = preroll
             .into_iter()
             .map(|packet| self.convert(packet))
             .collect::<Result<_, _>>()?;
-        Ok(MediaSeeked {
+        Ok(Seeked {
             requested,
             landed,
             discard_before,
+            timescale,
             preroll,
         })
     }

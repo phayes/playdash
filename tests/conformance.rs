@@ -196,9 +196,11 @@ fn check_fragments(manifest: &DashManifest) -> Checked {
 mod stream {
     use super::{Checked, Entry, TestType, check_fragments, check_ids, index, manifests, parse};
     use crate::common::{self, Probe};
+    use playdash::fragment::{Fragment, FragmentStream};
+    use playdash::packet::{Packet, PacketStream, Track};
     use playdash::{
-        Bytes, ContentKind, DashManifest, Error, Fragment, FragmentCache, FragmentStream, Packet,
-        PacketStream, Representation, Retention, TimeAccuracy, Track, Transport,
+        Bytes, ContentKind, DashManifest, Error, FragmentCache, Representation, Retention,
+        Transport,
     };
     use std::panic::{self, AssertUnwindSafe};
     use std::path::{Path, PathBuf};
@@ -305,7 +307,7 @@ mod stream {
         let id = representation.id;
         let open = || -> Result<FragmentStream, Error> {
             Ok(manifest
-                .stream_with_cache(id, cache.clone())?
+                .fragment_stream_with_cache(id, cache.clone())?
                 .with_retention(Retention {
                     behind: Some(Duration::ZERO),
                     ahead: Some(Duration::ZERO),
@@ -390,7 +392,7 @@ mod stream {
 
         // A seek to the middle.
         let mut stream = PacketStream::with_track(open()?, track.id)?;
-        let seeked = stream.seek_time(seek, TimeAccuracy::Packet)?;
+        let seeked = stream.seek_time(seek)?;
         let at = ticks(seek, track.timescale);
         assert_eq!(seeked.discard_before, at, "{context} seek discard_before");
         let after: Vec<Packet> = stream.take(AFTER_SEEK).collect::<Result<_, _>>()?;

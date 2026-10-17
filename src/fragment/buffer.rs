@@ -1,6 +1,6 @@
 //! Download progress of a DASH stream, by fragment, byte and media time.
 
-use crate::store::{CacheListener, FragmentData, Store};
+use super::store::{CacheListener, FragmentData, Store};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::Range;

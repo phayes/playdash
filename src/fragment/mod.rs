@@ -1,5 +1,30 @@
-//! Fragments and media timing: what a representation is made of, independent of how it is
-//! fetched.
+//! A representation's fragments: what it is made of and its media timing, and with the
+//! `sync` feature, the `FragmentStream` that downloads them and the `FragmentCache` and
+//! `Transport` it fetches through.
+
+#[cfg(any(feature = "sync", feature = "async"))]
+pub(crate) mod buffer;
+#[cfg(feature = "sync")]
+mod cache;
+#[cfg(feature = "sync")]
+mod manifest;
+#[cfg(any(feature = "sync", feature = "async"))]
+pub(crate) mod schedule;
+#[cfg(any(feature = "sync", feature = "async"))]
+pub(crate) mod store;
+#[cfg(feature = "sync")]
+mod stream;
+#[cfg(feature = "sync")]
+pub(crate) mod transport;
+
+#[cfg(feature = "sync")]
+pub use cache::FragmentCache;
+#[cfg(any(feature = "sync", feature = "async"))]
+pub use schedule::{Position, TimePosition};
+#[cfg(feature = "sync")]
+pub use stream::FragmentStream;
+#[cfg(feature = "sync")]
+pub use transport::Transport;
 
 use crate::error::Error;
 use serde::{Deserialize, Serialize};
@@ -16,7 +41,7 @@ use std::time::Duration;
 /// # Examples
 ///
 /// ```
-/// use playdash::MediaTimeline;
+/// use playdash::fragment::MediaTimeline;
 ///
 /// let timeline = MediaTimeline {
 ///     timescale: 1_000,
@@ -80,7 +105,7 @@ impl MediaTimeline {
     ///
     /// ```
     /// use std::time::Duration;
-    /// use playdash::MediaTimeline;
+    /// use playdash::fragment::MediaTimeline;
     ///
     /// let timeline = MediaTimeline {
     ///     timescale: 1_000,
@@ -155,7 +180,7 @@ pub(crate) fn slice_range<'a>(body: &'a [u8], range: &RangeInclusive<u64>) -> Op
 /// # Examples
 ///
 /// ```
-/// use playdash::Fragment;
+/// use playdash::fragment::Fragment;
 ///
 /// let whole = Fragment::new("https://media.example/init.mp4");
 /// assert_eq!(whole.known_size(), None);
@@ -225,7 +250,7 @@ impl fmt::Display for Fragment {
 /// # Examples
 ///
 /// ```
-/// use playdash::{Fragment, Fragments};
+/// use playdash::fragment::{Fragment, Fragments};
 ///
 /// let fragments = Fragments::new(
 ///     "https://media.example/init.mp4",

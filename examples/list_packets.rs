@@ -1,12 +1,12 @@
 //! Prints a representation's codec and packets, optionally from a seek.
 //!
 //! ```text
-//! cargo run --example list_packets -- [--id FORMAT] [--seek SECONDS] [--fragment] MANIFEST_URL
+//! cargo run --example list_packets -- [--id FORMAT] [--seek SECONDS] [--keyframe] MANIFEST_URL
 //! ```
 //!
 //! Without `--id` the manifest's first representation is read. `--seek` seeks to the
-//! packet at that time, or with `--fragment` to the start of its fragment, and lists the
-//! pre-roll packets first. For example:
+//! packet at that time, or with `--keyframe` to the last keyframe at or before it, and
+//! lists the pre-roll packets first. For example:
 //!
 //! ```text
 //! cargo run --example list_packets -- --id bbb_a64k --seek 30 https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd
@@ -15,7 +15,8 @@
 use std::error::Error;
 use std::time::Duration;
 
-use playdash::{DashManifest, Packet, PacketStream, TimeAccuracy};
+use playdash::DashManifest;
+use playdash::packet::{Packet, PacketStream};
 
 fn main() {
     if let Err(error) = run() {
@@ -37,7 +38,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             .to_owned(),
     };
 
-    let mut packets = PacketStream::new(manifest.stream(&id)?)?;
+    let mut packets = PacketStream::new(manifest.fragment_stream(&id)?)?;
     println!("representation {id}, track {}", packets.track_id());
     println!("codec {:?}", packets.codec());
     println!(
@@ -47,11 +48,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
 
     if let Some(seconds) = args.seek {
-        let accuracy = match args.fragment {
-            true => TimeAccuracy::Fragment,
-            false => TimeAccuracy::Packet,
+        let time = Duration::from_secs_f64(seconds);
+        let seeked = match args.keyframe {
+            true => packets.seek_keyframe(time)?,
+            false => packets.seek_time(time)?,
         };
-        let seeked = packets.seek_time(Duration::from_secs_f64(seconds), accuracy)?;
         println!(
             "seeked to {:?}: landed at {}, discarding output before {}",
             seeked.requested, seeked.landed, seeked.discard_before
@@ -85,12 +86,12 @@ struct Args {
     manifest: String,
     id: Option<String>,
     seek: Option<f64>,
-    fragment: bool,
+    keyframe: bool,
 }
 
 impl Args {
     fn parse() -> Result<Self, Box<dyn Error>> {
-        let (mut manifest, mut id, mut seek, mut fragment) = (None, None, None, false);
+        let (mut manifest, mut id, mut seek, mut keyframe) = (None, None, None, false);
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -99,7 +100,7 @@ impl Args {
                     let seconds = args.next().ok_or("--seek needs SECONDS")?;
                     seek = Some(seconds.parse().map_err(|_| "--seek needs SECONDS")?);
                 }
-                "--fragment" => fragment = true,
+                "--keyframe" => keyframe = true,
                 flag if flag.starts_with('-') => {
                     return Err(format!("unknown option: {flag}").into());
                 }
@@ -109,11 +110,11 @@ impl Args {
         }
         Ok(Self {
             manifest: manifest.ok_or(
-                "usage: list_packets [--id FORMAT] [--seek SECONDS] [--fragment] MANIFEST_URL",
+                "usage: list_packets [--id FORMAT] [--seek SECONDS] [--keyframe] MANIFEST_URL",
             )?,
             id,
             seek,
-            fragment,
+            keyframe,
         })
     }
 }

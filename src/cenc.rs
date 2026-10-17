@@ -90,6 +90,11 @@ impl ContentKeys {
         self.keys.is_empty()
     }
 
+    /// Adds every key of `other`, replacing any earlier key for the same KID.
+    pub(crate) fn merge(&mut self, other: ContentKeys) {
+        self.keys.extend(other.keys);
+    }
+
     fn key(&self, kid: &[u8; 16]) -> Result<&[u8; 16], Problem> {
         self.keys.get(kid).ok_or(Problem::MissingKey(*kid))
     }

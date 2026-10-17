@@ -249,7 +249,7 @@ fn stream_rejects_unknown_format() {
         </MPD>
     "#;
     let manifest = DashManifest::new(xml).unwrap();
-    let error = manifest.stream("FLAC").unwrap_err();
+    let error = manifest.fragment_stream("FLAC").unwrap_err();
     assert!(matches!(
         error,
         Error::DashManifestMissingRepresentation(id) if id == "FLAC"
@@ -812,8 +812,8 @@ fn segment_template_falls_back_to_initialization_element() {
 
 #[test]
 #[cfg(feature = "sync")]
-fn stream_with_cache_shares_cached_fragments() {
-    use crate::stream::{FragmentCache, Transport};
+fn fragment_stream_with_cache_shares_cached_fragments() {
+    use crate::fragment::{FragmentCache, Transport};
     use std::io::Read;
     use std::sync::{Arc, Mutex};
 
@@ -849,7 +849,9 @@ fn stream_with_cache_shares_cached_fragments() {
     let transport = Arc::new(Recording::default());
     let cache = Arc::new(FragmentCache::new(transport.clone()));
     for _ in 0..2 {
-        let mut reader = manifest.stream_with_cache("FLAC", cache.clone()).unwrap();
+        let mut reader = manifest
+            .fragment_stream_with_cache("FLAC", cache.clone())
+            .unwrap();
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"init12");

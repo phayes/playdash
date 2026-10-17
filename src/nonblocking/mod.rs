@@ -2,12 +2,11 @@
 //! through [`reqwest`] on a tokio runtime.
 //!
 //! This module mirrors the blocking API of the `sync` feature, with the same
-//! names: [`DashManifest`], [`FragmentStream`], [`FragmentCache`] and
-//! [`Transport`]. Here [`DashManifest::new_from_url`] and
-//! [`DashManifest::stream`] are awaited, and a [`FragmentStream`] is a
-//! [`futures_util::Stream`] of whole fragments and a tokio
-//! [`AsyncRead`](tokio::io::AsyncRead) and [`AsyncSeek`](tokio::io::AsyncSeek)
-//! view of the same bytes.
+//! names: [`DashManifest`] and [`MediaStream`] here, [`fragment::FragmentStream`],
+//! [`fragment::FragmentCache`] and [`fragment::Transport`] in [`fragment`], and
+//! [`packet::PacketStream`] in [`packet`]. Here [`DashManifest::new_from_url`] and
+//! [`MediaStreamBuilder::open`] are awaited, and a [`MediaStream`] is a
+//! [`futures_util::Stream`] of decoder-ready packets.
 //!
 //! # Examples
 //!
@@ -17,33 +16,29 @@
 //!
 //! # async fn example() -> Result<(), playdash::Error> {
 //! let manifest = DashManifest::new_from_url("https://media.example/stream.mpd").await?;
-//! let mut fragments = manifest.stream("audio").await?;
-//! while let Some(fragment) = fragments.next().await {
-//!     let bytes = fragment?;
-//!     // Append `bytes` to your buffer.
-//!     # drop(bytes);
+//! let mut input = manifest.media_stream("audio").open().await?;
+//! // configure the decoder with input.initialization()
+//! while let Some(packet) = input.next().await {
+//!     let packet = packet?;
+//!     // decode packet.data
+//!     # drop(packet);
 //! }
 //! # Ok(())
 //! # }
 //! ```
 
-mod cache;
-mod packet_stream;
-mod stream;
-mod transport;
+mod decoder;
+pub mod fragment;
+pub mod packet;
 
-pub use crate::decoder::nonblocking::{MediaStream, MediaStreamBuilder};
-pub use cache::FragmentCache;
-pub use packet_stream::PacketStream;
-pub use stream::FragmentStream;
-pub use transport::Transport;
+pub use decoder::{MediaStream, MediaStreamBuilder};
 
 use crate::error::Error;
 use crate::fragment::{Fragments, MediaTimeline};
 use crate::manifest::{ContentKind, Representation};
+use fragment::Transport;
 use reqwest::{Client, Response};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::OnceLock;
 
 /// A parsed MPEG-DASH manifest whose representations stream asynchronously:
 /// the async counterpart of the blocking
@@ -63,7 +58,7 @@ use std::time::Duration;
 /// let manifest = DashManifest::new(xml)?
 ///     .with_client(client)
 ///     .with_base_url("https://media.example/stream.mpd")?;
-/// let stream = manifest.stream("FLAC").await?;
+/// let stream = manifest.media_stream("FLAC").open().await?;
 /// # drop(stream);
 /// # Ok(())
 /// # }
@@ -147,67 +142,6 @@ impl DashManifest {
         }
     }
 
-    /// Opens a representation as a [`FragmentStream`]: a stream of its whole
-    /// fragments, and an async reader of them. The initialization fragment is
-    /// fetched before this returns.
-    ///
-    /// The representation is matched as by [`Self::representation`]. Call
-    /// [`FragmentStream::start_eager_head`] to discover fragment sizes in the
-    /// background, which can make byte seeking faster on servers that support
-    /// `HEAD`.
-    pub async fn stream(
-        &self,
-        representation_id: impl AsRef<str>,
-    ) -> Result<FragmentStream, Error> {
-        self.stream_with_cache(representation_id, Arc::new(self.new_cache()))
-            .await
-    }
-
-    /// Like [`Self::stream`], but fetches through `cache`.
-    ///
-    /// Pass clones of one [`FragmentCache`] to share pooled connections and
-    /// downloaded fragments between streams, such as a stream rebuilt after a
-    /// seek.
-    pub async fn stream_with_cache(
-        &self,
-        representation_id: impl AsRef<str>,
-        cache: Arc<FragmentCache>,
-    ) -> Result<FragmentStream, Error> {
-        let id = representation_id.as_ref();
-        let fragments = self.manifest.fragments(id)?;
-        let timeline = self.manifest.media_timeline(id)?;
-        FragmentStream::new_with_cache(fragments, Some(timeline), cache).await
-    }
-
-    /// Opens a representation as a [`FragmentStream`] that reads its
-    /// initialization fragment, then its media from the fragment covering
-    /// `time`, as a decoder starting there needs. Returns the stream and the
-    /// start of that fragment, at or before `time`.
-    ///
-    /// The stream reports and seeks by the representation's media time. See
-    /// [`FragmentStream::starting_at`].
-    pub async fn stream_at(
-        &self,
-        representation_id: impl AsRef<str>,
-        time: Duration,
-    ) -> Result<(FragmentStream, Duration), Error> {
-        self.stream_at_with_cache(representation_id, time, Arc::new(self.new_cache()))
-            .await
-    }
-
-    /// Like [`Self::stream_at`], but fetches through `cache`.
-    pub async fn stream_at_with_cache(
-        &self,
-        representation_id: impl AsRef<str>,
-        time: Duration,
-        cache: Arc<FragmentCache>,
-    ) -> Result<(FragmentStream, Duration), Error> {
-        let id = representation_id.as_ref();
-        let fragments = self.manifest.fragments(id)?;
-        let timeline = self.manifest.media_timeline(id)?;
-        FragmentStream::starting_at(fragments, timeline, time, cache).await
-    }
-
     /// Returns a builder of a representation's [`MediaStream`]: its track's packets in the
     /// form codec decoders read. Set options on the builder, then await
     /// [`MediaStreamBuilder::open`].
@@ -230,11 +164,6 @@ impl DashManifest {
     /// ```
     pub fn media_stream(&self, representation_id: impl AsRef<str>) -> MediaStreamBuilder<'_> {
         MediaStreamBuilder::new(self, representation_id.as_ref())
-    }
-
-    /// A new, empty cache that fetches through this manifest's client.
-    pub(crate) fn new_cache(&self) -> FragmentCache {
-        FragmentCache::new(Arc::new(self.client().clone()))
     }
 
     /// The URL the manifest was loaded from, if known.
@@ -335,12 +264,14 @@ pub(crate) mod tests {
     use super::*;
     use crate::fragment::{Fragment, parse_byte_range};
     use bytes::Bytes;
+    use fragment::FragmentStream;
     use futures_util::StreamExt;
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::ops::RangeInclusive;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// A test server's handler for one request, returning a status and a body.
     type Respond = dyn Fn(&str, Option<RangeInclusive<u64>>) -> (u16, Vec<u8>) + Send + Sync;
@@ -457,7 +388,7 @@ pub(crate) mod tests {
         // The stream reads the init, then the media past the index.
         let (init, media) = (&file[..838], &file[838 + index_len(&index_range)..]);
         let items: Vec<Bytes> = manifest
-            .stream("FLAC")
+            .fragment_stream("FLAC")
             .await
             .unwrap()
             .map(Result::unwrap)
@@ -467,7 +398,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn stream_opens_a_representation_through_the_given_client() {
+    async fn fragment_stream_opens_a_representation_through_the_given_client() {
         let (base, _) = serve(named());
         let xml = r#"<MPD><Period><AdaptationSet mimeType="audio/mp4">
             <Representation id="FLAC,24bit">
@@ -482,17 +413,17 @@ pub(crate) mod tests {
             .with_base_url(&format!("{base}/manifest.mpd"))
             .unwrap();
 
-        let mut stream = manifest.stream("FLAC").await.unwrap();
+        let mut stream = manifest.fragment_stream("FLAC").await.unwrap();
         assert_eq!(texts(&mut stream).await, ["init", "1", "2", "3"]);
 
         let (mut stream, start) = manifest
-            .stream_at("FLAC", Duration::from_millis(1_500))
+            .fragment_stream_at("FLAC", Duration::from_millis(1_500))
             .await
             .unwrap();
         assert_eq!(start, Duration::from_secs(1));
         assert_eq!(texts(&mut stream).await, ["init", "2", "3"]);
         assert!(matches!(
-            manifest.stream("AAC").await,
+            manifest.fragment_stream("AAC").await,
             Err(Error::DashManifestMissingRepresentation(id)) if id == "AAC"
         ));
     }

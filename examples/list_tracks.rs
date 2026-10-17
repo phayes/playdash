@@ -15,7 +15,8 @@
 use std::error::Error;
 use std::time::Duration;
 
-use playdash::{Codec, DashManifest, Retention, Track};
+use playdash::packet::Track;
+use playdash::{Codec, DashManifest, Retention};
 use serde_json::{Value, json};
 
 fn main() {
@@ -54,7 +55,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 fn tracks(manifest: &DashManifest, id: &str) -> Result<Vec<Track>, Box<dyn Error>> {
     // Opening a stream fetches the initialization fragment. Keep its download of
     // media to the first fragment, which dropping the stream then abandons.
-    let stream = manifest.stream(id)?.with_retention(Retention {
+    let stream = manifest.fragment_stream(id)?.with_retention(Retention {
         behind: Some(Duration::ZERO),
         ahead: Some(Duration::ZERO),
     });

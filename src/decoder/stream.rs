@@ -3,18 +3,18 @@
 
 use super::adapter::Choice;
 use super::{
-    Adapter, DecoderFormat, DecoderInitialization, DecoderStyle, MediaPacket, MediaSeeked,
-    TrackChoice, track_of_kind,
+    Adapter, DecoderFormat, DecoderInitialization, DecoderStyle, MediaPacket, Seeked, TrackChoice,
+    track_of_kind,
 };
-use crate::buffer::BufferHandle;
 #[cfg(feature = "encryption")]
 use crate::cenc::ContentKeys;
 use crate::error::Error;
+use crate::fragment::FragmentCache;
+use crate::fragment::buffer::BufferHandle;
+use crate::fragment::schedule::Retention;
 use crate::manifest::{ContentKind, DashManifest};
 use crate::mp4::codec::Codec;
-use crate::packet_stream::PacketStream;
-use crate::schedule::{Retention, TimeAccuracy};
-use crate::stream::FragmentCache;
+use crate::packet::{PacketSeeked, PacketStream};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ use std::time::Duration;
 ///
 /// ```no_run
 /// use std::time::Duration;
-/// use playdash::{DashManifest, TimeAccuracy};
+/// use playdash::DashManifest;
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
@@ -42,7 +42,7 @@ use std::time::Duration;
 /// # let _ = initialization;
 ///
 /// // After a seek, reset and reconfigure the decoder, then prime it with the pre-roll.
-/// let seeked = input.seek_time(Duration::from_secs(30), TimeAccuracy::Packet)?;
+/// let seeked = input.seek_time(Duration::from_secs(30))?;
 /// for packet in seeked.preroll {
 ///     # let _ = packet;
 ///     // decode packet.data, and discard the output
@@ -102,7 +102,7 @@ impl MediaStream {
     }
 
     /// A handle reporting how much of the representation the cache holds; see
-    /// [`FragmentStream::buffer`](crate::FragmentStream::buffer).
+    /// [`FragmentStream::buffer`](crate::fragment::FragmentStream::buffer).
     pub fn buffer(&self) -> Option<BufferHandle> {
         self.packets.buffer()
     }
@@ -114,13 +114,24 @@ impl MediaStream {
     /// Fails like [`PacketStream::seek_time`], and with [`Error::MalformedDecoderInput`]
     /// if a pre-roll packet cannot be converted, after which iteration yields nothing
     /// until a seek succeeds.
-    pub fn seek_time(
-        &mut self,
-        time: Duration,
-        accuracy: TimeAccuracy,
-    ) -> Result<MediaSeeked, Error> {
-        let seeked = self.packets.seek_time(time, accuracy)?;
-        let seeked = self.adapter.seeked(seeked);
+    pub fn seek_time(&mut self, time: Duration) -> Result<Seeked, Error> {
+        let seeked = self.packets.seek_time(time);
+        self.converted(seeked)
+    }
+
+    /// Seeks to the last keyframe at or before `time` on the representation's media
+    /// timeline, and returns the packets to decode before the stream's next one. Lands
+    /// where [`PacketStream::seek_keyframe`] does.
+    ///
+    /// Fails like [`Self::seek_time`].
+    pub fn seek_keyframe(&mut self, time: Duration) -> Result<Seeked, Error> {
+        let seeked = self.packets.seek_keyframe(time);
+        self.converted(seeked)
+    }
+
+    /// `seeked`, the result of a seek of the packets, with its pre-roll converted.
+    fn converted(&mut self, seeked: Result<PacketSeeked, Error>) -> Result<Seeked, Error> {
+        let seeked = self.adapter.seeked(seeked?);
         self.failed = seeked.is_err();
         seeked
     }
@@ -154,7 +165,7 @@ impl Iterator for MediaStream {
 ///
 /// ```no_run
 /// use std::time::Duration;
-/// use playdash::{ContentKind, DashManifest, DecoderStyle, Retention, TimeAccuracy};
+/// use playdash::{ContentKind, DashManifest, DecoderStyle, Retention};
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
@@ -168,7 +179,7 @@ impl Iterator for MediaStream {
 ///         ahead: Some(Duration::from_secs(60)),
 ///     })
 ///     .style(DecoderStyle::ConfigRecord)
-///     .open_at(Duration::from_secs(90), TimeAccuracy::Packet)?;
+///     .open_at(Duration::from_secs(90))?;
 /// // configure the decoder with input.initialization(), then decode seeked.preroll
 /// # let _ = (input, seeked);
 /// # Ok(())
@@ -210,11 +221,11 @@ impl<'a> MediaStreamBuilder<'a> {
         self
     }
 
-    /// Decrypts `cenc` or `cbcs` Common Encryption with `keys`, through a new
-    /// [`FragmentCache`].
+    /// Decrypts `cenc` or `cbcs` Common Encryption with `keys`. With [`Self::cache`], adds
+    /// them to that cache as [`FragmentCache::add_keys`] does.
     ///
-    /// [`Self::open`] fails with [`Error::Initialization`] if [`Self::cache`] is also
-    /// set; give that cache the keys with [`FragmentCache::with_keys`] instead.
+    /// [`Self::open`] fails with [`Error::Initialization`] if that cache has no keys yet
+    /// and a reader has already used it.
     #[cfg(feature = "encryption")]
     pub fn keys(mut self, keys: ContentKeys) -> Self {
         self.keys = Some(keys);
@@ -222,7 +233,8 @@ impl<'a> MediaStreamBuilder<'a> {
     }
 
     /// Keeps and downloads only as much of the representation around the position as
-    /// `retention` says. See [`FragmentStream::with_retention`](crate::FragmentStream::with_retention).
+    /// `retention` says. See
+    /// [`FragmentStream::with_retention`](crate::fragment::FragmentStream::with_retention).
     pub fn retention(mut self, retention: Retention) -> Self {
         self.retention = Some(retention);
         self
@@ -239,7 +251,7 @@ impl<'a> MediaStreamBuilder<'a> {
     }
 
     /// Reads track `track_id`, one of
-    /// [`FragmentStream::tracks`](crate::FragmentStream::tracks). Replaces any
+    /// [`FragmentStream::tracks`](crate::fragment::FragmentStream::tracks). Replaces any
     /// [`Self::track`].
     ///
     /// [`Self::open`] fails with [`Error::Initialization`] if the representation has no
@@ -275,16 +287,16 @@ impl<'a> MediaStreamBuilder<'a> {
     /// Opens the representation as a [`MediaStream`]. Fetches its initialization fragment
     /// before returning.
     ///
-    /// Fails like [`DashManifest::stream`], [`PacketStream::new`] and
-    /// [`PacketStream::into_media_stream`]. Fails with [`Error::Initialization`] if both
-    /// a cache and content keys are set, or the representation has no track that
-    /// [`Self::track`] or [`Self::track_id`] asks for.
+    /// Fails like [`DashManifest::fragment_stream`], [`PacketStream::new`] and
+    /// [`PacketStream::into_media_stream`]. Fails with [`Error::Initialization`] if
+    /// [`Self::keys`] cannot be added to the cache, or the representation has no track
+    /// that [`Self::track`] or [`Self::track_id`] asks for.
     pub fn open(mut self) -> Result<MediaStream, Error> {
         // The representation's fragments.
         let cache = self.take_cache()?;
         let mut fragments = self
             .manifest
-            .stream_with_cache(&self.representation_id, cache)?;
+            .fragment_stream_with_cache(&self.representation_id, cache)?;
         if let Some(retention) = self.retention {
             fragments = fragments.with_retention(retention);
         }
@@ -309,30 +321,30 @@ impl<'a> MediaStreamBuilder<'a> {
     /// packets to decode before its next one, as [`MediaStream::seek_time`] does.
     ///
     /// Fails like [`Self::open`] and [`MediaStream::seek_time`].
-    pub fn open_at(
-        self,
-        time: Duration,
-        accuracy: TimeAccuracy,
-    ) -> Result<(MediaStream, MediaSeeked), Error> {
+    pub fn open_at(self, time: Duration) -> Result<(MediaStream, Seeked), Error> {
         let mut stream = self.open()?;
-        let seeked = stream.seek_time(time, accuracy)?;
+        let seeked = stream.seek_time(time)?;
         Ok((stream, seeked))
     }
 
-    /// The cache to fetch through: the one given, or a new one that decrypts with any
-    /// keys given.
+    /// Opens the representation as a [`MediaStream`] seeked to the last keyframe at or
+    /// before `time`, and returns the packets to decode before its next one, as
+    /// [`MediaStream::seek_keyframe`] does.
+    ///
+    /// Fails like [`Self::open`] and [`MediaStream::seek_keyframe`].
+    pub fn open_at_keyframe(self, time: Duration) -> Result<(MediaStream, Seeked), Error> {
+        let mut stream = self.open()?;
+        let seeked = stream.seek_keyframe(time)?;
+        Ok((stream, seeked))
+    }
+
+    /// The cache to fetch through: the one given, or a new one, with any keys given added.
     fn take_cache(&mut self) -> Result<Arc<FragmentCache>, Error> {
+        let cache = self.cache.take().unwrap_or_default();
         #[cfg(feature = "encryption")]
         if let Some(keys) = self.keys.take() {
-            if self.cache.is_some() {
-                return Err(Error::Initialization(
-                    "a media stream takes either a cache or content keys; give the cache \
-                     the keys with FragmentCache::with_keys"
-                        .to_owned(),
-                ));
-            }
-            return Ok(Arc::new(FragmentCache::default().with_keys(keys)));
+            cache.add_keys(keys)?;
         }
-        Ok(self.cache.take().unwrap_or_default())
+        Ok(cache)
     }
 }

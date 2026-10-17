@@ -11,8 +11,6 @@ mod flac;
 mod h264;
 mod hevc;
 mod nal;
-#[cfg(feature = "async")]
-pub(crate) mod nonblocking;
 mod opus;
 mod passthrough;
 #[cfg(feature = "sync")]
@@ -30,7 +28,7 @@ pub use stream::{MediaStream, MediaStreamBuilder};
 use crate::error::Error;
 use crate::manifest::ContentKind;
 use crate::mp4::codec::Codec;
-use crate::mp4::packet::{Packet, ticks_to_duration};
+use crate::mp4::packet::{self, Packet, ticks_to_duration};
 use crate::mp4::reader::ParseError;
 use crate::mp4::track::Track;
 use bytes::Bytes;
@@ -83,8 +81,8 @@ pub enum DecoderFormat {
     /// empty. In a byte stream, the initialization goes after the first packet's temporal
     /// delimiter, not before it.
     Av1Obu,
-    /// AV1 temporal units as MP4 stores them, without temporal delimiters; the last OBU
-    /// may lack a size field. Initialization is the AV1CodecConfigurationRecord (the
+    /// AV1 temporal units as MP4 stores them, without temporal delimiters, but with a size
+    /// field on every OBU. Initialization is the AV1CodecConfigurationRecord (the
     /// `av1C` payload).
     Av1Samples,
     /// VP9 frames, superframes intact, without IVF framing. Initialization is the `vpcC`
@@ -122,20 +120,173 @@ impl fmt::Display for DecoderFormat {
 ///
 /// Packets and initialization differ between the two only for H.264, HEVC and AV1;
 /// every other codec has one format for both.
+///
+/// # Decoders
+///
+/// The style common decoders take. "Either" means the decoder reads both forms, or that
+/// the codec has one format for both styles. Notes say what a caller must add. A note
+/// that requires a [`DecoderFormat`] means asking for that format with
+/// [`MediaStreamBuilder::format`], whichever style is set.
+///
+/// | Decoder                                                                | Codec                              | DecoderStyle | Notes |
+/// |------------------------------------------------------------------------|------------------------------------|--------------|-------|
+/// | [`openh264`], [OpenH264]                                               | H.264                              | Elementary   |  |
+/// | [`rusty_h264`]                                                         | H.264                              | Elementary   | Length-prefixed input is ignored without an error. |
+/// | [`rff-codec-h264`]                                                     | H.264                              | Elementary   | Initialization as `extradata`. An `avcC` is dropped without an error. |
+/// | [`rust_h264`], [`ps-rust_h264`], [`z264`]                              | H.264                              | Either       | ConfigRecord: initialization through `parse_avcc_config`. |
+/// | [`veloster-h264`]                                                      | H.264                              | Either       | ConfigRecord: initialization through `Decoder::from_avcc`. |
+/// | [`gpu-video`], formerly [`vk-video`] ([Vulkan Video])                  | H.264                              | Elementary   |  |
+/// | [JM reference decoder]                                                 | H.264                              | Elementary   |  |
+/// | [`rusty_h265`]                                                         | HEVC                               | Elementary   | Main, Main 10 and Main Still Picture only. |
+/// | [`libde265-rs`], [`libde265`], [libde265]                              | HEVC                               | Elementary   |  |
+/// | [HM reference decoder]                                                 | HEVC                               | Elementary   |  |
+/// | [`dav1d`], [`rav1d`], [dav1d]                                          | AV1                                | Either       | ConfigRecord: skip the initialization. |
+/// | [libaom], [libgav1]                                                    | AV1                                | Either       | ConfigRecord: skip the initialization. |
+/// | [`vpx-rs`], [`env-libvpx-sys`], [libvpx]                               | VP9                                | Either       | Skip the initialization. |
+/// | [`cros-codecs`] ([VA-API])                                             | H.264, HEVC                        | Elementary   |  |
+/// | [`cros-codecs`] ([VA-API])                                             | AV1                                | Either       | ConfigRecord: skip the initialization. |
+/// | [`cros-codecs`] ([VA-API])                                             | VP9                                | Either       | Skip the initialization. |
+/// | [`cros-codecs`] ([V4L2])                                               | H.264, AV1, VP9                    | Elementary   | The V4L2 backend is incomplete. |
+/// | [`ffmpeg-next`], [`ffmpeg-the-third`], [`rsmpeg`], FFmpeg [libavcodec] | H.264, HEVC, FLAC, Opus, VP9       | Either       | Initialization as `extradata`. |
+/// | [`ffmpeg-next`], [`ffmpeg-the-third`], [`rsmpeg`], FFmpeg [libavcodec] | AV1                                | Either       | Initialization as `extradata`. The native `av1` decoder needs hardware acceleration. |
+/// | [`ffmpeg-next`], [`ffmpeg-the-third`], [`rsmpeg`], FFmpeg [libavcodec] | AAC                                | Either       | Initialization as `extradata`. Without it, HE-AAC decodes wrongly. |
+/// | [`ffmpeg-next`], [`ffmpeg-the-third`], [`rsmpeg`], FFmpeg [libavcodec] | MP3, AC-3, E-AC-3                  | Either       |  |
+/// | [`ffmpeg-next`], [`ffmpeg-the-third`], [`rsmpeg`], FFmpeg [libavcodec] | PCM                                | Either       | Pick the `pcm_*` decoder from [`DecoderParameters::Pcm`], and set the sample rate and channels. |
+/// | [`ffmpeg-sidecar`], [FFmpeg raw demuxers]                              | H.264, HEVC                        | Elementary   | `-f h264` or `-f hevc`. |
+/// | [`ffmpeg-sidecar`], [FFmpeg raw demuxers]                              | AV1                                | Elementary   | `-f obu`. |
+/// | [`ffmpeg-sidecar`], [FFmpeg raw demuxers]                              | FLAC                               | Either       | `-f flac`. |
+/// | [`ffmpeg-sidecar`], [FFmpeg raw demuxers]                              | MP3, AC-3, E-AC-3                  | Either       | `-f mp3`, `-f ac3` or `-f eac3`. Skip the initialization. |
+/// | [`ffmpeg-sidecar`], [FFmpeg raw demuxers]                              | PCM                                | Either       | `-f s16le` and the like, with `-ar` and `-ac`. |
+/// | [`ffmpeg-sidecar`], [FFmpeg raw demuxers]                              | AAC                                | Either       | Requires [`DecoderFormat::AacAdts`], with `-f aac`. For streams ADTS can describe. |
+/// | [`ffmpeg-sidecar`], [FFmpeg raw demuxers]                              | Opus                               | Either       | Wrapped in Ogg pages, with `-f ogg`: the initialization and an `OpusTags` header first, then a page per packet. |
+/// | [`ffmpeg-sidecar`], [FFmpeg raw demuxers]                              | VP9                                | Either       | Wrapped in IVF, with `-f ivf`: a file header, then a frame header before each frame. Skip the initialization. |
+/// | [`gstreamer`], [GStreamer]                                             | H.264, HEVC                        | Either       | Elementary: `stream-format=byte-stream`, initialization in the stream, no `codec_data`. ConfigRecord: `stream-format=avc` or `hvc1`, initialization as `codec_data`. Both `alignment=au`. |
+/// | [`gstreamer`], [GStreamer]                                             | AV1                                | Either       | Through `av1parse`, with `stream-format=obu-stream, alignment=tu`. ConfigRecord: initialization as `codec_data`. |
+/// | [`gstreamer`], [GStreamer]                                             | AAC                                | Either       | `stream-format=raw`, initialization as `codec_data`. |
+/// | [`gstreamer`], [GStreamer]                                             | FLAC                               | Either       | Through `flacparse`. |
+/// | [`gstreamer`], [GStreamer]                                             | Opus                               | Either       | Initialization in the stream, through `opusparse`, or as `opusdec` caps fields. Not `codec_data`. |
+/// | [`gstreamer`], [GStreamer]                                             | MP3, AC-3, E-AC-3, VP9, PCM        | Either       | Skip the initialization. |
+/// | [`objc2-video-toolbox`], [VideoToolbox]                                | H.264, HEVC                        | ConfigRecord | Initialization as the `avcC` or `hvcC` sample description extension, or parameter sets from [`DecoderParameters::Video`], through [`objc2-core-media`]. |
+/// | [`objc2-video-toolbox`], [VideoToolbox]                                | AV1                                | ConfigRecord | Initialization as the `av1C` sample description extension. Hardware only. |
+/// | [`ndk`], [MediaCodec]                                                  | H.264, HEVC                        | Elementary   | Initialization as one `BUFFER_FLAG_CODEC_CONFIG` buffer for H.264, or `csd-0` for HEVC. |
+/// | [`ndk`], [MediaCodec]                                                  | AV1                                | ConfigRecord | Initialization as `csd-0`. |
+/// | [`web-sys`], [WebCodecs] `VideoDecoder`                                | H.264, HEVC                        | Either       | ConfigRecord: initialization as `description`. Elementary: no `description`. |
+/// | [`web-sys`], [WebCodecs] `VideoDecoder`                                | AV1                                | Either       |  |
+/// | [`windows`], [Media Foundation]                                        | H.264, HEVC                        | Elementary   |  |
+/// | [NVIDIA NVDEC] (NVCUVID parser), [Intel oneVPL]                        | H.264, HEVC                        | Elementary   |  |
+/// | [NVIDIA NVDEC] (NVCUVID parser), [Intel oneVPL]                        | AV1                                | Either       | ConfigRecord: skip the initialization. |
+/// | [NVIDIA NVDEC] (NVCUVID parser), [Intel oneVPL]                        | VP9                                | Either       | Skip the initialization. |
+/// | [AMD AMF]                                                              | H.264, HEVC                        | Either       | ConfigRecord: initialization as `AMF_VIDEO_DECODER_EXTRADATA`. |
+/// | [AMD AMF]                                                              | AV1                                | Elementary   |  |
+/// | [AMD AMF]                                                              | VP9                                | Either       | Skip the initialization. |
+/// | [V4L2 stateful] (Raspberry Pi, Qualcomm, MediaTek)                     | H.264, HEVC, AV1                   | Elementary   |  |
+/// | [V4L2 stateful] (Raspberry Pi, Qualcomm, MediaTek)                     | VP9                                | Either       | One frame per buffer: split superframes. |
+/// | [VA-API], [VDPAU], [D3D11 Video], [D3D12 Video], [Vulkan Video], [V4L2 stateless] | H.264, HEVC             | Elementary   | Take parameter sets as parsed structures and slices as NAL units, so a parser goes in front. No length prefixes. |
+/// | [VA-API], [VDPAU], [D3D11 Video], [D3D12 Video], [Vulkan Video], [V4L2 stateless] | AV1, VP9                | Either       | Take parsed headers and frame data, so a parser goes in front. VP9 superframes are split. |
+/// | [`symphonia`]                                                          | AAC                                | Either       | Initialization as [`extra_data`]. AAC-LC, mono or stereo only. |
+/// | [`symphonia`]                                                          | MP3                                | Either       |  |
+/// | [`symphonia`]                                                          | FLAC                               | Either       | Skip the initialization: [`extra_data`] is `streaminfo` from [`DecoderParameters::Flac`]. |
+/// | [`symphonia`]                                                          | PCM                                | Either       | Pick the `CODEC_ID_PCM_*` codec from [`DecoderParameters::Pcm`], and set the sample rate and channels. |
+/// | [`fdk-aac`], [FDK AAC]                                                 | AAC                                | Either       | `Transport::Raw`, initialization through `config_raw`. |
+/// | [FAAD2]                                                                | AAC                                | Either       | Initialization through `NeAACDecInit2`. |
+/// | [`claxon`]                                                             | FLAC                               | Either       |  |
+/// | [libFLAC]                                                              | FLAC                               | Either       |  |
+/// | [`minimp3`], [`minimp3_fixed`], [`puremp3`]                            | MP3                                | Either       |  |
+/// | [minimp3], [mpg123]                                                    | MP3                                | Either       |  |
+/// | [`opus`], [libopus], [`ruopus`], [`opus-rs`], [`opus-decoder`]         | Opus                               | Either       | Skip the initialization: configure from [`DecoderParameters::Opus`] at 48 kHz, as a multistream decoder past stereo. |
+/// | [`audiopus`], [`magnum-opus`]                                          | Opus                               | Either       | As for `opus`, but mono or stereo only. |
+/// | [liba52]                                                               | AC-3                               | Either       | Skip the initialization. |
+/// | [AudioToolbox]                                                         | AAC                                | Either       | Initialization wrapped in an `esds` descriptor chain, as the magic cookie. |
+/// | [AudioToolbox]                                                         | MP3, AC-3, E-AC-3                  | Either       | Skip the initialization. |
+///
+/// [`audiopus`]: https://crates.io/crates/audiopus
+/// [`claxon`]: https://crates.io/crates/claxon
+/// [`cros-codecs`]: https://crates.io/crates/cros-codecs
+/// [`dav1d`]: https://crates.io/crates/dav1d
+/// [`env-libvpx-sys`]: https://crates.io/crates/env-libvpx-sys
+/// [`fdk-aac`]: https://crates.io/crates/fdk-aac
+/// [`ffmpeg-next`]: https://crates.io/crates/ffmpeg-next
+/// [`ffmpeg-sidecar`]: https://crates.io/crates/ffmpeg-sidecar
+/// [`ffmpeg-the-third`]: https://crates.io/crates/ffmpeg-the-third
+/// [`gpu-video`]: https://crates.io/crates/gpu-video
+/// [`gstreamer`]: https://crates.io/crates/gstreamer
+/// [`libde265-rs`]: https://crates.io/crates/libde265-rs
+/// [`libde265`]: https://crates.io/crates/libde265
+/// [`magnum-opus`]: https://crates.io/crates/magnum-opus
+/// [`minimp3`]: https://crates.io/crates/minimp3
+/// [`minimp3_fixed`]: https://crates.io/crates/minimp3_fixed
+/// [`ndk`]: https://crates.io/crates/ndk
+/// [`objc2-core-media`]: https://crates.io/crates/objc2-core-media
+/// [`objc2-video-toolbox`]: https://crates.io/crates/objc2-video-toolbox
+/// [`openh264`]: https://crates.io/crates/openh264
+/// [`opus`]: https://crates.io/crates/opus
+/// [`opus-decoder`]: https://crates.io/crates/opus-decoder
+/// [`opus-rs`]: https://crates.io/crates/opus-rs
+/// [`ps-rust_h264`]: https://crates.io/crates/ps-rust_h264
+/// [`puremp3`]: https://crates.io/crates/puremp3
+/// [`rav1d`]: https://crates.io/crates/rav1d
+/// [`rff-codec-h264`]: https://crates.io/crates/rff-codec-h264
+/// [`rsmpeg`]: https://crates.io/crates/rsmpeg
+/// [`ruopus`]: https://crates.io/crates/ruopus
+/// [`rust_h264`]: https://crates.io/crates/rust_h264
+/// [`rusty_h264`]: https://crates.io/crates/rusty_h264
+/// [`rusty_h265`]: https://crates.io/crates/rusty_h265
+/// [`symphonia`]: https://crates.io/crates/symphonia
+/// [`extra_data`]: https://docs.rs/symphonia-core/0.6/symphonia_core/codecs/audio/struct.AudioCodecParameters.html#structfield.extra_data
+/// [`veloster-h264`]: https://crates.io/crates/veloster-h264
+/// [`vk-video`]: https://crates.io/crates/vk-video
+/// [`vpx-rs`]: https://crates.io/crates/vpx-rs
+/// [`web-sys`]: https://crates.io/crates/web-sys
+/// [`windows`]: https://crates.io/crates/windows
+/// [`z264`]: https://crates.io/crates/z264
+///
+/// [AMD AMF]: https://github.com/GPUOpen-LibrariesAndSDKs/AMF
+/// [AudioToolbox]: https://developer.apple.com/documentation/audiotoolbox
+/// [D3D11 Video]: https://learn.microsoft.com/en-us/windows/win32/medfound/direct3d-11-video-apis
+/// [D3D12 Video]: https://learn.microsoft.com/en-us/windows/win32/medfound/direct3d-12-video-overview
+/// [dav1d]: https://code.videolan.org/videolan/dav1d
+/// [FAAD2]: https://github.com/knik0/faad2
+/// [FDK AAC]: https://github.com/mstorsjo/fdk-aac
+/// [FFmpeg raw demuxers]: https://ffmpeg.org/ffmpeg-formats.html
+/// [GStreamer]: https://gstreamer.freedesktop.org/
+/// [HM reference decoder]: https://vcgit.hhi.fraunhofer.de/jvet/HM
+/// [Intel oneVPL]: https://github.com/intel/libvpl
+/// [JM reference decoder]: https://vcgit.hhi.fraunhofer.de/jvet/JM
+/// [liba52]: https://sourceforge.net/projects/liba52/
+/// [libaom]: https://aomedia.googlesource.com/aom/
+/// [libavcodec]: https://ffmpeg.org/libavcodec.html
+/// [libde265]: https://github.com/strukturag/libde265
+/// [libFLAC]: https://github.com/xiph/flac
+/// [libgav1]: https://chromium.googlesource.com/codecs/libgav1/
+/// [libopus]: https://opus-codec.org/
+/// [libvpx]: https://chromium.googlesource.com/webm/libvpx/
+/// [Media Foundation]: https://learn.microsoft.com/en-us/windows/win32/medfound/microsoft-media-foundation-sdk
+/// [MediaCodec]: https://developer.android.com/reference/android/media/MediaCodec
+/// [minimp3]: https://github.com/lieff/minimp3
+/// [mpg123]: https://www.mpg123.de/
+/// [NVIDIA NVDEC]: https://developer.nvidia.com/video-codec-sdk
+/// [OpenH264]: https://github.com/cisco/openh264
+/// [V4L2]: https://docs.kernel.org/userspace-api/media/v4l/v4l2.html
+/// [V4L2 stateful]: https://docs.kernel.org/userspace-api/media/v4l/dev-decoder.html
+/// [V4L2 stateless]: https://docs.kernel.org/userspace-api/media/v4l/dev-stateless-decoder.html
+/// [VA-API]: https://github.com/intel/libva
+/// [VDPAU]: https://gitlab.freedesktop.org/vdpau/libvdpau
+/// [VideoToolbox]: https://developer.apple.com/documentation/videotoolbox
+/// [Vulkan Video]: https://docs.vulkan.org/spec/latest/chapters/videocoding.html
+/// [WebCodecs]: https://developer.mozilla.org/en-US/docs/Web/API/VideoDecoder
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum DecoderStyle {
     /// Elementary streams, with their configuration in the bitstream's own form:
     /// [`DecoderFormat::H264AnnexB`], [`DecoderFormat::HevcAnnexB`] and
-    /// [`DecoderFormat::Av1Obu`]. Initialization followed by the packets is a valid
-    /// stream. For decoders that parse bitstreams, such as dav1d, openh264, libFLAC and
-    /// ffmpeg's raw demuxers.
+    /// [`DecoderFormat::Av1Obu`]. For H.264, HEVC, AV1, FLAC, MP3 and PCM, initialization
+    /// followed by the packets is a valid stream. For decoders that parse bitstreams, such
+    /// as dav1d, openh264, libFLAC and ffmpeg's raw demuxers.
     #[default]
     Elementary,
     /// Packets as MP4 stores them, with the codec's configuration record:
     /// [`DecoderFormat::H264LengthPrefixed`], [`DecoderFormat::HevcLengthPrefixed`] and
     /// [`DecoderFormat::Av1Samples`]. For decoders configured the way MP4 is, such as
-    /// VideoToolbox, MediaCodec and WebCodecs.
+    /// VideoToolbox.
     ConfigRecord,
 }
 
@@ -294,19 +445,128 @@ impl MediaPacket {
 ///
 /// Reset the decoder and configure it with the stream's initialization, feed it
 /// `preroll` in order and discard its output, then decode the stream's packets as usual,
-/// discarding any output presented before `discard_before`.
+/// discarding any output presented before `discard_before`: drop output for which
+/// [`Self::discards`] is true, and for audio, [`Self::trim_start_of`] ticks from the
+/// start of each packet's output.
+///
+/// # Examples
+///
+/// ```
+/// use playdash::{DecoderInitialization, MediaPacket, Seeked};
+///
+/// # struct Frame { pts: i64, duration: u64 }
+/// # struct VideoDecoder;
+/// # impl VideoDecoder {
+/// #     fn reset(&mut self, _: &DecoderInitialization) {}
+/// #     fn decode(&mut self, _: &MediaPacket) -> Vec<Frame> { Vec::new() }
+/// # }
+/// # struct AudioDecoder;
+/// # impl AudioDecoder {
+/// #     fn reset(&mut self, _: &DecoderInitialization) {}
+/// #     fn decode(&mut self, _: &MediaPacket) -> Vec<f32> { Vec::new() }
+/// # }
+/// # fn show(_: Frame) {}
+/// # fn play(_: &[f32]) {}
+/// /// Decodes video from where `seeked` landed, given the stream's packets after the seek.
+/// fn decode_video(
+///     decoder: &mut VideoDecoder,
+///     initialization: &DecoderInitialization,
+///     seeked: &Seeked,
+///     packets: impl IntoIterator<Item = MediaPacket>,
+/// ) {
+///     // Reset the decoder and configure it with the stream's initialization.
+///     decoder.reset(initialization);
+///
+///     // Feed it the pre-roll in order, discarding its output.
+///     for packet in &seeked.preroll {
+///         decoder.decode(packet);
+///     }
+///
+///     // Decode the stream's packets, discarding output presented before
+///     // `discard_before`. Frames come out in presentation order, and B-frames can
+///     // present before the landing point.
+///     for packet in packets {
+///         for frame in decoder.decode(&packet) {
+///             if !seeked.discards(frame.pts, frame.duration) {
+///                 show(frame);
+///             }
+///         }
+///     }
+/// }
+///
+/// /// Decodes mono audio at `sample_rate` from where `seeked` landed, given the stream's
+/// /// packets after the seek.
+/// fn decode_audio(
+///     decoder: &mut AudioDecoder,
+///     initialization: &DecoderInitialization,
+///     seeked: &Seeked,
+///     packets: impl IntoIterator<Item = MediaPacket>,
+///     sample_rate: u64,
+/// ) {
+///     decoder.reset(initialization);
+///     for packet in &seeked.preroll {
+///         decoder.decode(packet);
+///     }
+///
+///     // Each packet's output, without its encoder priming or what presents before
+///     // `discard_before`.
+///     for packet in packets {
+///         let samples = decoder.decode(&packet);
+///         let to_samples = |ticks: u64| {
+///             let count = ticks * sample_rate / u64::from(packet.timescale);
+///             usize::try_from(count).unwrap_or(usize::MAX).min(samples.len())
+///         };
+///         let start = to_samples(seeked.trim_start_of(&packet));
+///         let end = samples.len() - to_samples(packet.trim_end);
+///         play(&samples[start.min(end)..end]);
+///     }
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MediaSeeked {
+pub struct Seeked {
     /// The time the seek asked for.
     pub requested: Duration,
-    /// Presentation timestamp of the packet the stream yields next, in its timescale.
+    /// Presentation timestamp of the packet the stream yields next, in `timescale` ticks.
     pub landed: i64,
-    /// Presentation timestamp before which decoded output is discarded, in the stream's
-    /// timescale.
+    /// Presentation timestamp before which decoded output is discarded, in `timescale`
+    /// ticks: the requested time for `seek_time`, `landed` for `seek_keyframe`.
     pub discard_before: i64,
+    /// Ticks per second of `landed` and `discard_before`: the stream's timescale.
+    pub timescale: u32,
     /// Packets to decode, in order, before the stream's next packet. None of their output
     /// is presented.
     pub preroll: Vec<MediaPacket>,
+}
+
+impl Seeked {
+    /// The landing point as a time, or `None` if it is negative.
+    pub fn landed_time(&self) -> Option<Duration> {
+        ticks_to_duration(self.landed, self.timescale)
+    }
+
+    /// The time before which decoded output is discarded, or `None` if it is negative.
+    pub fn discard_before_time(&self) -> Option<Duration> {
+        ticks_to_duration(self.discard_before, self.timescale)
+    }
+
+    /// Whether decoded output presented from `pts` for `duration` ticks is discarded
+    /// whole: it starts before `discard_before` and ends at or before it. Output that
+    /// spans `discard_before` is kept; for audio, trim it with [`Self::trim_start_of`].
+    pub fn discards(&self, pts: i64, duration: u64) -> bool {
+        packet::discards(self.discard_before, pts, duration)
+    }
+
+    /// Ticks to drop from the start of `packet`'s decoded output: its own `trim_start`,
+    /// or more to discard what presents before `discard_before`, up to its whole
+    /// `duration`. For audio, where output is decoded a packet at a time.
+    pub fn trim_start_of(&self, packet: &MediaPacket) -> u64 {
+        packet::trim_start_of(
+            self.discard_before,
+            packet.pts,
+            packet.duration,
+            packet.trim_start,
+        )
+    }
 }
 
 /// `error`, from parsing `codec`'s configuration for `format`, as a decoder-input error.

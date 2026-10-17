@@ -1,258 +1,26 @@
-//! Progressive in-memory streaming of MPEG-DASH fragments: the blocking API of the `sync`
-//! feature.
+//! Progressive in-memory streaming of MPEG-DASH fragments: the blocking `FragmentStream`.
 
-use crate::buffer::BufferHandle;
-#[cfg(feature = "encryption")]
-use crate::cenc::ContentKeys;
-use crate::error::Error;
-use crate::fragment::{Fragment, Fragments, MediaTimeline, slice_range};
-use crate::mp4::track::{self, Track};
-use crate::schedule::{
+use super::buffer::BufferHandle;
+use super::cache::FragmentCache;
+use super::schedule::{
     self, Cursor, Part, PartBody, Position, Retention, Schedule, StreamTimeline, TimeAccuracy,
     WindowChange,
 };
-use crate::store::{FragmentData, Store};
+use super::store::FragmentData;
+use super::transport::Transport;
+use super::{Fragments, MediaTimeline};
+use crate::error::Error;
+use crate::mp4::track::{self, Track};
 use bytes::Bytes;
-use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// Fetches fragment bodies and sizes for a [`FragmentCache`].
-///
-/// [`ureq::Agent`] implements this with its connection pool.
-/// Implement this trait to load fragments from another HTTP client, local
-/// storage, or an application-specific source.
-///
-/// # Examples
-///
-/// ```
-/// use std::sync::Arc;
-/// use bytes::Bytes;
-/// use playdash::{Error, Fragment, FragmentCache, Transport};
-///
-/// struct MemoryTransport;
-///
-/// impl Transport for MemoryTransport {
-///     fn get(&self, fragment: &Fragment, _: Option<u64>) -> Result<Bytes, Error> {
-///         let bytes: &'static [u8] = match fragment.url.as_str() {
-///             "memory://init" => b"initialization data",
-///             _ => b"media data",
-///         };
-///         Ok(Bytes::from_static(bytes))
-///     }
-/// }
-///
-/// let cache = FragmentCache::new(Arc::new(MemoryTransport));
-/// assert!(cache.cached(&Fragment::new("memory://init")).is_none());
-/// ```
-pub trait Transport: Send + Sync {
-    /// Body of `fragment`.
-    ///
-    /// Must honor [`Fragment::range`] and return exactly those bytes; a ranged
-    /// body of any other length fails the stream. `size_hint` is the length
-    /// when already known, for preallocating the body.
-    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error>;
-
-    /// Byte length of `fragment`, typically from a HEAD `Content-Length`.
-    ///
-    /// Never called for ranged fragments, whose sizes are already known. An
-    /// error disables HEAD probing for the stream; the default always errors.
-    fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
-        Err(Error::Initialization(format!(
-            "transport cannot HEAD {fragment}"
-        )))
-    }
-}
-
-impl Transport for ureq::Agent {
-    /// Sends a `Range` header for ranged fragments; if a server ignores it and
-    /// returns the whole body, the range is sliced out of that body.
-    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error> {
-        let mut request = ureq::Agent::get(self, &fragment.url);
-        if let Some(range) = &fragment.range {
-            request = request.header(
-                ureq::http::header::RANGE,
-                format!("bytes={}-{}", range.start(), range.end()),
-            );
-        }
-        let response = request.call()?;
-        let partial = response.status() == ureq::http::StatusCode::PARTIAL_CONTENT;
-        let mut bytes = size_hint
-            .and_then(|len| usize::try_from(len).ok())
-            .map(Vec::with_capacity)
-            .unwrap_or_default();
-        response.into_body().into_reader().read_to_end(&mut bytes)?;
-        let body = Bytes::from(bytes);
-        match &fragment.range {
-            Some(range) if !partial => {
-                #[cfg(feature = "log")]
-                log::warn!(
-                    "server ignored the Range request for {fragment}; slicing the full body"
-                );
-                Ok(slice_range(&body, range)
-                    .map_or_else(|| body.clone(), |part| body.slice_ref(part)))
-            }
-            _ => Ok(body),
-        }
-    }
-
-    fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
-        let url = &fragment.url;
-        let response = ureq::Agent::head(self, url).call()?;
-        response
-            .headers()
-            .get(ureq::http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .ok_or_else(|| {
-                Error::Initialization(format!("HEAD for {url} did not return Content-Length"))
-            })
-    }
-}
-
-/// Downloaded fragment data that can be shared by multiple readers.
-///
-/// With the `encryption` feature, `with_keys` makes the cache decrypt
-/// Common Encryption before making fragment data available.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::sync::Arc;
-/// use playdash::{DashManifest, FragmentCache};
-///
-/// # fn example(manifest: &DashManifest) -> Result<(), playdash::Error> {
-/// let cache = Arc::new(FragmentCache::default());
-/// let first = manifest.stream_with_cache("audio", cache.clone())?;
-/// let second = manifest.stream_with_cache("audio", cache)?;
-/// // Both streams reuse fragment bodies that either one downloads.
-/// # drop((first, second));
-/// # Ok(())
-/// # }
-/// ```
-pub struct FragmentCache {
-    transport: Arc<dyn Transport>,
-    pub(crate) store: Store,
-}
-
-impl FragmentCache {
-    /// An empty cache that fetches through `transport`.
-    pub fn new(transport: Arc<dyn Transport>) -> Self {
-        Self {
-            transport,
-            store: Store::default(),
-        }
-    }
-
-    /// Decrypts `cenc` and `cbcs` Common Encryption with `keys` before
-    /// caching each body, so readers and [`Self::cached`] see plaintext.
-    ///
-    /// Each reader parses its representation's protection from the
-    /// initialization segment, and fails with
-    /// [`Error::MissingContentKey`] before any media GET if `keys` lacks
-    /// its KID. Unprotected representations pass through unchanged.
-    #[cfg(feature = "encryption")]
-    pub fn with_keys(mut self, keys: ContentKeys) -> Self {
-        self.store.set_keys(keys);
-        self
-    }
-
-    /// Whether this cache decrypts Common Encryption; see `with_keys`
-    /// (requires the `encryption` feature).
-    pub fn decrypts(&self) -> bool {
-        self.store.decrypts()
-    }
-
-    /// The body of `fragment`, if it is held. On a cache with content keys,
-    /// this is the decrypted body.
-    pub fn cached(&self, fragment: &Fragment) -> Option<Bytes> {
-        self.store.cached(fragment)
-    }
-
-    /// The byte length of `fragment`, if its range, a HEAD or a GET has
-    /// established it.
-    pub fn known_size(&self, fragment: &Fragment) -> Option<u64> {
-        self.store.known_size(fragment)
-    }
-
-    /// The shared entry for `fragment`, created empty if new.
-    pub(crate) fn data(&self, fragment: Fragment) -> Arc<FragmentData> {
-        self.store.data(fragment)
-    }
-
-    /// The body of `data`, fetching it unless it is held or another stream
-    /// is already fetching it. A ranged body of the wrong length is an error
-    /// and is not kept.
-    pub(crate) fn get(&self, data: &FragmentData) -> Result<Bytes, Error> {
-        if let Some(body) = data.body() {
-            return Ok(body);
-        }
-        let _in_flight = data
-            .blocking_fetch
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(body) = data.body() {
-            return Ok(body);
-        }
-        let body = self.transport.get(&data.fragment, data.size())?;
-        self.store.accept(data, body)
-    }
-
-    /// HEADs `data` unless its size is already known or another stream is
-    /// already probing it.
-    fn probe(&self, data: &FragmentData) -> Result<(), Error> {
-        if data.size().is_some() {
-            return Ok(());
-        }
-        let _in_flight = data
-            .blocking_probe
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if data.size().is_none() {
-            let size = self.transport.head(&data.fragment)?;
-            self.store.accept_probe(data, size);
-        }
-        Ok(())
-    }
-}
-
-impl Default for FragmentCache {
-    /// Fetches through a ureq agent with this crate's connection-pool settings.
-    fn default() -> Self {
-        Self::new(Arc::new(ureq_agent()))
-    }
-}
-
-impl fmt::Debug for FragmentCache {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FragmentCache")
-            .field("fragments", &self.store.len())
-            .field("decrypts", &self.decrypts())
-            .finish_non_exhaustive()
-    }
-}
-
-/// Maximum idle time for an HTTP connection in the ureq pool.
-///
-/// Fastly allows idle client reuse for up to 10 minutes. Stay well under
-/// that so we close first, and under typical NAT idle timeouts.
-const POOL_IDLE_AGE: Duration = Duration::from_secs(90);
-
-/// A ureq agent with this crate's connection-pool settings.
-pub(crate) fn ureq_agent() -> ureq::Agent {
-    ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .max_idle_age(POOL_IDLE_AGE)
-            .build(),
-    )
-}
-
 /// A representation's fragments, downloaded in the background and read in
 /// order: an [`Iterator`] of whole fragments, and a progressive [`Read`] and
 /// [`Seek`] view of the same bytes. The blocking counterpart of the `async`
-/// feature's `nonblocking::FragmentStream`.
+/// feature's `nonblocking::fragment::FragmentStream`.
 ///
 /// The initialization segment comes first, then the media segments. Iterating
 /// and reading share one position: [`Iterator::next`] yields everything from
@@ -276,11 +44,11 @@ pub(crate) fn ureq_agent() -> ureq::Agent {
 /// will not compile. Name the trait you mean instead:
 ///
 /// ```no_run
-/// # fn example(stream: playdash::FragmentStream) {
+/// # fn example(stream: playdash::fragment::FragmentStream) {
 /// use std::io::Read;
 ///
 /// let first_three = Iterator::take(stream, 3); // fragments
-/// # let stream: playdash::FragmentStream = todo!();
+/// # let stream: playdash::fragment::FragmentStream = todo!();
 /// let first_kib = Read::take(stream, 1024); // bytes
 /// # }
 /// ```
@@ -296,13 +64,13 @@ pub(crate) fn ureq_agent() -> ureq::Agent {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
 ///
 /// // Whole fragments.
-/// for fragment in manifest.stream("audio")? {
+/// for fragment in manifest.fragment_stream("audio")? {
 ///     let bytes = fragment?;
 ///     # drop(bytes);
 /// }
 ///
 /// // Bytes, from 30 seconds in.
-/// let mut stream = manifest.stream("audio")?;
+/// let mut stream = manifest.fragment_stream("audio")?;
 /// stream.seek_time(Duration::from_secs(30))?;
 /// let mut bytes = [0; 4096];
 /// let count = stream.read(&mut bytes)?;
@@ -553,7 +321,7 @@ impl FragmentStream {
     /// prioritized and loaded before this method returns.
     ///
     /// This is fragment-granular: playback may begin earlier than `time` by up
-    /// to one media-fragment duration. The returned [`TimePosition`](crate::TimePosition)
+    /// to one media-fragment duration. The returned [`TimePosition`](super::TimePosition)
     /// holds the fragment's start, which is exact for the position
     /// ([`TimeAccuracy::Packet`]); compare it with `time` to see how far back
     /// the seek landed. The byte field is `None` until every earlier fragment
@@ -606,7 +374,7 @@ impl FragmentStream {
     }
 
     /// The tracks of the representation's initialization fragment, as a
-    /// [`PacketStream`](crate::PacketStream) reads them.
+    /// [`PacketStream`](crate::packet::PacketStream) reads them.
     ///
     /// Fails with [`Error::MalformedMedia`] or [`Error::UnsupportedMedia`] if the
     /// initialization fragment is not MP4 this crate reads.
@@ -966,8 +734,8 @@ impl Drop for FragmentStream {
 mod tests {
     use super::*;
     use crate::BufferStatus;
-    use crate::fragment::parse_byte_range;
-    use crate::schedule::TimePosition;
+    use crate::fragment::schedule::TimePosition;
+    use crate::fragment::{Fragment, parse_byte_range};
     use std::sync::atomic::AtomicUsize;
     use std::thread;
     use std::time::Duration;

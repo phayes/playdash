@@ -2,9 +2,8 @@
 
 #[cfg(feature = "encryption")]
 use crate::ContentKeys;
-use crate::{
-    BufferHandle, DashManifest, Error, FragmentCache, FragmentStream, Fragments, MediaTimeline,
-};
+use crate::fragment::{FragmentStream, Fragments, MediaTimeline};
+use crate::{BufferHandle, DashManifest, Error, FragmentCache};
 use ::rodio::{Decoder, Source, source::SeekError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -210,7 +209,8 @@ impl Source for DashSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Fragment, Transport};
+    use crate::Transport;
+    use crate::fragment::Fragment;
 
     #[test]
     fn protected_representation_is_rejected_before_streaming() {

@@ -4,11 +4,10 @@
 use super::codec::{self, Codec};
 use super::fragment;
 use super::init::{self, RollGroups, SampleEntry, TrackDefaults};
-use super::packet::{Packet, Seeked, duration_to_ticks, ticks_to_duration};
+use super::packet::{Packet, PacketSeeked, duration_to_ticks, ticks_to_duration};
 use super::reader::ParseError;
 use crate::error::Error;
 use crate::fragment::{Fragment, MediaTimeline};
-use crate::schedule::TimeAccuracy;
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::io;
@@ -43,6 +42,15 @@ impl Loaded {
     }
 }
 
+/// Where a seek lands relative to its time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Landing {
+    /// On the first packet in decode order that presents at or after the time.
+    Exact,
+    /// Past the pre-roll of the last keyframe it can decode from to reach the time.
+    Keyframe,
+}
+
 /// A seek's next step.
 #[derive(Debug)]
 pub(crate) enum Split {
@@ -54,7 +62,7 @@ pub(crate) enum Split {
     /// puts the time in a fragment ending before it.
     Later,
     /// The seek is done.
-    Done(Seeked),
+    Done(PacketSeeked),
 }
 
 /// One track's packets from its fragments, in decode order.
@@ -287,11 +295,7 @@ impl Demuxer {
 
     /// The media fragments a seek to `time` loads first: from where decoding may
     /// have to start, to the one containing `time`.
-    pub(crate) fn seek_range(
-        &self,
-        time: Duration,
-        accuracy: TimeAccuracy,
-    ) -> io::Result<RangeInclusive<usize>> {
+    pub(crate) fn seek_range(&self, time: Duration) -> io::Result<RangeInclusive<usize>> {
         let timeline = self.timeline.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -306,23 +310,20 @@ impl Demuxer {
                 )
             })
         };
-        let target = fragment_at(time)?;
-        Ok(match accuracy {
-            TimeAccuracy::Fragment => target..=target,
-            TimeAccuracy::Packet => fragment_at(time.saturating_sub(self.preroll()))?..=target,
-        })
+        Ok(fragment_at(time.saturating_sub(self.preroll()))?..=fragment_at(time)?)
     }
 
     /// Completes a seek to `time` from `loaded`, consecutive fragments ending with the
-    /// one containing `time`. Asks for the fragment before them when none has a sync
-    /// sample early enough, unless `at_first`: they start at the stream's first. Asks for
-    /// the fragment after them when none of their packets presents at or after the time to
-    /// land at, unless `at_last`: they end at the stream's last.
+    /// one containing `time`, landing as `landing` says. Asks for the fragment before
+    /// them when none has a sync sample early enough, unless `at_first`: they start at the
+    /// stream's first. Asks for the fragment after them when none of their packets
+    /// presents at or after the time to land at, unless `at_last`: they end at the
+    /// stream's last.
     /// When done, the queue holds the packets from where the seek landed.
     pub(crate) fn seek(
         &mut self,
         time: Duration,
-        accuracy: TimeAccuracy,
+        landing: Landing,
         loaded: &[Loaded],
         at_first: bool,
         at_last: bool,
@@ -333,48 +334,29 @@ impl Demuxer {
         let all: Vec<&Entry> = loaded.iter().flat_map(|loaded| &loaded.entries).collect();
         let preroll = self.preroll_ticks(target);
 
-        // Where decoding starts and the time to land at.
-        let (start, at, discard_before) = match accuracy {
-            TimeAccuracy::Fragment => {
-                let first = all.len() - target.entries.len();
-                match all.get(first) {
-                    // The fragment starts with a sync sample: decode from it, and land
-                    // past its own pre-roll.
-                    Some(entry) if entry.packet.keyframe => {
-                        let at = entry.packet.pts + preroll;
-                        (first, at, None)
-                    }
-                    // Otherwise, as a packet-accurate seek to the fragment's start.
-                    _ => {
-                        let start = self.fragment_start(target.index);
-                        let split =
-                            self.seek(start, TimeAccuracy::Packet, loaded, at_first, at_last);
-                        return match split {
-                            Split::Done(seeked) => Split::Done(Seeked {
-                                requested: time,
-                                ..seeked
-                            }),
-                            other => other,
-                        };
-                    }
-                }
-            }
-            TimeAccuracy::Packet => {
-                let at = duration_to_ticks(time, self.timescale);
-                let decode_target = at - preroll;
-                let start = all
-                    .iter()
-                    .rposition(|entry| entry.packet.keyframe && entry.packet.pts <= decode_target);
-                let start = match start {
-                    Some(start) => start,
-                    None if !at_first => return Split::Earlier,
-                    None => all
-                        .iter()
-                        .position(|entry| entry.packet.keyframe)
-                        .unwrap_or(0),
-                };
-                (start, at, Some(at))
-            }
+        // Where decoding starts: the last sync sample a pre-roll before the time, or
+        // the stream's first when there is none.
+        let time_ticks = duration_to_ticks(time, self.timescale);
+        let decode_target = time_ticks - preroll;
+        let start = all
+            .iter()
+            .rposition(|entry| entry.packet.keyframe && entry.packet.pts <= decode_target);
+        let start = match start {
+            Some(start) => start,
+            None if !at_first => return Split::Earlier,
+            None => all
+                .iter()
+                .position(|entry| entry.packet.keyframe)
+                .unwrap_or(0),
+        };
+
+        // The time to land at: the time itself, or past the start's pre-roll, but never
+        // after the time.
+        let at = match landing {
+            Landing::Exact => time_ticks,
+            Landing::Keyframe => all.get(start).map_or(time_ticks, |entry| {
+                (entry.packet.pts + preroll).min(time_ticks)
+            }),
         };
 
         // Leading samples of a start, up to the next sync sample, cannot be decoded from
@@ -437,10 +419,15 @@ impl Demuxer {
         }
         self.next_decode = target.end_decode_time.map(|time| (target.index + 1, time));
 
-        Split::Done(Seeked {
+        let discard_before = match landing {
+            Landing::Exact => at,
+            Landing::Keyframe => landed,
+        };
+        Split::Done(PacketSeeked {
             requested: time,
             landed,
-            discard_before: discard_before.unwrap_or(landed),
+            discard_before,
+            timescale: self.timescale,
             preroll,
         })
     }
@@ -752,7 +739,7 @@ mod tests {
         std::iter::from_fn(|| demuxer.pop()).collect()
     }
 
-    fn done(split: Split) -> Seeked {
+    fn done(split: Split) -> PacketSeeked {
         match split {
             Split::Done(seeked) => seeked,
             Split::Earlier => panic!("seek wanted an earlier fragment"),
@@ -825,15 +812,12 @@ mod tests {
         let mut demuxer = demuxer(one_track(b"soun", None, &[]), &[40, 40]);
         demuxer.set_preroll(Duration::from_millis(10));
         let time = Duration::from_millis(45);
-        assert_eq!(
-            demuxer.seek_range(time, TimeAccuracy::Packet).unwrap(),
-            0..=1
-        );
+        assert_eq!(demuxer.seek_range(time).unwrap(), 0..=1);
         let loaded = [
             load(&mut demuxer, 0, Some(0), &audio_samples(4), 0),
             load(&mut demuxer, 1, Some(40), &audio_samples(4), 4),
         ];
-        let seeked = done(demuxer.seek(time, TimeAccuracy::Packet, &loaded, false, false));
+        let seeked = done(demuxer.seek(time, Landing::Exact, &loaded, false, false));
         assert_eq!(seeked.requested, time);
         assert_eq!((seeked.landed, seeked.discard_before), (40, 45));
         assert_eq!(pts(seeked.preroll), [30]);
@@ -846,19 +830,29 @@ mod tests {
     }
 
     #[test]
-    fn fragment_seeks_land_past_the_fragments_own_preroll() {
+    fn keyframe_seeks_land_past_the_keyframes_preroll_before_the_time() {
         let mut demuxer = demuxer(one_track(b"soun", None, &[]), &[40, 40]);
         demuxer.set_preroll(Duration::from_millis(20));
         let time = Duration::from_millis(65);
-        assert_eq!(
-            demuxer.seek_range(time, TimeAccuracy::Fragment).unwrap(),
-            1..=1
-        );
+        assert_eq!(demuxer.seek_range(time).unwrap(), 1..=1);
         let loaded = [load(&mut demuxer, 1, Some(40), &audio_samples(4), 4)];
-        let seeked = done(demuxer.seek(time, TimeAccuracy::Fragment, &loaded, false, false));
+        let seeked = done(demuxer.seek(time, Landing::Keyframe, &loaded, false, false));
+        assert_eq!(seeked.requested, time);
         assert_eq!((seeked.landed, seeked.discard_before), (60, 60));
         assert_eq!(pts(seeked.preroll), [40, 50]);
         assert_eq!(pts(drain(&mut demuxer)), [60, 70]);
+    }
+
+    #[test]
+    fn keyframe_seeks_within_the_first_preroll_land_on_the_packet_at_the_time() {
+        let mut demuxer = demuxer(one_track(b"soun", None, &[]), &[40, 40]);
+        demuxer.set_preroll(Duration::from_millis(20));
+        let loaded = [load(&mut demuxer, 0, Some(0), &audio_samples(4), 0)];
+        let time = Duration::from_millis(15);
+        let seeked = done(demuxer.seek(time, Landing::Keyframe, &loaded, true, false));
+        assert_eq!((seeked.landed, seeked.discard_before), (10, 10));
+        assert_eq!(pts(seeked.preroll), [0]);
+        assert_eq!(pts(drain(&mut demuxer)), [10, 20, 30]);
     }
 
     /// A GOP of I, P, B, B, P, B, B decoded from `decode_time`, presenting 70 ticks
@@ -899,10 +893,17 @@ mod tests {
 
         // 25 is shown by the B-frame at 20, which decodes after the P-frame at 30.
         let time = Duration::from_millis(25);
-        let seeked = done(demuxer.seek(time, TimeAccuracy::Packet, &[first], false, false));
+        let seeked = done(demuxer.seek(time, Landing::Exact, &[first], false, false));
         assert_eq!((seeked.landed, seeked.discard_before), (30, 25));
         assert_eq!(pts(seeked.preroll), [0]);
         assert_eq!(pts(drain(&mut demuxer)), [30, 10, 20, 60, 40, 50]);
+
+        // A keyframe seek there lands on the keyframe itself, with nothing to pre-roll.
+        let first = load(&mut demuxer, 0, Some(0), &gop(), 0);
+        let seeked = done(demuxer.seek(time, Landing::Keyframe, &[first], false, false));
+        assert_eq!((seeked.landed, seeked.discard_before), (0, 0));
+        assert!(seeked.preroll.is_empty());
+        assert_eq!(pts(drain(&mut demuxer)), [0, 30, 10, 20, 60, 40, 50]);
     }
 
     #[test]
@@ -916,7 +917,7 @@ mod tests {
         assert!(matches!(
             demuxer.seek(
                 time,
-                TimeAccuracy::Packet,
+                Landing::Exact,
                 std::slice::from_ref(&second),
                 false,
                 false
@@ -926,16 +927,17 @@ mod tests {
 
         let first = load(&mut demuxer, 0, Some(0), &gop(), 0);
         let loaded = [first, second];
-        let seeked = done(demuxer.seek(time, TimeAccuracy::Packet, &loaded, false, false));
+        let seeked = done(demuxer.seek(time, Landing::Exact, &loaded, false, false));
         assert_eq!(seeked.landed, 70);
         assert_eq!(pts(seeked.preroll), [0, 30, 10, 20, 60, 40, 50]);
 
-        // A fragment-accurate seek there does the same, from the fragment's start.
+        // A keyframe seek there lands on that earlier keyframe.
         let first = load(&mut demuxer, 0, Some(0), &gop(), 0);
         let second = load(&mut demuxer, 1, Some(70), &open, 7);
         let loaded = [first, second];
-        let seeked = done(demuxer.seek(time, TimeAccuracy::Fragment, &loaded, false, false));
-        assert_eq!((seeked.requested, seeked.landed), (time, 70));
+        let seeked = done(demuxer.seek(time, Landing::Keyframe, &loaded, false, false));
+        assert_eq!((seeked.requested, seeked.landed), (time, 0));
+        assert!(seeked.preroll.is_empty());
     }
 
     #[test]
@@ -957,7 +959,7 @@ mod tests {
         assert!(matches!(
             demuxer.seek(
                 time,
-                TimeAccuracy::Packet,
+                Landing::Exact,
                 std::slice::from_ref(&first),
                 true,
                 false
@@ -968,14 +970,14 @@ mod tests {
         // With the next fragment, decoding starts at its keyframe, where the stream lands.
         let second = load(&mut demuxer, 1, Some(30), &gop(), 3);
         let loaded = [first, second];
-        let seeked = done(demuxer.seek(time, TimeAccuracy::Packet, &loaded, true, false));
+        let seeked = done(demuxer.seek(time, Landing::Exact, &loaded, true, false));
         assert_eq!((seeked.landed, seeked.discard_before), (30, 30));
         assert!(seeked.preroll.is_empty());
         assert_eq!(drain(&mut demuxer)[0].pts, 30);
 
         // At the stream's end, it lands there.
         let last = load(&mut demuxer, 0, Some(0), &short, 0);
-        let seeked = done(demuxer.seek(time, TimeAccuracy::Packet, &[last], true, true));
+        let seeked = done(demuxer.seek(time, Landing::Exact, &[last], true, true));
         assert_eq!(seeked.landed, 30);
     }
 
@@ -994,7 +996,7 @@ mod tests {
         );
         let seeked = done(demuxer.seek(
             Duration::from_millis(72),
-            TimeAccuracy::Packet,
+            Landing::Exact,
             &[open],
             true,
             false,
@@ -1025,11 +1027,11 @@ mod tests {
         let time = Duration::from_millis(75);
         let only_second = std::slice::from_ref(&second);
         assert!(matches!(
-            demuxer.seek(time, TimeAccuracy::Packet, only_second, false, false),
+            demuxer.seek(time, Landing::Exact, only_second, false, false),
             Split::Earlier
         ));
         let loaded = [first, second];
-        let seeked = done(demuxer.seek(time, TimeAccuracy::Packet, &loaded, false, false));
+        let seeked = done(demuxer.seek(time, Landing::Exact, &loaded, false, false));
         assert_eq!(seeked.landed, 70);
         assert_eq!(pts(seeked.preroll), [0, 30, 10, 20, 60, 40, 50]);
         assert_eq!(pts(drain(&mut demuxer)), [70, 90, 100]);
@@ -1177,9 +1179,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let error = demuxer
-            .seek_range(Duration::ZERO, TimeAccuracy::Packet)
-            .unwrap_err();
+        let error = demuxer.seek_range(Duration::ZERO).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

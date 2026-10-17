@@ -2,9 +2,10 @@
 //! and checks they decode to the same samples as the unencrypted source.
 #![cfg(all(feature = "encryption", feature = "rodio"))]
 
+use playdash::fragment::{Fragment, FragmentStream, Fragments};
 use playdash::{
-    BufferStatus, Bytes, ContentKeys, DashManifest, DashSource, Error, Fragment, FragmentCache,
-    FragmentStream, Fragments, MediaPacket, MediaStream, Transport,
+    BufferStatus, Bytes, ContentKeys, DashManifest, DashSource, Error, FragmentCache, MediaPacket,
+    MediaStream, Transport,
 };
 use rodio::{Decoder, Source};
 use std::io::{BufRead, BufReader, Cursor, Write};
@@ -236,7 +237,7 @@ fn decrypts_ffmpeg_cenc_byte_ranges() {
 fn iterates_decrypted_fragments() {
     let manifest = manifest("shaka_cbcs.mpd");
     let fragments: Vec<_> = manifest
-        .stream_with_cache("0", keyed_cache())
+        .fragment_stream_with_cache("0", keyed_cache())
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
@@ -349,14 +350,77 @@ fn media_stream_decrypts_with_keys() {
     }
 }
 
+/// Keys for a KID none of the fixtures use.
+fn other_keys() -> ContentKeys {
+    let mut keys = ContentKeys::new();
+    keys.insert_hex("ffffffffffffffffffffffffffffffff", KEY)
+        .unwrap();
+    keys
+}
+
 #[test]
-fn media_stream_refuses_both_a_cache_and_keys() {
-    let opened = manifest("shaka_cenc.mpd")
+fn media_stream_adds_keys_to_an_unused_cache() {
+    let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures)));
+    let keyed = manifest("shaka_cenc.mpd")
         .media_stream("0")
+        .cache(cache.clone())
         .keys(keys())
+        .open()
+        .unwrap();
+    assert!(cache.decrypts());
+    let expected = manifest("shaka_cenc.mpd")
+        .media_stream("0")
         .cache(keyed_cache())
+        .open()
+        .unwrap();
+    assert_eq!(media_packets(keyed), media_packets(expected));
+}
+
+#[test]
+fn media_stream_merges_keys_into_a_keyed_cache() {
+    let expected = media_packets(
+        manifest("shaka_cenc.mpd")
+            .media_stream("0")
+            .cache(keyed_cache())
+            .open()
+            .unwrap(),
+    );
+
+    // The builder's keys are added to the cache's own.
+    let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures)).with_keys(other_keys()));
+    let added = manifest("shaka_cenc.mpd")
+        .media_stream("0")
+        .cache(cache)
+        .keys(keys())
+        .open()
+        .unwrap();
+    assert_eq!(media_packets(added), expected);
+
+    // The cache's own keys are kept.
+    let kept = manifest("shaka_cenc.mpd")
+        .media_stream("0")
+        .cache(keyed_cache())
+        .keys(other_keys())
+        .open()
+        .unwrap();
+    assert_eq!(media_packets(kept), expected);
+}
+
+#[test]
+fn media_stream_refuses_keys_for_a_cache_used_without_them() {
+    let manifest = manifest("shaka_cenc.mpd");
+    let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures)));
+    let unkeyed = manifest
+        .fragment_stream_with_cache("0", cache.clone())
+        .unwrap();
+    let opened = manifest
+        .media_stream("0")
+        .cache(cache.clone())
+        .keys(keys())
         .open();
     assert!(matches!(opened, Err(Error::Initialization(_))));
+    assert!(!cache.decrypts());
+    drop(unkeyed);
 }
 
 #[test]
@@ -373,7 +437,7 @@ fn protected_dash_without_keys_is_rejected() {
 mod nonblocking {
     use super::*;
     use futures_util::StreamExt;
-    use playdash::nonblocking::{FragmentCache, FragmentStream};
+    use playdash::nonblocking::fragment::{FragmentCache, FragmentStream};
 
     /// The DASH fixture `name`, served from `base`.
     fn async_manifest(base: &str, name: &str) -> playdash::nonblocking::DashManifest {
@@ -399,7 +463,7 @@ mod nonblocking {
         let base = serve_fixtures();
         for name in ["shaka_cbcs.mpd", "shaka_cenc.mpd"] {
             let stream = async_manifest(&base, name)
-                .stream_with_cache("0", keyed_cache(keys()))
+                .fragment_stream_with_cache("0", keyed_cache(keys()))
                 .await
                 .unwrap();
             assert_eq!(
@@ -433,7 +497,7 @@ mod nonblocking {
         keys.insert_hex("ffffffffffffffffffffffffffffffff", KEY)
             .unwrap();
         let opened = async_manifest(&base, "shaka_cbcs.mpd")
-            .stream_with_cache("0", keyed_cache(keys))
+            .fragment_stream_with_cache("0", keyed_cache(keys))
             .await;
         assert!(matches!(opened, Err(Error::MissingContentKey(kid)) if kid == KID));
     }
@@ -461,14 +525,42 @@ mod nonblocking {
     }
 
     #[tokio::test]
-    async fn media_stream_refuses_both_a_cache_and_keys() {
+    async fn media_stream_merges_keys_into_a_keyed_cache() {
         let manifest = async_manifest(&serve_fixtures(), "shaka_cenc.mpd");
+        let expected = media_packets(
+            super::manifest("shaka_cenc.mpd")
+                .media_stream("0")
+                .cache(super::keyed_cache())
+                .open()
+                .unwrap(),
+        );
+        let added = manifest
+            .media_stream("0")
+            .cache(keyed_cache(other_keys()))
+            .keys(keys())
+            .open()
+            .await
+            .unwrap();
+        let packets: Vec<MediaPacket> = added.map(Result::unwrap).collect().await;
+        assert_eq!(packets, expected);
+    }
+
+    #[tokio::test]
+    async fn media_stream_refuses_keys_for_a_cache_used_without_them() {
+        let manifest = async_manifest(&serve_fixtures(), "shaka_cenc.mpd");
+        let cache = Arc::new(FragmentCache::default());
+        let unkeyed = manifest
+            .fragment_stream_with_cache("0", cache.clone())
+            .await
+            .unwrap();
         let opened = manifest
             .media_stream("0")
+            .cache(cache.clone())
             .keys(keys())
-            .cache(keyed_cache(keys()))
             .open()
             .await;
         assert!(matches!(opened, Err(Error::Initialization(_))));
+        assert!(!cache.decrypts());
+        drop(unkeyed);
     }
 }

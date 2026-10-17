@@ -2,9 +2,9 @@
 //! their workers follow, and the arithmetic of reading and seeking. Nothing here does I/O or
 //! waits.
 
+use super::store::FragmentData;
+use super::{Fragment, Fragments, MediaTimeline};
 use crate::error::Error;
-use crate::fragment::{Fragment, Fragments, MediaTimeline};
-use crate::store::FragmentData;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -79,16 +79,15 @@ pub struct TimePosition {
     pub accuracy: TimeAccuracy,
 }
 
-/// Granularity of a media time: a seek's target, or how precisely a reported
-/// timestamp describes a stream position.
+/// Granularity of a reported media timestamp: how precisely it describes a stream
+/// position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimeAccuracy {
-    /// To the media fragment. A seek lands at the start of a fragment; a reported
-    /// timestamp is the start of the fragment the position is inside.
+    /// To the media fragment: the timestamp is the start of the fragment the position
+    /// is inside.
     Fragment,
 
-    /// To the packet. A seek lands at the packet containing its target; a reported
-    /// timestamp is that of the packet at the position.
+    /// To the packet: the timestamp is that of the packet at the position.
     Packet,
 }
 

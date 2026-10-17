@@ -198,3 +198,41 @@ Open questions
   period start) be seekable, landing on the first fragment, or an error?
 - Breaking change to `MediaTimeline`: fold it into the Phase 1 segment list,
   or keep it as a public view over that list?
+
+
+3. Container wrapping for raw-demuxer decoders
+----------------------------------------------
+
+Goal: every codec's `MediaStream` output can be piped to a decoder that reads a
+byte stream, such as the `ffmpeg` CLI through ffmpeg-sidecar, without the
+caller writing a container muxer.
+
+What is missing today
+
+- Opus has no raw byte-stream form: `ffmpeg` and other raw demuxers read it
+  only in Ogg, with the `OpusHead` and an `OpusTags` header first and the
+  packets paginated, each page with a granule position and CRC.
+- VP9 has none either: it needs IVF, a 32-byte file header (width, height,
+  timebase) and a 12-byte frame header before each frame.
+- AAC has `DecoderFormat::AacAdts`, but only when asked for by format; neither
+  `DecoderStyle` gives it.
+- tests/decoder.rs already wraps all three for its ffmpeg checks (`feed`, with
+  Ogg pages and CRC, IVF, and ADTS); none of it is public.
+
+Plan
+
+- Promote the Ogg Opus and IVF wrapping from tests/decoder.rs, either as new
+  `DecoderFormat`s (e.g. `OpusOgg`, `Vp9Ivf`) whose initialization is the
+  container header and whose packets carry their page or frame header, or as
+  separate helpers that wrap a `MediaStream`'s initialization and packets.
+- Update `DecoderStyle`'s decoder table: the ffmpeg-sidecar Opus and VP9 rows
+  point at the new format.
+
+Open questions
+- New `DecoderFormat`s, or helpers outside the format enum? Formats keep "one
+  packet in, one packet out" and work with `MediaStreamBuilder::format`, but
+  they are containers, not decoder input.
+- Ogg granule positions and IVF frame counts after a seek: restart the
+  container, or keep counting?
+- IVF's header has a frame count, unknown while streaming: write 0, as ffmpeg
+  accepts?

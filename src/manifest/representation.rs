@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// This is a lightweight view of the selection details applications commonly
 /// need. Use [`DashManifest::representations`] to list available
 /// representations and pass [`Self::id`] to [`DashManifest::fragments`], or to
-/// `DashManifest::stream` with the `sync` feature. Attributes the
+/// `DashManifest::media_stream` with the `sync` feature. Attributes the
 /// representation does not set are inherited from its adaptation set.
 ///
 /// [`DashManifest`]: crate::DashManifest
