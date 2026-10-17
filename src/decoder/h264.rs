@@ -16,7 +16,7 @@ const FORMATS: [DecoderFormat; 2] = [DecoderFormat::H264AnnexB, DecoderFormat::H
 
 /// A converter of an H.264 track's packets to [`DecoderFormat::H264AnnexB`] or
 /// [`DecoderFormat::H264LengthPrefixed`], for use without a
-/// [`DecoderPacketStream`](crate::DecoderPacketStream).
+/// [`DecoderStream`](crate::DecoderStream).
 ///
 /// # Examples
 ///

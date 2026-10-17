@@ -21,7 +21,7 @@ const ADTS_MAX_FRAME: usize = 0x1fff;
 
 /// A converter of an AAC track's packets to [`DecoderFormat::AacRaw`] or
 /// [`DecoderFormat::AacAdts`], for use without a
-/// [`DecoderPacketStream`](crate::DecoderPacketStream).
+/// [`DecoderStream`](crate::DecoderStream).
 #[derive(Clone, Debug)]
 pub struct AacAdapter {
     /// The fields every ADTS header repeats, for [`DecoderFormat::AacAdts`].

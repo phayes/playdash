@@ -16,7 +16,7 @@ const FORMATS: [DecoderFormat; 2] = [DecoderFormat::HevcAnnexB, DecoderFormat::H
 
 /// A converter of an HEVC track's packets to [`DecoderFormat::HevcAnnexB`] or
 /// [`DecoderFormat::HevcLengthPrefixed`], for use without a
-/// [`DecoderPacketStream`](crate::DecoderPacketStream).
+/// [`DecoderStream`](crate::DecoderStream).
 #[derive(Clone, Debug)]
 pub struct HevcAdapter {
     /// Bytes of each NAL unit's length prefix in the track's samples.

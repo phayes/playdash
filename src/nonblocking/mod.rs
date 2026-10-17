@@ -32,7 +32,7 @@ mod packet_stream;
 mod stream;
 mod transport;
 
-pub use crate::decoder::nonblocking::DecoderPacketStream;
+pub use crate::decoder::nonblocking::DecoderStream;
 pub use cache::FragmentCache;
 pub use packet_stream::PacketStream;
 pub use stream::FragmentStream;

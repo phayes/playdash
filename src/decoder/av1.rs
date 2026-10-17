@@ -22,7 +22,7 @@ const OBU_TEMPORAL_DELIMITER: u8 = 2;
 
 /// A converter of an AV1 track's packets to [`DecoderFormat::Av1Obu`] or
 /// [`DecoderFormat::Av1Samples`], for use without a
-/// [`DecoderPacketStream`](crate::DecoderPacketStream).
+/// [`DecoderStream`](crate::DecoderStream).
 #[derive(Clone, Debug)]
 pub struct Av1Adapter {
     initialization: DecoderInitialization,

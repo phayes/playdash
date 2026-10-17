@@ -15,7 +15,7 @@ playdash = "0.2"
 
 | Feature | Default | What it adds |
 |---|---|---|
-| `sync` | yes | The blocking API: `FragmentStream`, `PacketStream`, `DecoderPacketStream`, `FragmentCache` and `Transport`, fetching through ureq |
+| `sync` | yes | The blocking API: `FragmentStream`, `PacketStream`, `DecoderStream`, `FragmentCache` and `Transport`, fetching through ureq |
 | `async` | no | `playdash::nonblocking`: the same API, async, fetching through reqwest on tokio |
 | `rodio` | no | `DashSource`, a ready-to-play rodio source (implies `sync`) |
 | `encryption` | no | Common Encryption (`cenc`, `cbcs`) decryption with keys you supply |
@@ -83,8 +83,8 @@ for packet in packets {
 
 A `Packet` holds an access unit as MP4 stores it, which is not always what a decoder reads:
 H.264 and HEVC samples carry length prefixes where decoders expect start codes, and codec
-configuration sits in MP4 boxes such as `avcC` and `dOps`. `into_decoder_packets` converts a
-`PacketStream` into a `DecoderPacketStream`. Its packets keep their timing, and
+configuration sits in MP4 boxes such as `avcC` and `dOps`. `into_decoder_stream` converts a
+`PacketStream` into a `DecoderStream`. Its packets keep their timing, and
 `initialization()` gives everything to configure the decoder with: a `DecoderFormat`, the
 initialization bytes in that format, and `DecoderParameters` such as the sample rate.
 playdash still doesn't decompress anything; you choose and run the decoder.
@@ -104,7 +104,7 @@ use std::time::Duration;
 use playdash::{DashManifest, PacketStream, TimeAccuracy};
 
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
-let mut input = PacketStream::new(manifest.stream("video")?)?.into_decoder_packets()?;
+let mut input = PacketStream::new(manifest.stream("video")?)?.into_decoder_stream()?;
 decoder.configure(input.initialization())?;
 
 // Seeking converts the pre-roll too. Reconfigure the decoder after resetting it.
@@ -128,10 +128,10 @@ initialization. Ask for that style, whatever the codec:
 ```rust,ignore
 use playdash::DecoderStyle;
 
-let input = packets.into_decoder_packets_for(DecoderStyle::ConfigRecord)?;
+let input = packets.into_decoder_stream_for(DecoderStyle::ConfigRecord)?;
 ```
 
-Other codecs have one format for both styles. `into_decoder_packets_as` asks for one
+Other codecs have one format for both styles. `into_decoder_stream_as` asks for one
 particular `DecoderFormat`, and fails if the codec cannot be converted to it, such as
 `DecoderFormat::AacAdts` for decoders that only read AAC with ADTS headers. The per-codec
 adapters in `playdash::decoder` convert packets one at a time.
@@ -146,7 +146,7 @@ cargo run --example save_flac -- MANIFEST_URL output.flac
 ## Async streaming
 
 The `async` feature adds `playdash::nonblocking`, the same API for applications on a tokio
-runtime: `DashManifest`, `FragmentStream`, `PacketStream`, `DecoderPacketStream`,
+runtime: `DashManifest`, `FragmentStream`, `PacketStream`, `DecoderStream`,
 `FragmentCache` and `Transport`.
 
 ```toml
@@ -272,7 +272,7 @@ let source = DashSource::new_with_keys(&manifest, "FLAC", keys)?;
 playdash is tested against the MP4 content of GPAC's
 [Telecom ParisTech DASH conformance set](https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/).
 
-We currently pass 52 / 81 (64%). 
+We currently pass 61 / 91 (67%).
 
 These are known limitations / failures where support is planned:
 
@@ -288,7 +288,7 @@ These are known limitations / failures where support is planned:
    content keys supplied by the caller; it does not acquire licenses.
 
 6. Codec changes within a stream are not supported. `PacketStream` refuses samples that switch
-   to another sample description, so a `DecoderPacketStream` keeps one initialization from
+   to another sample description, so a `DecoderStream` keeps one initialization from
    start to end.
 
 ## Example audio player

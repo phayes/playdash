@@ -1,4 +1,4 @@
-//! The codec-specific adapter a decoder packet stream converts packets with, chosen once
+//! The codec-specific adapter a decoder stream converts packets with, chosen once
 //! from the track's codec.
 
 use super::{
@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::mp4::codec::Codec;
 use crate::mp4::packet::{Packet, Seeked};
 
-/// What a decoder packet stream was asked to produce.
+/// What a decoder stream was asked to produce.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Choice {
     /// The format of this style for the track's codec.

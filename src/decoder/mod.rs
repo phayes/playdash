@@ -1,7 +1,7 @@
 //! Decoder-ready packets: a track's compressed access units rewritten into the form codec
 //! decoders read, with the initialization a decoder needs before them.
 //!
-//! [`DecoderPacketStream`] is the usual way in. The per-codec adapters here do the same
+//! [`DecoderStream`] is the usual way in. The per-codec adapters here do the same
 //! conversion one packet at a time.
 
 mod aac;
@@ -14,18 +14,18 @@ mod nal;
 #[cfg(feature = "async")]
 pub(crate) mod nonblocking;
 mod opus;
-#[cfg(feature = "sync")]
-mod packet_stream;
 mod passthrough;
+#[cfg(feature = "sync")]
+mod stream;
 
 pub use aac::AacAdapter;
 pub(crate) use adapter::{Adapter, Choice};
 pub use av1::Av1Adapter;
 pub use h264::H264Adapter;
 pub use hevc::HevcAdapter;
-#[cfg(feature = "sync")]
-pub use packet_stream::DecoderPacketStream;
 pub use passthrough::PassthroughAdapter;
+#[cfg(feature = "sync")]
+pub use stream::DecoderStream;
 
 use crate::error::Error;
 use crate::mp4::codec::Codec;
@@ -287,7 +287,7 @@ impl DecoderPacket {
     }
 }
 
-/// A [`DecoderPacketStream`] seek's landing point, and the packets to decode before
+/// A [`DecoderStream`] seek's landing point, and the packets to decode before
 /// continuing.
 ///
 /// Reset the decoder and configure it with the stream's initialization, feed it

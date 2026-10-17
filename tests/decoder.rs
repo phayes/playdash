@@ -1,4 +1,4 @@
-//! `DecoderPacketStream` against real DASH output from ffmpeg: decoder-ready packets that
+//! `DecoderStream` against real DASH output from ffmpeg: decoder-ready packets that
 //! carry the same access units and timing as `PacketStream`'s MP4 packets for every codec,
 //! and, with the `ffmpeg-tests` feature, decode to the same output as the source.
 #![cfg(feature = "sync")]
@@ -7,9 +7,8 @@ mod common;
 
 use common::{Fixtures, fragment_stream, fragment_stream_through, muxed};
 use playdash::{
-    Bytes, Codec, DecoderFormat, DecoderPacket, DecoderPacketStream, DecoderParameters,
-    DecoderStyle, Error, Fragment, FragmentCache, FragmentStream, Packet, PacketStream,
-    TimeAccuracy, Transport,
+    Bytes, Codec, DecoderFormat, DecoderPacket, DecoderParameters, DecoderStream, DecoderStyle,
+    Error, Fragment, FragmentCache, FragmentStream, Packet, PacketStream, TimeAccuracy, Transport,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,8 +23,8 @@ fn packets(name: &str) -> PacketStream {
     PacketStream::new(fragment_stream(name, Arc::default())).unwrap()
 }
 
-fn decoder_packets(name: &str) -> DecoderPacketStream {
-    packets(name).into_decoder_packets().unwrap()
+fn decoder_stream(name: &str) -> DecoderStream {
+    packets(name).into_decoder_stream().unwrap()
 }
 
 /// The format fixture `name` converts to.
@@ -134,7 +133,7 @@ fn assert_all_converted(
 #[test]
 fn every_codec_has_its_initialization() {
     for name in AUDIO.iter().chain(&VIDEO) {
-        let stream = decoder_packets(name);
+        let stream = decoder_stream(name);
         let initialization = stream.initialization();
         let data = &initialization.data[..];
         assert_eq!(initialization.format, format_of(name), "{name}");
@@ -242,7 +241,7 @@ fn every_codec_has_its_initialization() {
 #[test]
 fn every_codec_converts_the_mp4_packets() {
     for name in AUDIO.iter().chain(&VIDEO) {
-        let converted: Vec<DecoderPacket> = decoder_packets(name).map(Result::unwrap).collect();
+        let converted: Vec<DecoderPacket> = decoder_stream(name).map(Result::unwrap).collect();
         let packets: Vec<Packet> = packets(name).map(Result::unwrap).collect();
         assert!(packets.len() > 10, "{name}");
         assert_all_converted(name, format_of(name), &converted, &packets);
@@ -259,7 +258,7 @@ fn seek_preroll_is_converted_like_every_other_packet() {
         ] {
             let context = format!("{name} {time:?} {accuracy:?}");
             let format = format_of(name);
-            let mut stream = decoder_packets(name);
+            let mut stream = decoder_stream(name);
             let mut plain = packets(name);
 
             let seeked = stream.seek_time(time, accuracy).unwrap();
@@ -293,7 +292,7 @@ fn config_record_style_gives_the_mp4_packets_with_their_record() {
     for name in AUDIO.iter().chain(&VIDEO) {
         let format = config_record_format_of(name);
         let mut stream = packets(name)
-            .into_decoder_packets_for(DecoderStyle::ConfigRecord)
+            .into_decoder_stream_for(DecoderStyle::ConfigRecord)
             .unwrap();
         let initialization = stream.initialization().clone();
         assert_eq!(initialization.format, format, "{name}");
@@ -316,13 +315,13 @@ fn config_record_style_gives_the_mp4_packets_with_their_record() {
             // One format serves both styles.
             _ => assert_eq!(
                 &initialization,
-                decoder_packets(name).initialization(),
+                decoder_stream(name).initialization(),
                 "{name}"
             ),
         }
 
         // Asking for the format itself gives the same stream.
-        let exact = packets(name).into_decoder_packets_as(format).unwrap();
+        let exact = packets(name).into_decoder_stream_as(format).unwrap();
         assert_eq!(exact.initialization(), &initialization, "{name}");
 
         let converted: Vec<DecoderPacket> = stream.by_ref().map(Result::unwrap).collect();
@@ -340,7 +339,7 @@ fn config_record_style_gives_the_mp4_packets_with_their_record() {
 fn adts_puts_a_header_on_every_aac_access_unit() {
     for name in ["aac", "he_aac"] {
         let mut stream = packets(name)
-            .into_decoder_packets_as(DecoderFormat::AacAdts)
+            .into_decoder_stream_as(DecoderFormat::AacAdts)
             .unwrap();
         assert_eq!(stream.initialization().format, DecoderFormat::AacAdts);
         assert!(stream.initialization().data.is_empty(), "{name}");
@@ -369,7 +368,7 @@ fn both_tracks_of_a_muxed_representation_convert() {
     for (track, format) in [(1, DecoderFormat::H264AnnexB), (2, DecoderFormat::AacRaw)] {
         let converted = PacketStream::with_track(stream(), track)
             .unwrap()
-            .into_decoder_packets()
+            .into_decoder_stream()
             .unwrap();
         assert_eq!(converted.initialization().format, format);
         let converted: Vec<DecoderPacket> = converted.map(Result::unwrap).collect();
@@ -389,7 +388,7 @@ fn both_tracks_of_a_muxed_representation_convert() {
 #[test]
 fn mismatched_formats_are_refused() {
     let error = packets("h264")
-        .into_decoder_packets_as(DecoderFormat::AacRaw)
+        .into_decoder_stream_as(DecoderFormat::AacRaw)
         .unwrap_err();
     assert!(
         matches!(
@@ -405,17 +404,17 @@ fn mismatched_formats_are_refused() {
          length-prefixed H.264"
     );
     assert!(matches!(
-        packets("aac").into_decoder_packets_as(DecoderFormat::Mp3),
+        packets("aac").into_decoder_stream_as(DecoderFormat::Mp3),
         Err(Error::UnsupportedDecoderInput { codec, .. }) if codec == "AAC"
     ));
 
     for name in AUDIO.iter().chain(&VIDEO) {
         let explicit = packets(name)
-            .into_decoder_packets_as(format_of(name))
+            .into_decoder_stream_as(format_of(name))
             .unwrap();
         assert_eq!(
             explicit.initialization(),
-            decoder_packets(name).initialization(),
+            decoder_stream(name).initialization(),
             "{name}"
         );
     }
@@ -449,7 +448,7 @@ fn a_malformed_packet_ends_iteration_until_a_seek() {
     let fragments = fragment_stream_through("h264", Arc::new(CorruptH264::default()));
     let mut stream = PacketStream::new(fragments)
         .unwrap()
-        .into_decoder_packets()
+        .into_decoder_stream()
         .unwrap();
 
     // The first segment's packets, then the error, once.
@@ -461,7 +460,7 @@ fn a_malformed_packet_ends_iteration_until_a_seek() {
     let fragments = fragment_stream_through("h264", Arc::new(CorruptH264::default()));
     let mut fresh = PacketStream::new(fragments)
         .unwrap()
-        .into_decoder_packets()
+        .into_decoder_stream()
         .unwrap();
     let error = fresh.find_map(Result::err).unwrap();
     assert!(
@@ -482,7 +481,7 @@ fn a_malformed_packet_ends_iteration_until_a_seek() {
     assert!(stream.next().is_none());
 }
 
-/// The same decoder-ready packets and seeks through `nonblocking::DecoderPacketStream`.
+/// The same decoder-ready packets and seeks through `nonblocking::DecoderStream`.
 #[cfg(feature = "async")]
 mod nonblocking {
     use super::*;
@@ -490,19 +489,19 @@ mod nonblocking {
     use futures_util::StreamExt;
     use playdash::nonblocking;
 
-    async fn decoder_packets(name: &str) -> nonblocking::DecoderPacketStream {
+    async fn decoder_stream(name: &str) -> nonblocking::DecoderStream {
         nonblocking::PacketStream::new(async_fragment_stream(name).await)
             .await
             .unwrap()
-            .into_decoder_packets()
+            .into_decoder_stream()
             .unwrap()
     }
 
     #[tokio::test]
     async fn every_codec_matches_the_blocking_stream() {
         for name in AUDIO.iter().chain(&VIDEO) {
-            let stream = decoder_packets(name).await;
-            let blocking = super::decoder_packets(name);
+            let stream = decoder_stream(name).await;
+            let blocking = super::decoder_stream(name);
             assert_eq!(stream.initialization(), blocking.initialization(), "{name}");
             assert_eq!(stream.codec(), blocking.codec(), "{name}");
             let packets: Vec<DecoderPacket> = stream.map(Result::unwrap).collect().await;
@@ -518,8 +517,8 @@ mod nonblocking {
                 (Duration::from_millis(1_300), TimeAccuracy::Packet),
                 (Duration::from_millis(600), TimeAccuracy::Fragment),
             ] {
-                let mut stream = decoder_packets(name).await;
-                let mut blocking = super::decoder_packets(name);
+                let mut stream = decoder_stream(name).await;
+                let mut blocking = super::decoder_stream(name);
                 assert_eq!(
                     stream.seek_time(time, accuracy).await.unwrap(),
                     blocking.seek_time(time, accuracy).unwrap(),
@@ -538,10 +537,10 @@ mod nonblocking {
             let stream = nonblocking::PacketStream::new(async_fragment_stream(name).await)
                 .await
                 .unwrap()
-                .into_decoder_packets_for(DecoderStyle::ConfigRecord)
+                .into_decoder_stream_for(DecoderStyle::ConfigRecord)
                 .unwrap();
             let blocking = super::packets(name)
-                .into_decoder_packets_for(DecoderStyle::ConfigRecord)
+                .into_decoder_stream_for(DecoderStyle::ConfigRecord)
                 .unwrap();
             assert_eq!(stream.initialization(), blocking.initialization(), "{name}");
             let packets: Vec<DecoderPacket> = stream.map(Result::unwrap).collect().await;
@@ -556,7 +555,7 @@ mod nonblocking {
             .await
             .unwrap();
         assert!(matches!(
-            packets.into_decoder_packets_as(DecoderFormat::Flac),
+            packets.into_decoder_stream_as(DecoderFormat::Flac),
             Err(Error::UnsupportedDecoderInput {
                 format: Some(DecoderFormat::Flac),
                 ..
@@ -792,7 +791,7 @@ mod ffmpeg {
     #[test]
     fn every_codec_decodes_to_the_source_output() {
         for name in VIDEO.iter().chain(&AUDIO) {
-            let stream = decoder_packets(name);
+            let stream = decoder_stream(name);
             let initialization = stream.initialization().data.clone();
             let packets: Vec<DecoderPacket> = stream.map(Result::unwrap).collect();
             let packets: Vec<&DecoderPacket> = packets.iter().collect();
@@ -810,7 +809,7 @@ mod ffmpeg {
     fn adts_decodes_to_the_source_output() {
         for name in ["aac", "he_aac"] {
             let stream = packets(name)
-                .into_decoder_packets_as(DecoderFormat::AacAdts)
+                .into_decoder_stream_as(DecoderFormat::AacAdts)
                 .unwrap();
             let mut adts = stream.initialization().data.to_vec();
             for packet in stream {
@@ -826,14 +825,14 @@ mod ffmpeg {
     fn video_decodes_from_a_seek_to_any_frame_to_the_source_frames() {
         for name in VIDEO {
             let reference = frame_hashes(&[], source(name), "framehash");
-            let all: Vec<DecoderPacket> = decoder_packets(name).map(Result::unwrap).collect();
+            let all: Vec<DecoderPacket> = decoder_stream(name).map(Result::unwrap).collect();
             let timescale = all[0].timescale;
 
             // A packet-accurate seek to every frame's presentation time.
             for target in all.iter().filter(|packet| packet.pts >= 0) {
                 let time = Duration::from_secs_f64(target.pts as f64 / f64::from(timescale));
                 let context = format!("{name} seeking to {}", target.pts);
-                let mut stream = decoder_packets(name);
+                let mut stream = decoder_stream(name);
                 let initialization = stream.initialization().data.clone();
                 let seeked = stream.seek_time(time, TimeAccuracy::Packet).unwrap();
                 let rest: Vec<DecoderPacket> = stream.map(Result::unwrap).collect();

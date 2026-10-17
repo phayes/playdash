@@ -17,9 +17,9 @@
     fragment it names. Leading pictures that cannot be decoded from where decoding starts,
     flagged in the sample flags or, for HEVC, RASL pictures, are left out; when one would be
     shown, decoding starts at the keyframe before.
-- `DecoderPacketStream` (blocking and async): a `PacketStream`'s packets in the form codec
-  decoders read, from `PacketStream::into_decoder_packets`, `into_decoder_packets_for` or
-  `into_decoder_packets_as`. It yields `DecoderPacket`s with the same timing as `Packet`s,
+- `DecoderStream` (blocking and async): a `PacketStream`'s packets in the form codec
+  decoders read, from `PacketStream::into_decoder_stream`, `into_decoder_stream_for` or
+  `into_decoder_stream_as`. It yields `DecoderPacket`s with the same timing as `Packet`s,
   and `initialization()` gives the `DecoderInitialization` to configure a decoder with: a
   `DecoderFormat`, its initialization bytes and `DecoderParameters`. `seek_time` returns a
   `DecoderSeeked` whose pre-roll is converted the same way.

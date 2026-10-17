@@ -1,4 +1,4 @@
-//! A representation's decoder-ready packets: the async `DecoderPacketStream` over a
+//! A representation's decoder-ready packets: the async `DecoderStream` over a
 //! `nonblocking::PacketStream`.
 
 use super::adapter::Choice;
@@ -16,11 +16,11 @@ use std::time::Duration;
 /// A track's compressed packets in the form its codec's decoders read: a [`Stream`] of
 /// [`DecoderPacket`]s in decode order, with the [`DecoderInitialization`] to configure a
 /// decoder with first, and time seeking. The async counterpart of the blocking
-/// `playdash::DecoderPacketStream`.
+/// `playdash::DecoderStream`.
 ///
-/// Made by [`PacketStream::into_decoder_packets`], which chooses the elementary format of
-/// the codec, [`PacketStream::into_decoder_packets_for`] or
-/// [`PacketStream::into_decoder_packets_as`].
+/// Made by [`PacketStream::into_decoder_stream`], which chooses the elementary format of
+/// the codec, [`PacketStream::into_decoder_stream_for`] or
+/// [`PacketStream::into_decoder_stream_as`].
 ///
 /// After an error, the stream yields it once and then ends, until a seek succeeds.
 ///
@@ -35,7 +35,7 @@ use std::time::Duration;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd").await?;
 /// let packets = PacketStream::new(manifest.stream("video").await?).await?;
-/// let mut input = packets.into_decoder_packets()?;
+/// let mut input = packets.into_decoder_stream()?;
 /// let initialization = input.initialization().clone();
 /// // configure the decoder with initialization.data and initialization.parameters
 /// # let _ = initialization;
@@ -51,7 +51,7 @@ use std::time::Duration;
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct DecoderPacketStream {
+pub struct DecoderStream {
     packets: PacketStream,
     adapter: Adapter,
     /// Set once the stream has yielded an error, so it ends rather than carrying on past
@@ -59,7 +59,7 @@ pub struct DecoderPacketStream {
     failed: bool,
 }
 
-impl DecoderPacketStream {
+impl DecoderStream {
     /// The packets of `packets` in the format `choice` asks for.
     pub(crate) fn new(packets: PacketStream, choice: Choice) -> Result<Self, Error> {
         let adapter = Adapter::new(packets.codec(), choice)?;
@@ -121,7 +121,7 @@ impl DecoderPacketStream {
     }
 }
 
-impl Stream for DecoderPacketStream {
+impl Stream for DecoderStream {
     type Item = Result<DecoderPacket, Error>;
 
     /// The next packet in decode order.

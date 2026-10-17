@@ -1,11 +1,12 @@
 //! Real-world DASH content from GPAC's Telecom ParisTech conformance set: every manifest
-//! under `tests/files/conformance/pass` parses, each representation streams, and
-//! `PacketStream` reads every track. Streaming needs the `conformance` feature. See
-//! `tests/files/conformance/README.md`.
+//! under `tests/files/conformance/pass` parses, and, to the level its `test_type` says,
+//! lists its fragments and streams each representation, with `PacketStream` reading every
+//! track. Streaming needs the `conformance` feature. See `tests/files/conformance/README.md`.
 #![cfg(feature = "sync")]
 
 mod common;
 
+use playdash::DashManifest;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,20 +16,43 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/files/conformance")
 }
 
+type Checked = Result<(), Box<dyn std::error::Error>>;
+
+/// How much of a manifest is checked. Each level checks everything the ones before it do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TestType {
+    /// It parses. Offline.
+    Parse,
+    /// Each representation's ID also reaches it, and it lists its fragments, one per
+    /// media segment of its timeline. Offline.
+    Manifest,
+    /// Each representation also streams from GPAC's server. Needs the `conformance`
+    /// feature.
+    #[default]
+    Full,
+}
+
 /// A manifest's entry in `index.json`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
     /// Where the manifest was downloaded from, which its relative URLs resolve against.
     url: String,
+    /// How much of it is checked. `full` when absent.
+    #[serde(default)]
+    test_type: TestType,
     /// Why a manifest under `fail/` fails, as this crate's fault.
     reason: Option<String>,
-    /// Why a manifest under `fail/` cannot pass whatever this crate does, such as media
-    /// missing from the server.
+    /// Why a manifest under `invalid/` cannot pass whatever this crate does, as the
+    /// manifest or its media is broken.
     invalid_reason: Option<String>,
+    /// Anything else to know about the manifest, such as why its `test_type` is below
+    /// `full`.
+    note: Option<String>,
 }
 
-/// `index.json`: each manifest's entry, by its path under `pass/` or `fail/`.
+/// `index.json`: each manifest's entry, by its path under `pass/`, `fail/` or `invalid/`.
 fn index() -> BTreeMap<String, Entry> {
     let path = root().join("index.json");
     let json = fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
@@ -62,7 +86,7 @@ fn manifests(dir: &str) -> Vec<String> {
 #[test]
 fn index_lists_every_manifest() {
     let mut index = index();
-    for (dir, failing) in [("pass", false), ("fail", true)] {
+    for dir in ["pass", "fail", "invalid"] {
         for path in manifests(dir) {
             let entry = index.remove(&path);
             let entry = entry.unwrap_or_else(|| panic!("{dir}/{path} is not in index.json"));
@@ -71,27 +95,106 @@ fn index_lists_every_manifest() {
                 "{dir}/{path} has the URL of another path: {}",
                 entry.url
             );
-            let reasons = usize::from(entry.reason.is_some())
-                + usize::from(entry.invalid_reason.is_some());
             assert_eq!(
-                reasons,
-                usize::from(failing),
-                "{dir}/{path}: each manifest under fail/, and only those, has a reason or an \
-                 invalid_reason in index.json"
+                (entry.reason.is_some(), entry.invalid_reason.is_some()),
+                (dir == "fail", dir == "invalid"),
+                "{dir}/{path}: each manifest under fail/, and only those, has a reason, and \
+                 each under invalid/, and only those, has an invalid_reason in index.json"
+            );
+            assert!(
+                dir != "pass" || entry.test_type == TestType::Full || entry.note.is_some(),
+                "{dir}/{path}: its test_type is below full, so it needs a note saying why"
             );
         }
     }
     let missing: Vec<_> = index.keys().collect();
     assert!(
         missing.is_empty(),
-        "in index.json but not under pass/ or fail/: {missing:?}"
+        "in index.json but not under pass/, fail/ or invalid/: {missing:?}"
     );
 }
 
-/// Streaming each manifest under `pass/` from GPAC's server.
+#[test]
+fn offline_manifests_check() {
+    let index = index();
+    let paths: Vec<String> = manifests("pass")
+        .into_iter()
+        .filter(|path| index[path].test_type < TestType::Full)
+        .collect();
+    let mut failures = Vec::new();
+    for path in &paths {
+        let entry = &index[path];
+        let checked = parse(path, entry).and_then(|manifest| {
+            if entry.test_type >= TestType::Manifest {
+                check_ids(&manifest)?;
+                check_fragments(&manifest)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = checked {
+            failures.push(format!("{path}: {error}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} manifests failed:\n{}",
+        failures.len(),
+        paths.len(),
+        failures.join("\n")
+    );
+}
+
+/// Parses manifest `path` of `pass/`, resolving against where it was downloaded from.
+fn parse(path: &str, entry: &Entry) -> Result<DashManifest, Box<dyn std::error::Error>> {
+    let xml = fs::read_to_string(root().join("pass").join(path))?;
+    Ok(DashManifest::new(xml)?.with_base_url(&entry.url)?)
+}
+
+/// Checks each representation of `manifest` is the one its ID reaches.
+fn check_ids(manifest: &DashManifest) -> Checked {
+    for representation in manifest.representations() {
+        let id = representation.id;
+        let reached = manifest.representation(id).ok_or("not reached by its ID")?;
+        if reached.adaptation_set != representation.adaptation_set {
+            return Err(format!(
+                "representation {id} of adaptation set {} is reached in adaptation set {}",
+                representation.adaptation_set, reached.adaptation_set
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Checks each representation of `manifest` lists at least one media fragment, one per
+/// media segment of its timeline.
+fn check_fragments(manifest: &DashManifest) -> Checked {
+    for representation in manifest.representations() {
+        let id = representation.id;
+        let listed = manifest
+            .fragments(id)
+            .and_then(|fragments| Ok((fragments, manifest.media_timeline(id)?)));
+        let (fragments, timeline) =
+            listed.map_err(|error| format!("representation {id}: {error}"))?;
+        if fragments.media.is_empty() {
+            return Err(format!("representation {id} has no media fragments").into());
+        }
+        if fragments.media.len() != timeline.media_durations.len() {
+            return Err(format!(
+                "representation {id} lists {} media fragments for {} timeline segments",
+                fragments.media.len(),
+                timeline.media_durations.len()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Streaming each `full` manifest under `pass/` from GPAC's server.
 #[cfg(feature = "conformance")]
 mod stream {
-    use super::{Entry, index, manifests, root};
+    use super::{Checked, Entry, TestType, check_fragments, check_ids, index, manifests, parse};
     use crate::common::{self, Probe};
     use playdash::{
         Bytes, ContentKind, DashManifest, Error, Fragment, FragmentCache, FragmentStream, Packet,
@@ -120,7 +223,7 @@ mod stream {
         let filter = env::var("PLAYDASH_CONFORMANCE_FILTER").unwrap_or_default();
         let paths: Vec<String> = manifests("pass")
             .into_iter()
-            .filter(|path| path.contains(&filter))
+            .filter(|path| index[path].test_type == TestType::Full && path.contains(&filter))
             .collect();
         let transport = Arc::new(Network::from_env());
         let ffprobe = Command::new("ffprobe").arg("-version").output().is_ok();
@@ -169,28 +272,22 @@ mod stream {
         }
     }
 
-    type Checked = Result<(), Box<dyn std::error::Error>>;
-
-    /// Checks manifest `path` of `pass/`: it parses, and every representation streams.
+    /// Checks manifest `path` of `pass/`: it passes the `manifest` checks once its segment
+    /// indexes load, and every representation streams.
     fn check_manifest(
         path: &str,
         entry: &Entry,
         transport: &Arc<Network>,
         ffprobe: bool,
     ) -> Checked {
-        let xml = fs::read_to_string(root().join("pass").join(path))?;
-        let mut manifest = DashManifest::new(xml)?.with_base_url(&entry.url)?;
+        let mut manifest = parse(path, entry)?;
         manifest.load_segment_indexes(transport.as_ref());
+        check_ids(&manifest)?;
+        check_fragments(&manifest)?;
 
         let cache = Arc::new(FragmentCache::new(transport.clone()));
         for representation in manifest.representations() {
             let id = representation.id;
-            let reached = manifest.representation(id).unwrap();
-            assert_eq!(
-                reached.adaptation_set, representation.adaptation_set,
-                "representation {id} of adaptation set {} is reached by its ID",
-                representation.adaptation_set
-            );
             check_representation(&manifest, &representation, &cache, ffprobe)
                 .map_err(|error| format!("representation {id}: {error}"))?;
         }
@@ -234,7 +331,8 @@ mod stream {
         let spans = timeline.spans();
         let read = spans[FRAGMENTS.min(spans.len()) - 1].end - spans[0].start;
         let middle = (spans[0].start + spans[spans.len() - 1].end) / 2;
-        let origin = Duration::from_secs_f64(timeline.origin as f64 / f64::from(timeline.timescale));
+        let origin =
+            Duration::from_secs_f64(timeline.origin as f64 / f64::from(timeline.timescale));
         for track in &tracks {
             if track.kind == ContentKind::Text {
                 continue;

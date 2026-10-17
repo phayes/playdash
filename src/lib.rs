@@ -35,7 +35,7 @@ pub use buffer::{BufferAmount, BufferHandle, BufferStatus, BufferTotal};
 pub use cenc::ContentKeys;
 #[cfg(feature = "sync")]
 #[doc(inline)]
-pub use decoder::DecoderPacketStream;
+pub use decoder::DecoderStream;
 #[cfg(any(feature = "sync", feature = "async"))]
 #[doc(inline)]
 pub use decoder::{

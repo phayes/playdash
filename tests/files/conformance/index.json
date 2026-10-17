@@ -1,7 +1,8 @@
 {
   "advanced/durations_mismatch.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/durations_mismatch.mpd",
-    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+    "test_type": "manifest",
+    "note": "Its media is missing from GPAC's server (404)."
   },
   "advanced/empty-segments.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/empty-segments.mpd",
@@ -9,23 +10,29 @@
   },
   "advanced/non-matching-codec.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/non-matching-codec.mpd",
-    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+    "test_type": "parse",
+    "note": "Its media, which holds its SegmentBase index, is missing from GPAC's server (404), so its fragments cannot be listed."
   },
   "advanced/non-matching-frame-rate.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/non-matching-frame-rate.mpd",
-    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+    "test_type": "parse",
+    "note": "Its media, which holds its SegmentBase index, is missing from GPAC's server (404), so its fragments cannot be listed."
   },
   "advanced/non-matching-width.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/non-matching-width.mpd",
-    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+    "test_type": "parse",
+    "note": "Its media, which holds its SegmentBase index, is missing from GPAC's server (404), so its fragments cannot be listed."
   },
   "advanced/not-all-tracks-as-reps.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/not-all-tracks-as-reps.mpd",
-    "invalid_reason": "audio-video.mp4 is missing from GPAC's server (404). playdash also does not support a Representation addressed by a BaseURL alone, as a single segment."
+    "test_type": "manifest",
+    "reason": "A Representation addressed by a BaseURL alone, as a single segment, is not supported.",
+    "note": "Its media, audio-video.mp4, is missing from GPAC's server (404)."
   },
   "advanced/par_w_h.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/par_w_h.mpd",
-    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+    "test_type": "parse",
+    "note": "Its media, which holds its SegmentBase index, is missing from GPAC's server (404), so its fragments cannot be listed."
   },
   "advanced/periods/gap/periods_gap_segmentbase-extra-media.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/gap/periods_gap_segmentbase-extra-media.mpd",
@@ -106,19 +113,23 @@
   "advanced/pto/pto_segmenttimeline.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/pto/pto_segmenttimeline.mpd" },
   "advanced/same_init_as.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/same_init_as.mpd",
-    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+    "test_type": "parse",
+    "note": "Its media is missing from GPAC's server (404), and its two Representations share the ID 1, which DASH forbids within a Period, so one cannot be reached by its ID."
   },
   "advanced/segmenttemplate_merge.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/segmenttemplate_merge.mpd",
-    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+    "test_type": "manifest",
+    "note": "Its media is missing from GPAC's server (404)."
   },
   "advanced/segmenttimeline_time.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/segmenttimeline_time.mpd",
-    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+    "test_type": "manifest",
+    "note": "Its media is missing from GPAC's server (404)."
   },
   "advanced/zero-width.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/zero-width.mpd",
-    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+    "test_type": "manifest",
+    "note": "Its media is missing from GPAC's server (404)."
   },
   "mp4-full-gdr/mp4-full-gdr-mpd-AV-BS.mpd": {
     "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-full-gdr/mp4-full-gdr-mpd-AV-BS.mpd",

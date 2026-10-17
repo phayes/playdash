@@ -1,7 +1,7 @@
 //! A representation's packets: the blocking `PacketStream` over a `FragmentStream`.
 
 use crate::buffer::BufferHandle;
-use crate::decoder::{Choice, DecoderFormat, DecoderPacketStream, DecoderStyle};
+use crate::decoder::{Choice, DecoderFormat, DecoderStream, DecoderStyle};
 use crate::error::Error;
 use crate::mp4::codec::Codec;
 use crate::mp4::demux::{Demuxer, Loaded, Split};
@@ -201,36 +201,30 @@ impl PacketStream {
 
     /// Converts this stream to one of decoder-ready packets in its codec's elementary
     /// format, such as [`DecoderFormat::H264AnnexB`] for H.264. The same as
-    /// [`Self::into_decoder_packets_for`] with [`DecoderStyle::Elementary`].
+    /// [`Self::into_decoder_stream_for`] with [`DecoderStyle::Elementary`].
     ///
     /// Fails with [`Error::UnsupportedDecoderInput`] if the codec has no decoder-ready
     /// form, and with [`Error::MalformedDecoderInput`] if its MP4 decoder configuration
     /// is damaged.
-    pub fn into_decoder_packets(self) -> Result<DecoderPacketStream, Error> {
-        self.into_decoder_packets_for(DecoderStyle::Elementary)
+    pub fn into_decoder_stream(self) -> Result<DecoderStream, Error> {
+        self.into_decoder_stream_for(DecoderStyle::Elementary)
     }
 
     /// Converts this stream to one of decoder-ready packets in its codec's format of
     /// `style`, such as [`DecoderFormat::H264LengthPrefixed`] for H.264 in
     /// [`DecoderStyle::ConfigRecord`].
     ///
-    /// Fails like [`Self::into_decoder_packets`].
-    pub fn into_decoder_packets_for(
-        self,
-        style: DecoderStyle,
-    ) -> Result<DecoderPacketStream, Error> {
-        DecoderPacketStream::new(self, Choice::Style(style))
+    /// Fails like [`Self::into_decoder_stream`].
+    pub fn into_decoder_stream_for(self, style: DecoderStyle) -> Result<DecoderStream, Error> {
+        DecoderStream::new(self, Choice::Style(style))
     }
 
     /// Converts this stream to one of decoder-ready packets in `format`.
     ///
-    /// Fails like [`Self::into_decoder_packets`], and with
+    /// Fails like [`Self::into_decoder_stream`], and with
     /// [`Error::UnsupportedDecoderInput`] if the codec cannot be converted to `format`.
-    pub fn into_decoder_packets_as(
-        self,
-        format: DecoderFormat,
-    ) -> Result<DecoderPacketStream, Error> {
-        DecoderPacketStream::new(self, Choice::Format(format))
+    pub fn into_decoder_stream_as(self, format: DecoderFormat) -> Result<DecoderStream, Error> {
+        DecoderStream::new(self, Choice::Format(format))
     }
 
     /// The packets of a media fragment `part`.

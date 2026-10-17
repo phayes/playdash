@@ -1,4 +1,4 @@
-//! A representation's decoder-ready packets: the blocking `DecoderPacketStream` over a
+//! A representation's decoder-ready packets: the blocking `DecoderStream` over a
 //! `PacketStream`.
 
 use super::adapter::Choice;
@@ -14,9 +14,9 @@ use std::time::Duration;
 /// of [`DecoderPacket`]s in decode order, with the [`DecoderInitialization`] to
 /// configure a decoder with first, and time seeking.
 ///
-/// Made by [`PacketStream::into_decoder_packets`], which chooses the elementary format of
-/// the codec, [`PacketStream::into_decoder_packets_for`] or
-/// [`PacketStream::into_decoder_packets_as`].
+/// Made by [`PacketStream::into_decoder_stream`], which chooses the elementary format of
+/// the codec, [`PacketStream::into_decoder_stream_for`] or
+/// [`PacketStream::into_decoder_stream_as`].
 ///
 /// After an error, iteration yields it once and then ends, until a seek succeeds.
 ///
@@ -28,7 +28,7 @@ use std::time::Duration;
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
-/// let mut input = PacketStream::new(manifest.stream("video")?)?.into_decoder_packets()?;
+/// let mut input = PacketStream::new(manifest.stream("video")?)?.into_decoder_stream()?;
 /// let initialization = input.initialization().clone();
 /// // configure the decoder with initialization.data and initialization.parameters
 /// # let _ = initialization;
@@ -48,7 +48,7 @@ use std::time::Duration;
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct DecoderPacketStream {
+pub struct DecoderStream {
     packets: PacketStream,
     adapter: Adapter,
     /// Set once iteration has yielded an error, so it ends rather than carrying on
@@ -56,7 +56,7 @@ pub struct DecoderPacketStream {
     failed: bool,
 }
 
-impl DecoderPacketStream {
+impl DecoderStream {
     /// The packets of `packets` in the format `choice` asks for.
     pub(crate) fn new(packets: PacketStream, choice: Choice) -> Result<Self, Error> {
         let adapter = Adapter::new(packets.codec(), choice)?;
@@ -118,7 +118,7 @@ impl DecoderPacketStream {
     }
 }
 
-impl Iterator for DecoderPacketStream {
+impl Iterator for DecoderStream {
     type Item = Result<DecoderPacket, Error>;
 
     /// The next packet in decode order. Blocks while its fragment downloads.

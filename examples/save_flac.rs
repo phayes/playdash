@@ -47,7 +47,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // FLAC frames with the stream header.
     let packets = PacketStream::new(manifest.stream(&id)?)?;
-    let mut input = packets.into_decoder_packets_as(DecoderFormat::Flac)?;
+    let mut input = packets.into_decoder_stream_as(DecoderFormat::Flac)?;
     if let Some(seconds) = args.start {
         // FLAC frames decode on their own, so there is no pre-roll to write.
         let seeked = input.seek_time(Duration::from_secs_f64(seconds), TimeAccuracy::Packet)?;
