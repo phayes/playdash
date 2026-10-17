@@ -81,10 +81,10 @@ They are not needed on the ordinary path.
 Public types
 ------------
 
-DecoderPacket contains transformed compressed bytes and all of Packet's
+MediaPacket contains transformed compressed bytes and all of Packet's
 timing information:
 
-    pub struct DecoderPacket {
+    pub struct MediaPacket {
         pub data: Bytes,
         pub pts: i64,
         pub dts: i64,
@@ -96,7 +96,7 @@ timing information:
     }
 
 It is a separate type from Packet so the two byte contracts cannot be
-confused: Packet is MP4-native; DecoderPacket is in DecoderFormat.
+confused: Packet is MP4-native; MediaPacket is in DecoderFormat.
 
 DecoderInitialization describes both the byte representation and semantic
 parameters a decoder may need:
@@ -155,13 +155,13 @@ Convenvience API
 ----------------
 
 impl PacketStream {
-    pub fn decoder_stream(self) -> Result<DecoderStream, Error>;
+    pub fn media_stream(self) -> Result<MediaStream, Error>;
 }
 
-DecoderStream would:
+MediaStream would:
 - Automatically select H264AnnexBAdapter, HevcAnnexBAdapter, etc.
 - Hold normalized decoder initialization.
-- Yield decoder-ready compressed DecoderPackets.
+- Yield decoder-ready compressed MediaPackets.
 - Transform seek preroll through the same adapter.
 - Preserve timing, trimming, and keyframe metadata.
 
@@ -255,13 +255,13 @@ DecoderInput must own seeking so it also transforms pre-roll packets:
         // Decode normally; discard output before seeked.discard_before.
     }
 
-The seek result mirrors Seeked but contains DecoderPackets:
+The seek result mirrors Seeked but contains MediaPackets:
 
-    pub struct DecoderSeeked {
+    pub struct MediaSeeked {
         pub requested: Duration,
         pub landed: i64,
         pub discard_before: i64,
-        pub preroll: Vec<DecoderPacket>,
+        pub preroll: Vec<MediaPacket>,
     }
 
 Initialization remains available after every seek because a consumer normally
@@ -306,9 +306,9 @@ Implementation sequence
 -----------------------
 
 1. Define DecoderFormat, DecoderParameters, DecoderInitialization,
-   DecoderPacket, DecoderSeeked, and the blocking DecoderInput shell.
+   MediaPacket, MediaSeeked, and the blocking DecoderInput shell.
 
-2. Factor copying Packet timing into DecoderPacket through one internal
+2. Factor copying Packet timing into MediaPacket through one internal
    helper so adapters cannot accidentally lose trims, timestamps, or the
    keyframe flag.
 
@@ -343,7 +343,7 @@ Testing
 - Test truncated and inconsistent codec configuration and packet data.
 - Test packets containing multiple H.264/HEVC NAL units and every supported
   NAL length width.
-- Test that DecoderPacket preserves every timing, trim, and keyframe field.
+- Test that MediaPacket preserves every timing, trim, and keyframe field.
 - Test that seek pre-roll is transformed identically to normal iteration.
 - Compare blocking and async output byte-for-byte.
 - Feed generated initialization and packets into at least one real decoder

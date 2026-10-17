@@ -3,7 +3,7 @@
 
 use super::nal::{self, Framing};
 use super::{
-    DecoderFormat, DecoderInitialization, DecoderPacket, DecoderParameters, config_error,
+    DecoderFormat, DecoderInitialization, DecoderParameters, MediaPacket, config_error,
     unsupported_format, wrong_codec,
 };
 use crate::error::Error;
@@ -16,7 +16,7 @@ const FORMATS: [DecoderFormat; 2] = [DecoderFormat::HevcAnnexB, DecoderFormat::H
 
 /// A converter of an HEVC track's packets to [`DecoderFormat::HevcAnnexB`] or
 /// [`DecoderFormat::HevcLengthPrefixed`], for use without a
-/// [`DecoderStream`](crate::DecoderStream).
+/// [`MediaStream`](crate::MediaStream).
 #[derive(Clone, Debug)]
 pub struct HevcAdapter {
     /// Bytes of each NAL unit's length prefix in the track's samples.
@@ -85,7 +85,7 @@ impl HevcAdapter {
     ///
     /// Fails with [`Error::MalformedDecoderInput`] if the packet's NAL unit lengths do not
     /// fit its data.
-    pub fn convert(&self, packet: Packet) -> Result<DecoderPacket, Error> {
+    pub fn convert(&self, packet: Packet) -> Result<MediaPacket, Error> {
         let format = self.initialization.format;
         nal::convert(packet, self.length_size, self.framing, "HEVC", format)
     }

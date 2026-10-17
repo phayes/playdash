@@ -1,15 +1,15 @@
-//! The codec-specific adapter a decoder stream converts packets with, chosen once
+//! The codec-specific adapter a media stream converts packets with, chosen once
 //! from the track's codec.
 
 use super::{
-    AacAdapter, Av1Adapter, DecoderFormat, DecoderInitialization, DecoderPacket, DecoderSeeked,
-    DecoderStyle, H264Adapter, HevcAdapter, PassthroughAdapter, unsupported_format,
+    AacAdapter, Av1Adapter, DecoderFormat, DecoderInitialization, DecoderStyle, H264Adapter,
+    HevcAdapter, MediaPacket, MediaSeeked, PassthroughAdapter, unsupported_format,
 };
 use crate::error::Error;
 use crate::mp4::codec::Codec;
 use crate::mp4::packet::{Packet, Seeked};
 
-/// What a decoder stream was asked to produce.
+/// What a media stream was asked to produce.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Choice {
     /// The format of this style for the track's codec.
@@ -90,7 +90,7 @@ impl Adapter {
         }
     }
 
-    pub(crate) fn convert(&self, packet: Packet) -> Result<DecoderPacket, Error> {
+    pub(crate) fn convert(&self, packet: Packet) -> Result<MediaPacket, Error> {
         match self {
             Adapter::H264(adapter) => adapter.convert(packet),
             Adapter::Hevc(adapter) => adapter.convert(packet),
@@ -101,7 +101,7 @@ impl Adapter {
     }
 
     /// `seeked` with its pre-roll converted.
-    pub(crate) fn seeked(&self, seeked: Seeked) -> Result<DecoderSeeked, Error> {
+    pub(crate) fn seeked(&self, seeked: Seeked) -> Result<MediaSeeked, Error> {
         let Seeked {
             requested,
             landed,
@@ -112,7 +112,7 @@ impl Adapter {
             .into_iter()
             .map(|packet| self.convert(packet))
             .collect::<Result<_, _>>()?;
-        Ok(DecoderSeeked {
+        Ok(MediaSeeked {
             requested,
             landed,
             discard_before,

@@ -17,12 +17,13 @@
     fragment it names. Leading pictures that cannot be decoded from where decoding starts,
     flagged in the sample flags or, for HEVC, RASL pictures, are left out; when one would be
     shown, decoding starts at the keyframe before.
-- `DecoderStream` (blocking and async): a `PacketStream`'s packets in the form codec
-  decoders read, from `PacketStream::into_decoder_stream`, `into_decoder_stream_for` or
-  `into_decoder_stream_as`. It yields `DecoderPacket`s with the same timing as `Packet`s,
+- `MediaStream` (blocking and async): a representation's packets in the form codec
+  decoders read, from `DashManifest::media_stream`, or from a `PacketStream` by
+  `PacketStream::into_media_stream`, `into_media_stream_for` or `into_media_stream_as`.
+  It yields `MediaPacket`s with the same timing as `Packet`s,
   and `initialization()` gives the `DecoderInitialization` to configure a decoder with: a
   `DecoderFormat`, its initialization bytes and `DecoderParameters`. `seek_time` returns a
-  `DecoderSeeked` whose pre-roll is converted the same way.
+  `MediaSeeked` whose pre-roll is converted the same way.
   - `DecoderStyle` chooses the kind of format for any codec: `Elementary`, the default,
     for bitstream decoders, or `ConfigRecord` for decoders configured the way MP4 is, such
     as VideoToolbox, MediaCodec and WebCodecs.
@@ -40,9 +41,16 @@
     packets with an `OpusHead` and its full channel mapping; VP9 is frames with the `vpcC`
     record; MP3, AC-3, E-AC-3 and PCM pass through.
   - Unknown codecs fail with `Error::UnsupportedDecoderInput`.
+  - `DashManifest::media_stream` returns a `MediaStreamBuilder`, which opens a
+    representation as a `MediaStream` in one call. Its options are `cache`, `keys` (with
+    the `encryption` feature), `retention`, `track` (by `ContentKind`) or `track_id`,
+    `preroll`, and `style` or `format`. Finish it with `open`, or with `open_at`, which also
+    seeks and returns the `MediaSeeked`.
   - `playdash::decoder` has the per-codec adapters, `H264Adapter`, `HevcAdapter`,
     `Av1Adapter`, `AacAdapter` and `PassthroughAdapter`, which convert packets one at a
     time.
+- `DashManifest::representations_of`, `highest_bandwidth` and `lowest_bandwidth` (blocking
+  and async): pick representations by `ContentKind` and advertised bandwidth.
 - `Error::UnsupportedDecoderInput` and `Error::MalformedDecoderInput`.
 - `FragmentStream::tracks` (blocking and async): the representation's tracks as `Track`s,
   each with its ID, kind, codec and timescale, read from the initialization fragment.

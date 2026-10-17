@@ -9,8 +9,8 @@
 //! and the video falls behind the audio. Requires `ffmpeg` on `PATH`. Video
 //! plays at 30 frames per second, letterboxed into a 1280x720 window, and
 //! follows the audio's position.
-//! Without `--id` or `--audio-id` the first video or audio representation in
-//! the manifest plays.
+//! Without `--id` or `--audio-id` the video or audio representation with the
+//! highest bandwidth plays.
 //!
 //! ```text
 //! # Big Buck Bunny, H.264 and HE-AAC, SegmentTemplate with $Number$
@@ -175,8 +175,7 @@ fn select<'a>(
             .representation(id)
             .ok_or_else(|| format!("MPEG-DASH representation not found: {id}").into()),
         None => manifest
-            .representations()
-            .find(|representation| representation.kind == kind)
+            .highest_bandwidth(kind)
             .ok_or_else(|| format!("MPEG-DASH manifest has no {kind:?} representation").into()),
     }
 }

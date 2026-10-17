@@ -57,13 +57,18 @@ pub fn fragment_stream(name: &str, transport: Arc<Fixtures>) -> FragmentStream {
     fragment_stream_through(name, transport)
 }
 
-/// The representation in `tests/files/packets/<name>.mpd`, read through any `transport`.
-pub fn fragment_stream_through(name: &str, transport: Arc<dyn Transport>) -> FragmentStream {
+/// The manifest `tests/files/packets/<name>.mpd`, at the URL [`Fixtures`] serves it from.
+pub fn manifest(name: &str) -> DashManifest {
     let xml = String::from_utf8(fixture(&format!("packets/{name}.mpd"))).unwrap();
-    let manifest = DashManifest::new(xml)
+    DashManifest::new(xml)
         .unwrap()
         .with_base_url(&format!("{BASE}packets/{name}.mpd"))
-        .unwrap();
+        .unwrap()
+}
+
+/// The representation in `tests/files/packets/<name>.mpd`, read through any `transport`.
+pub fn fragment_stream_through(name: &str, transport: Arc<dyn Transport>) -> FragmentStream {
+    let manifest = manifest(name);
     let id = manifest.representations().next().unwrap().id.to_owned();
     manifest
         .stream_with_cache(id, Arc::new(FragmentCache::new(transport)))
@@ -87,11 +92,7 @@ impl playdash::nonblocking::Transport for Fixtures {
 pub async fn async_fragment_stream(name: &str) -> playdash::nonblocking::FragmentStream {
     use playdash::nonblocking::{DashManifest, FragmentCache};
 
-    let xml = String::from_utf8(fixture(&format!("packets/{name}.mpd"))).unwrap();
-    let manifest = DashManifest::new(xml)
-        .unwrap()
-        .with_base_url(&format!("{BASE}packets/{name}.mpd"))
-        .unwrap();
+    let manifest = DashManifest::from(manifest(name));
     let id = manifest.representations().next().unwrap().id.to_owned();
     let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures::default())));
     manifest.stream_with_cache(id, cache).await.unwrap()

@@ -32,7 +32,7 @@ mod packet_stream;
 mod stream;
 mod transport;
 
-pub use crate::decoder::nonblocking::DecoderStream;
+pub use crate::decoder::nonblocking::{MediaStream, MediaStreamBuilder};
 pub use cache::FragmentCache;
 pub use packet_stream::PacketStream;
 pub use stream::FragmentStream;
@@ -40,7 +40,7 @@ pub use transport::Transport;
 
 use crate::error::Error;
 use crate::fragment::{Fragments, MediaTimeline};
-use crate::manifest::Representation;
+use crate::manifest::{ContentKind, Representation};
 use reqwest::{Client, Response};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -159,8 +159,7 @@ impl DashManifest {
         &self,
         representation_id: impl AsRef<str>,
     ) -> Result<FragmentStream, Error> {
-        let cache = FragmentCache::new(Arc::new(self.client().clone()));
-        self.stream_with_cache(representation_id, Arc::new(cache))
+        self.stream_with_cache(representation_id, Arc::new(self.new_cache()))
             .await
     }
 
@@ -192,8 +191,7 @@ impl DashManifest {
         representation_id: impl AsRef<str>,
         time: Duration,
     ) -> Result<(FragmentStream, Duration), Error> {
-        let cache = FragmentCache::new(Arc::new(self.client().clone()));
-        self.stream_at_with_cache(representation_id, time, Arc::new(cache))
+        self.stream_at_with_cache(representation_id, time, Arc::new(self.new_cache()))
             .await
     }
 
@@ -208,6 +206,35 @@ impl DashManifest {
         let fragments = self.manifest.fragments(id)?;
         let timeline = self.manifest.media_timeline(id)?;
         FragmentStream::starting_at(fragments, timeline, time, cache).await
+    }
+
+    /// Returns a builder of a representation's [`MediaStream`]: its track's packets in the
+    /// form codec decoders read. Set options on the builder, then await
+    /// [`MediaStreamBuilder::open`].
+    ///
+    /// The representation is matched as by [`Self::representation`]. Never fails; errors
+    /// come from [`MediaStreamBuilder::open`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use playdash::nonblocking::DashManifest;
+    ///
+    /// # async fn example() -> Result<(), playdash::Error> {
+    /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd").await?;
+    /// let input = manifest.media_stream("audio").open().await?;
+    /// // configure the decoder with input.initialization(), then decode each packet
+    /// # drop(input);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn media_stream(&self, representation_id: impl AsRef<str>) -> MediaStreamBuilder<'_> {
+        MediaStreamBuilder::new(self, representation_id.as_ref())
+    }
+
+    /// A new, empty cache that fetches through this manifest's client.
+    pub(crate) fn new_cache(&self) -> FragmentCache {
+        FragmentCache::new(Arc::new(self.client().clone()))
     }
 
     /// The URL the manifest was loaded from, if known.
@@ -225,6 +252,27 @@ impl DashManifest {
     /// [`crate::DashManifest::representation`].
     pub fn representation(&self, representation_id: impl AsRef<str>) -> Option<Representation<'_>> {
         self.manifest.representation(representation_id)
+    }
+
+    /// Lists the representations of `kind` in document order. See
+    /// [`crate::DashManifest::representations_of`].
+    pub fn representations_of(
+        &self,
+        kind: ContentKind,
+    ) -> impl Iterator<Item = Representation<'_>> {
+        self.manifest.representations_of(kind)
+    }
+
+    /// Finds the representation of `kind` with the highest advertised bandwidth. See
+    /// [`crate::DashManifest::highest_bandwidth`].
+    pub fn highest_bandwidth(&self, kind: ContentKind) -> Option<Representation<'_>> {
+        self.manifest.highest_bandwidth(kind)
+    }
+
+    /// Finds the representation of `kind` with the lowest advertised bandwidth. See
+    /// [`crate::DashManifest::lowest_bandwidth`].
+    pub fn lowest_bandwidth(&self, kind: ContentKind) -> Option<Representation<'_>> {
+        self.manifest.lowest_bandwidth(kind)
     }
 
     /// Lists a representation's initialization fragment and its media

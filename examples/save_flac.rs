@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Duration;
 
-use playdash::{DashManifest, DecoderFormat, PacketStream, TimeAccuracy};
+use playdash::{DashManifest, DecoderFormat, TimeAccuracy};
 
 fn main() {
     if let Err(error) = run() {
@@ -46,16 +46,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     // FLAC frames with the stream header.
-    let packets = PacketStream::new(manifest.stream(&id)?)?;
-    let mut input = packets.into_decoder_stream_as(DecoderFormat::Flac)?;
-    if let Some(seconds) = args.start {
-        // FLAC frames decode on their own, so there is no pre-roll to write.
-        let seeked = input.seek_time(Duration::from_secs_f64(seconds), TimeAccuracy::Packet)?;
-        println!(
-            "starting at {:.3}s",
-            seeked.landed as f64 / f64::from(input.timescale())
-        );
-    }
+    let builder = manifest.media_stream(&id).format(DecoderFormat::Flac);
+    let input = match args.start {
+        Some(seconds) => {
+            // FLAC frames decode on their own, so there is no pre-roll to write.
+            let time = Duration::from_secs_f64(seconds);
+            let (input, seeked) = builder.open_at(time, TimeAccuracy::Packet)?;
+            println!(
+                "starting at {:.3}s",
+                seeked.landed as f64 / f64::from(input.timescale())
+            );
+            input
+        }
+        None => builder.open()?,
+    };
 
     // The header, then the frames: a FLAC file.
     let mut file = BufWriter::new(File::create(&args.output)?);

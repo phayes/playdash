@@ -1,26 +1,33 @@
-//! A representation's decoder-ready packets: the async `DecoderStream` over a
+//! A representation's decoder-ready packets: the async `MediaStream` over a
 //! `nonblocking::PacketStream`.
 
 use super::adapter::Choice;
-use super::{Adapter, DecoderInitialization, DecoderPacket, DecoderSeeked};
+use super::{
+    Adapter, DecoderFormat, DecoderInitialization, DecoderStyle, MediaPacket, MediaSeeked,
+    TrackChoice, track_of_kind,
+};
 use crate::buffer::BufferHandle;
+#[cfg(feature = "encryption")]
+use crate::cenc::ContentKeys;
 use crate::error::Error;
+use crate::manifest::ContentKind;
 use crate::mp4::codec::Codec;
-use crate::nonblocking::PacketStream;
-use crate::schedule::TimeAccuracy;
+use crate::nonblocking::{DashManifest, FragmentCache, PacketStream};
+use crate::schedule::{Retention, TimeAccuracy};
 use futures_util::Stream;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 /// A track's compressed packets in the form its codec's decoders read: a [`Stream`] of
-/// [`DecoderPacket`]s in decode order, with the [`DecoderInitialization`] to configure a
+/// [`MediaPacket`]s in decode order, with the [`DecoderInitialization`] to configure a
 /// decoder with first, and time seeking. The async counterpart of the blocking
-/// `playdash::DecoderStream`.
+/// `playdash::MediaStream`.
 ///
-/// Made by [`PacketStream::into_decoder_stream`], which chooses the elementary format of
-/// the codec, [`PacketStream::into_decoder_stream_for`] or
-/// [`PacketStream::into_decoder_stream_as`].
+/// Made by [`DashManifest::media_stream`], or from a [`PacketStream`] by
+/// [`PacketStream::into_media_stream`], which chooses the elementary format of the codec,
+/// [`PacketStream::into_media_stream_for`] or [`PacketStream::into_media_stream_as`].
 ///
 /// After an error, the stream yields it once and then ends, until a seek succeeds.
 ///
@@ -30,12 +37,11 @@ use std::time::Duration;
 /// use std::time::Duration;
 /// use futures_util::StreamExt;
 /// use playdash::TimeAccuracy;
-/// use playdash::nonblocking::{DashManifest, PacketStream};
+/// use playdash::nonblocking::DashManifest;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd").await?;
-/// let packets = PacketStream::new(manifest.stream("video").await?).await?;
-/// let mut input = packets.into_decoder_stream()?;
+/// let mut input = manifest.media_stream("video").open().await?;
 /// let initialization = input.initialization().clone();
 /// // configure the decoder with initialization.data and initialization.parameters
 /// # let _ = initialization;
@@ -51,7 +57,7 @@ use std::time::Duration;
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct DecoderStream {
+pub struct MediaStream {
     packets: PacketStream,
     adapter: Adapter,
     /// Set once the stream has yielded an error, so it ends rather than carrying on past
@@ -59,7 +65,7 @@ pub struct DecoderStream {
     failed: bool,
 }
 
-impl DecoderStream {
+impl MediaStream {
     /// The packets of `packets` in the format `choice` asks for.
     pub(crate) fn new(packets: PacketStream, choice: Choice) -> Result<Self, Error> {
         let adapter = Adapter::new(packets.codec(), choice)?;
@@ -113,7 +119,7 @@ impl DecoderStream {
         &mut self,
         time: Duration,
         accuracy: TimeAccuracy,
-    ) -> Result<DecoderSeeked, Error> {
+    ) -> Result<MediaSeeked, Error> {
         let seeked = self.packets.seek_time(time, accuracy).await?;
         let seeked = self.adapter.seeked(seeked);
         self.failed = seeked.is_err();
@@ -121,8 +127,8 @@ impl DecoderStream {
     }
 }
 
-impl Stream for DecoderStream {
-    type Item = Result<DecoderPacket, Error>;
+impl Stream for MediaStream {
+    type Item = Result<MediaPacket, Error>;
 
     /// The next packet in decode order.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -136,5 +142,210 @@ impl Stream for DecoderStream {
         let packet = packet.and_then(|packet| this.adapter.convert(packet));
         this.failed = packet.is_err();
         Poll::Ready(Some(packet))
+    }
+}
+
+/// A builder of a [`MediaStream`]: one representation of a [`DashManifest`], and the
+/// options to open it with. The async counterpart of the blocking
+/// `playdash::MediaStreamBuilder`.
+///
+/// Made by [`DashManifest::media_stream`]. With no options set, [`Self::open`] reads the
+/// representation's only track in its codec's elementary format, through a new
+/// [`FragmentCache`] on the manifest's client, and keeps every fragment.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use playdash::{ContentKind, DecoderStyle, Retention, TimeAccuracy};
+/// use playdash::nonblocking::DashManifest;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd").await?;
+/// let video = manifest
+///     .highest_bandwidth(ContentKind::Video)
+///     .ok_or("no video")?;
+/// let (input, seeked) = manifest
+///     .media_stream(video.id)
+///     .retention(Retention {
+///         behind: Some(Duration::from_secs(30)),
+///         ahead: Some(Duration::from_secs(60)),
+///     })
+///     .style(DecoderStyle::ConfigRecord)
+///     .open_at(Duration::from_secs(90), TimeAccuracy::Packet)
+///     .await?;
+/// // configure the decoder with input.initialization(), then decode seeked.preroll
+/// # let _ = (input, seeked);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct MediaStreamBuilder<'a> {
+    manifest: &'a DashManifest,
+    representation_id: String,
+    cache: Option<Arc<FragmentCache>>,
+    #[cfg(feature = "encryption")]
+    keys: Option<ContentKeys>,
+    retention: Option<Retention>,
+    track: Option<TrackChoice>,
+    preroll: Option<Duration>,
+    choice: Choice,
+}
+
+impl<'a> MediaStreamBuilder<'a> {
+    /// A builder for representation `representation_id` of `manifest`, with no options
+    /// set.
+    pub(crate) fn new(manifest: &'a DashManifest, representation_id: &str) -> Self {
+        Self {
+            manifest,
+            representation_id: representation_id.to_owned(),
+            cache: None,
+            #[cfg(feature = "encryption")]
+            keys: None,
+            retention: None,
+            track: None,
+            preroll: None,
+            choice: Choice::Style(DecoderStyle::Elementary),
+        }
+    }
+
+    /// Fetches through `cache` instead of a new one.
+    pub fn cache(mut self, cache: Arc<FragmentCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Decrypts `cenc` or `cbcs` Common Encryption with `keys`, through a new
+    /// [`FragmentCache`] on the manifest's client.
+    ///
+    /// [`Self::open`] fails with [`Error::Initialization`] if [`Self::cache`] is also
+    /// set; give that cache the keys with [`FragmentCache::with_keys`] instead.
+    #[cfg(feature = "encryption")]
+    pub fn keys(mut self, keys: ContentKeys) -> Self {
+        self.keys = Some(keys);
+        self
+    }
+
+    /// Keeps and downloads only as much of the representation around the position as
+    /// `retention` says. See
+    /// [`FragmentStream::with_retention`](crate::nonblocking::FragmentStream::with_retention).
+    pub fn retention(mut self, retention: Retention) -> Self {
+        self.retention = Some(retention);
+        self
+    }
+
+    /// Reads the representation's first track of `kind`, such as the audio of a muxed
+    /// representation. Replaces any [`Self::track_id`].
+    ///
+    /// [`Self::open`] fails with [`Error::Initialization`] if the representation has no
+    /// track of `kind`.
+    pub fn track(mut self, kind: ContentKind) -> Self {
+        self.track = Some(TrackChoice::Kind(kind));
+        self
+    }
+
+    /// Reads track `track_id`, one of
+    /// [`FragmentStream::tracks`](crate::nonblocking::FragmentStream::tracks). Replaces
+    /// any [`Self::track`].
+    ///
+    /// [`Self::open`] fails with [`Error::Initialization`] if the representation has no
+    /// such track.
+    pub fn track_id(mut self, track_id: u32) -> Self {
+        self.track = Some(TrackChoice::Id(track_id));
+        self
+    }
+
+    /// Decodes `preroll` of media before a seek target. See
+    /// [`PacketStream::with_preroll`].
+    pub fn preroll(mut self, preroll: Duration) -> Self {
+        self.preroll = Some(preroll);
+        self
+    }
+
+    /// Converts packets to the format of `style` for the track's codec. See
+    /// [`PacketStream::into_media_stream_for`]. Replaces any [`Self::format`].
+    pub fn style(mut self, style: DecoderStyle) -> Self {
+        self.choice = Choice::Style(style);
+        self
+    }
+
+    /// Converts packets to `format`. Replaces any [`Self::style`].
+    ///
+    /// [`Self::open`] fails with [`Error::UnsupportedDecoderInput`] if the track's codec
+    /// cannot be converted to `format`.
+    pub fn format(mut self, format: DecoderFormat) -> Self {
+        self.choice = Choice::Format(format);
+        self
+    }
+
+    /// Opens the representation as a [`MediaStream`]. Fetches its initialization fragment
+    /// before returning.
+    ///
+    /// Fails like [`DashManifest::stream`], [`PacketStream::new`] and
+    /// [`PacketStream::into_media_stream`]. Fails with [`Error::Initialization`] if both
+    /// a cache and content keys are set, or the representation has no track that
+    /// [`Self::track`] or [`Self::track_id`] asks for.
+    pub async fn open(mut self) -> Result<MediaStream, Error> {
+        // The representation's fragments.
+        let cache = self.take_cache()?;
+        let mut fragments = self
+            .manifest
+            .stream_with_cache(&self.representation_id, cache)
+            .await?;
+        if let Some(retention) = self.retention {
+            fragments = fragments.with_retention(retention);
+        }
+
+        // The packets of the chosen track.
+        let mut packets = match self.track {
+            None => PacketStream::new(fragments).await?,
+            Some(TrackChoice::Id(track_id)) => {
+                PacketStream::with_track(fragments, track_id).await?
+            }
+            Some(TrackChoice::Kind(kind)) => {
+                let track_id = track_of_kind(&fragments.tracks()?, kind)?;
+                PacketStream::with_track(fragments, track_id).await?
+            }
+        };
+        if let Some(preroll) = self.preroll {
+            packets = packets.with_preroll(preroll);
+        }
+
+        MediaStream::new(packets, self.choice)
+    }
+
+    /// Opens the representation as a [`MediaStream`] seeked to `time`, and returns the
+    /// packets to decode before its next one, as [`MediaStream::seek_time`] does.
+    ///
+    /// Fails like [`Self::open`] and [`MediaStream::seek_time`].
+    pub async fn open_at(
+        self,
+        time: Duration,
+        accuracy: TimeAccuracy,
+    ) -> Result<(MediaStream, MediaSeeked), Error> {
+        let mut stream = self.open().await?;
+        let seeked = stream.seek_time(time, accuracy).await?;
+        Ok((stream, seeked))
+    }
+
+    /// The cache to fetch through: the one given, or a new one on the manifest's client
+    /// that decrypts with any keys given.
+    fn take_cache(&mut self) -> Result<Arc<FragmentCache>, Error> {
+        #[cfg(feature = "encryption")]
+        if let Some(keys) = self.keys.take() {
+            if self.cache.is_some() {
+                return Err(Error::Initialization(
+                    "a media stream takes either a cache or content keys; give the cache \
+                     the keys with FragmentCache::with_keys"
+                        .to_owned(),
+                ));
+            }
+            return Ok(Arc::new(self.manifest.new_cache().with_keys(keys)));
+        }
+        let manifest = self.manifest;
+        Ok(self
+            .cache
+            .take()
+            .unwrap_or_else(|| Arc::new(manifest.new_cache())))
     }
 }

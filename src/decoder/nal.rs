@@ -1,7 +1,7 @@
 //! NAL unit framing for H.264 and HEVC: MP4's length-prefixed NAL units checked, or
 //! rewritten as Annex-B byte streams with start codes.
 
-use super::{DecoderFormat, DecoderPacket};
+use super::{DecoderFormat, MediaPacket};
 use crate::error::Error;
 use crate::mp4::packet::Packet;
 use crate::mp4::reader::{ParseError, malformed};
@@ -52,7 +52,7 @@ pub(crate) fn convert(
     framing: Framing,
     codec: &str,
     format: DecoderFormat,
-) -> Result<DecoderPacket, Error> {
+) -> Result<MediaPacket, Error> {
     let malformed = |reason| Error::MalformedDecoderInput {
         codec: codec.to_owned(),
         format,
@@ -69,7 +69,7 @@ pub(crate) fn convert(
             packet.data.clone()
         }
     };
-    Ok(DecoderPacket::from_packet(packet, data))
+    Ok(MediaPacket::from_packet(packet, data))
 }
 
 /// `data`'s NAL units, each prefixed by a big-endian length of `length_size` bytes (1, 2

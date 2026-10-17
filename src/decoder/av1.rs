@@ -2,7 +2,7 @@
 //! temporal delimiters restored and every OBU sized; or the samples as MP4 stores them.
 
 use super::{
-    DecoderFormat, DecoderInitialization, DecoderPacket, config_error, unsupported_format, video,
+    DecoderFormat, DecoderInitialization, MediaPacket, config_error, unsupported_format, video,
     wrong_codec,
 };
 use crate::error::Error;
@@ -22,7 +22,7 @@ const OBU_TEMPORAL_DELIMITER: u8 = 2;
 
 /// A converter of an AV1 track's packets to [`DecoderFormat::Av1Obu`] or
 /// [`DecoderFormat::Av1Samples`], for use without a
-/// [`DecoderStream`](crate::DecoderStream).
+/// [`MediaStream`](crate::MediaStream).
 #[derive(Clone, Debug)]
 pub struct Av1Adapter {
     initialization: DecoderInitialization,
@@ -78,7 +78,7 @@ impl Av1Adapter {
     ///
     /// Fails with [`Error::MalformedDecoderInput`] if the packet's OBUs do not fit its
     /// data.
-    pub fn convert(&self, packet: Packet) -> Result<DecoderPacket, Error> {
+    pub fn convert(&self, packet: Packet) -> Result<MediaPacket, Error> {
         let format = self.initialization.format;
         let malformed = |reason| Error::MalformedDecoderInput {
             codec: "AV1".to_owned(),
@@ -90,7 +90,7 @@ impl Av1Adapter {
                 obu.map_err(malformed)?;
             }
             let data = packet.data.clone();
-            return Ok(DecoderPacket::from_packet(packet, data));
+            return Ok(MediaPacket::from_packet(packet, data));
         }
         let sized = sized_obus(&packet.data).map_err(malformed)?;
 
@@ -103,7 +103,7 @@ impl Av1Adapter {
             data.extend_from_slice(&TEMPORAL_DELIMITER);
         }
         data.extend_from_slice(&sized);
-        Ok(DecoderPacket::from_packet(packet, Bytes::from(data)))
+        Ok(MediaPacket::from_packet(packet, Bytes::from(data)))
     }
 }
 

@@ -1,7 +1,7 @@
 //! Decoder-ready packets: a track's compressed access units rewritten into the form codec
 //! decoders read, with the initialization a decoder needs before them.
 //!
-//! [`DecoderStream`] is the usual way in. The per-codec adapters here do the same
+//! [`MediaStream`] is the usual way in. The per-codec adapters here do the same
 //! conversion one packet at a time.
 
 mod aac;
@@ -25,12 +25,14 @@ pub use h264::H264Adapter;
 pub use hevc::HevcAdapter;
 pub use passthrough::PassthroughAdapter;
 #[cfg(feature = "sync")]
-pub use stream::DecoderStream;
+pub use stream::{MediaStream, MediaStreamBuilder};
 
 use crate::error::Error;
+use crate::manifest::ContentKind;
 use crate::mp4::codec::Codec;
 use crate::mp4::packet::{Packet, ticks_to_duration};
 use crate::mp4::reader::ParseError;
+use crate::mp4::track::Track;
 use bytes::Bytes;
 use std::fmt;
 use std::time::Duration;
@@ -236,7 +238,7 @@ pub struct DecoderInitialization {
 /// packets come in decode order, and the first `trim_start` and last `trim_end` ticks of
 /// the decoded output are dropped.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecoderPacket {
+pub struct MediaPacket {
     /// The access unit, in the stream's [`DecoderFormat`].
     pub data: Bytes,
     /// Presentation timestamp in `timescale` ticks.
@@ -255,7 +257,7 @@ pub struct DecoderPacket {
     pub trim_end: u64,
 }
 
-impl DecoderPacket {
+impl MediaPacket {
     /// The presentation timestamp as a time, or `None` if it is negative.
     pub fn presentation_time(&self) -> Option<Duration> {
         ticks_to_duration(self.pts, self.timescale)
@@ -287,14 +289,14 @@ impl DecoderPacket {
     }
 }
 
-/// A [`DecoderStream`] seek's landing point, and the packets to decode before
+/// A [`MediaStream`] seek's landing point, and the packets to decode before
 /// continuing.
 ///
 /// Reset the decoder and configure it with the stream's initialization, feed it
 /// `preroll` in order and discard its output, then decode the stream's packets as usual,
 /// discarding any output presented before `discard_before`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecoderSeeked {
+pub struct MediaSeeked {
     /// The time the seek asked for.
     pub requested: Duration,
     /// Presentation timestamp of the packet the stream yields next, in its timescale.
@@ -304,7 +306,7 @@ pub struct DecoderSeeked {
     pub discard_before: i64,
     /// Packets to decode, in order, before the stream's next packet. None of their output
     /// is presented.
-    pub preroll: Vec<DecoderPacket>,
+    pub preroll: Vec<MediaPacket>,
 }
 
 /// `error`, from parsing `codec`'s configuration for `format`, as a decoder-input error.
@@ -361,6 +363,24 @@ pub(crate) fn unsupported_format(
     }
 }
 
+/// The track of a representation a media stream builder reads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TrackChoice {
+    /// The track with this MP4 track ID.
+    Id(u32),
+    /// The first track of this kind, in the initialization fragment's order.
+    Kind(ContentKind),
+}
+
+/// The ID of the first of `tracks` of `kind`, or an [`Error::Initialization`] if none is.
+pub(crate) fn track_of_kind(tracks: &[Track], kind: ContentKind) -> Result<u32, Error> {
+    tracks
+        .iter()
+        .find(|track| track.kind == kind)
+        .map(|track| track.id)
+        .ok_or_else(|| Error::Initialization(format!("representation has no {kind:?} track")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,10 +397,10 @@ mod tests {
             trim_start: 5,
             trim_end: 3,
         };
-        let converted = DecoderPacket::from_packet(packet, Bytes::from_static(&[4]));
+        let converted = MediaPacket::from_packet(packet, Bytes::from_static(&[4]));
         assert_eq!(
             converted,
-            DecoderPacket {
+            MediaPacket {
                 data: Bytes::from_static(&[4]),
                 pts: -7,
                 dts: -9,

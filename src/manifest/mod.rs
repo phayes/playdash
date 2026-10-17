@@ -341,6 +341,44 @@ impl DashManifest {
         self.find(representation_id.as_ref()).map(Selected::summary)
     }
 
+    /// Lists the representations of `kind` in document order.
+    ///
+    /// Representations carrying both video and audio are [`ContentKind::Muxed`], and are
+    /// not listed for [`ContentKind::Video`] or [`ContentKind::Audio`].
+    pub fn representations_of(
+        &self,
+        kind: ContentKind,
+    ) -> impl Iterator<Item = Representation<'_>> {
+        self.representations()
+            .filter(move |representation| representation.kind == kind)
+    }
+
+    /// Finds the representation of `kind` with the highest advertised bandwidth; the first
+    /// in document order among equals.
+    ///
+    /// Returns `None` if no representation of `kind` advertises a bandwidth.
+    pub fn highest_bandwidth(&self, kind: ContentKind) -> Option<Representation<'_>> {
+        self.representations_of(kind)
+            .filter(|representation| representation.bandwidth.is_some())
+            .reduce(|best, next| match next.bandwidth > best.bandwidth {
+                true => next,
+                false => best,
+            })
+    }
+
+    /// Finds the representation of `kind` with the lowest advertised bandwidth; the first
+    /// in document order among equals.
+    ///
+    /// Returns `None` if no representation of `kind` advertises a bandwidth.
+    pub fn lowest_bandwidth(&self, kind: ContentKind) -> Option<Representation<'_>> {
+        self.representations_of(kind)
+            .filter(|representation| representation.bandwidth.is_some())
+            .reduce(|best, next| match next.bandwidth < best.bandwidth {
+                true => next,
+                false => best,
+            })
+    }
+
     /// Lists a representation's initialization fragment and its media
     /// fragments in timeline order.
     ///

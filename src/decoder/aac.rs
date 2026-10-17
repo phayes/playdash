@@ -2,7 +2,7 @@
 //! unit after an ADTS header.
 
 use super::{
-    DecoderFormat, DecoderInitialization, DecoderPacket, DecoderParameters, unsupported_format,
+    DecoderFormat, DecoderInitialization, DecoderParameters, MediaPacket, unsupported_format,
     wrong_codec,
 };
 use crate::error::Error;
@@ -21,7 +21,7 @@ const ADTS_MAX_FRAME: usize = 0x1fff;
 
 /// A converter of an AAC track's packets to [`DecoderFormat::AacRaw`] or
 /// [`DecoderFormat::AacAdts`], for use without a
-/// [`DecoderStream`](crate::DecoderStream).
+/// [`MediaStream`](crate::MediaStream).
 #[derive(Clone, Debug)]
 pub struct AacAdapter {
     /// The fields every ADTS header repeats, for [`DecoderFormat::AacAdts`].
@@ -106,10 +106,10 @@ impl AacAdapter {
     ///
     /// Fails with [`Error::MalformedDecoderInput`] if the access unit is too long for an
     /// ADTS frame.
-    pub fn convert(&self, packet: Packet) -> Result<DecoderPacket, Error> {
+    pub fn convert(&self, packet: Packet) -> Result<MediaPacket, Error> {
         let Some(fields) = self.adts else {
             let data = packet.data.clone();
-            return Ok(DecoderPacket::from_packet(packet, data));
+            return Ok(MediaPacket::from_packet(packet, data));
         };
         let len = ADTS_HEADER_LEN + packet.data.len();
         if len > ADTS_MAX_FRAME {
@@ -125,7 +125,7 @@ impl AacAdapter {
         let mut data = Vec::with_capacity(len);
         data.extend_from_slice(&adts_header(fields, len));
         data.extend_from_slice(&packet.data);
-        Ok(DecoderPacket::from_packet(packet, Bytes::from(data)))
+        Ok(MediaPacket::from_packet(packet, Bytes::from(data)))
     }
 }
 

@@ -1,7 +1,7 @@
 //! Codecs whose MP4 samples are already decoder-ready, needing only their configuration
 //! put in decoder form.
 
-use super::{DecoderFormat, DecoderInitialization, DecoderPacket, DecoderParameters};
+use super::{DecoderFormat, DecoderInitialization, DecoderParameters, MediaPacket};
 use super::{config_error, flac, opus};
 use crate::error::Error;
 use crate::mp4::codec::{AudioConfig, Codec};
@@ -11,7 +11,7 @@ use bytes::Bytes;
 /// A converter of the packets of a track whose samples decoders read as they are: MP3,
 /// AC-3, E-AC-3, FLAC, Opus, VP9 and PCM. Packets keep their bytes, and the
 /// initialization is the codec's configuration in the form each [`DecoderFormat`]
-/// describes. For use without a [`DecoderStream`](crate::DecoderStream).
+/// describes. For use without a [`MediaStream`](crate::MediaStream).
 #[derive(Clone, Debug)]
 pub struct PassthroughAdapter {
     initialization: DecoderInitialization,
@@ -87,9 +87,9 @@ impl PassthroughAdapter {
     }
 
     /// Converts `packet`, one of the track's, keeping its bytes.
-    pub fn convert(&self, packet: Packet) -> DecoderPacket {
+    pub fn convert(&self, packet: Packet) -> MediaPacket {
         let data = packet.data.clone();
-        DecoderPacket::from_packet(packet, data)
+        MediaPacket::from_packet(packet, data)
     }
 }
 

@@ -15,7 +15,7 @@ playdash = "0.2"
 
 | Feature | Default | What it adds |
 |---|---|---|
-| `sync` | yes | The blocking API: `FragmentStream`, `PacketStream`, `DecoderStream`, `FragmentCache` and `Transport`, fetching through ureq |
+| `sync` | yes | The blocking API: `FragmentStream`, `PacketStream`, `MediaStream`, `FragmentCache` and `Transport`, fetching through ureq |
 | `async` | no | `playdash::nonblocking`: the same API, async, fetching through reqwest on tokio |
 | `rodio` | no | `DashSource`, a ready-to-play rodio source (implies `sync`) |
 | `encryption` | no | Common Encryption (`cenc`, `cbcs`) decryption with keys you supply |
@@ -83,11 +83,11 @@ for packet in packets {
 
 A `Packet` holds an access unit as MP4 stores it, which is not always what a decoder reads:
 H.264 and HEVC samples carry length prefixes where decoders expect start codes, and codec
-configuration sits in MP4 boxes such as `avcC` and `dOps`. `into_decoder_stream` converts a
-`PacketStream` into a `DecoderStream`. Its packets keep their timing, and
-`initialization()` gives everything to configure the decoder with: a `DecoderFormat`, the
-initialization bytes in that format, and `DecoderParameters` such as the sample rate.
-playdash still doesn't decompress anything; you choose and run the decoder.
+configuration sits in MP4 boxes such as `avcC` and `dOps`. A `MediaStream` gives you
+packets that a decoder reads, with the same timing. Its `initialization()` gives everything
+to configure the decoder with: a `DecoderFormat`, the initialization bytes in that format,
+and `DecoderParameters` such as the sample rate. playdash still doesn't decompress anything;
+you choose and run the decoder.
 
 | Codec | Packets | Initialization |
 |---|---|---|
@@ -101,10 +101,10 @@ playdash still doesn't decompress anything; you choose and run the decoder.
 
 ```rust,ignore
 use std::time::Duration;
-use playdash::{DashManifest, PacketStream, TimeAccuracy};
+use playdash::{DashManifest, TimeAccuracy};
 
 let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
-let mut input = PacketStream::new(manifest.stream("video")?)?.into_decoder_stream()?;
+let mut input = manifest.media_stream("video").open()?;
 decoder.configure(input.initialization())?;
 
 // Seeking converts the pre-roll too. Reconfigure the decoder after resetting it.
@@ -128,13 +128,35 @@ initialization. Ask for that style, whatever the codec:
 ```rust,ignore
 use playdash::DecoderStyle;
 
-let input = packets.into_decoder_stream_for(DecoderStyle::ConfigRecord)?;
+let input = manifest.media_stream("video").style(DecoderStyle::ConfigRecord).open()?;
 ```
 
-Other codecs have one format for both styles. `into_decoder_stream_as` asks for one
-particular `DecoderFormat`, and fails if the codec cannot be converted to it, such as
-`DecoderFormat::AacAdts` for decoders that only read AAC with ADTS headers. The per-codec
-adapters in `playdash::decoder` convert packets one at a time.
+Other codecs have one format for both styles. `format` asks for one particular
+`DecoderFormat`, and `open` fails if the codec cannot be converted to it, such as
+`DecoderFormat::AacAdts` for decoders that only read AAC with ADTS headers.
+
+`media_stream` returns a `MediaStreamBuilder`. Its other options:
+
+```rust,ignore
+use std::time::Duration;
+use playdash::{ContentKind, Retention, TimeAccuracy};
+
+let video = manifest.highest_bandwidth(ContentKind::Video).ok_or("no video")?;
+let (input, seeked) = manifest
+    .media_stream(video.id)
+    .cache(cache.clone())          // share downloads, or fetch through your own Transport
+    .retention(Retention { behind: Some(Duration::from_secs(30)), ahead: Some(Duration::from_secs(60)) })
+    .track(ContentKind::Video)     // or .track_id(1), for a representation with several tracks
+    .preroll(Duration::from_millis(80))
+    .open_at(Duration::from_secs(90), TimeAccuracy::Packet)?;
+// decode seeked.preroll, then the stream
+```
+
+With the `encryption` feature, `.keys(keys)` decrypts through a cache of its own.
+
+To work at a lower level, `PacketStream::into_media_stream`, `into_media_stream_for` and
+`into_media_stream_as` convert a `PacketStream` you have built, and the per-codec adapters
+in `playdash::decoder` convert packets one at a time.
 
 The `save_flac` example writes a FLAC representation's decoder-ready packets to a `.flac`
 file:
@@ -146,7 +168,7 @@ cargo run --example save_flac -- MANIFEST_URL output.flac
 ## Async streaming
 
 The `async` feature adds `playdash::nonblocking`, the same API for applications on a tokio
-runtime: `DashManifest`, `FragmentStream`, `PacketStream`, `DecoderStream`,
+runtime: `DashManifest`, `FragmentStream`, `PacketStream`, `MediaStream`,
 `FragmentCache` and `Transport`.
 
 ```toml
@@ -173,6 +195,9 @@ let mut stream = manifest.stream("FLAC").await?;
 stream.seek_time(Duration::from_secs(90)).await?;
 let mut buffer = [0u8; 4096];
 stream.read(&mut buffer).await?;
+
+// Decoder-ready packets, with the same builder options as the blocking API.
+let mut input = manifest.media_stream("video").open().await?;
 
 // A manifest you already hold, fetched through your own client.
 let manifest = DashManifest::new(xml)?
@@ -288,7 +313,7 @@ These are known limitations / failures where support is planned:
    content keys supplied by the caller; it does not acquire licenses.
 
 6. Codec changes within a stream are not supported. `PacketStream` refuses samples that switch
-   to another sample description, so a `DecoderStream` keeps one initialization from
+   to another sample description, so a `MediaStream` keeps one initialization from
    start to end.
 
 ## Example audio player

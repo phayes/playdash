@@ -4,10 +4,11 @@
 
 use playdash::{
     BufferStatus, Bytes, ContentKeys, DashManifest, DashSource, Error, Fragment, FragmentCache,
-    FragmentStream, Fragments, Transport,
+    FragmentStream, Fragments, MediaPacket, MediaStream, Transport,
 };
 use rodio::{Decoder, Source};
-use std::io::Cursor;
+use std::io::{BufRead, BufReader, Cursor, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -106,6 +107,63 @@ fn manifest(name: &str) -> DashManifest {
         .unwrap()
         .with_base_url(&format!("{BASE}{name}"))
         .unwrap()
+}
+
+/// Serves the fixtures by file name on a local port, answering `Range`
+/// requests with 206. Returns the base URL.
+fn serve_fixtures() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let name = request_line.split(' ').nth(1).unwrap()[1..].to_owned();
+                let mut range = None;
+                let mut header = String::new();
+                while reader.read_line(&mut header).unwrap() > 2 {
+                    if let Some(value) = header
+                        .to_ascii_lowercase()
+                        .trim()
+                        .strip_prefix("range: bytes=")
+                    {
+                        let (start, end) = value.split_once('-').unwrap();
+                        range = Some(start.parse::<usize>().unwrap()..=end.parse().unwrap());
+                    }
+                    header.clear();
+                }
+                let file = fixture(&name);
+                let (status, body) = match range {
+                    Some(range) => ("206 Partial Content", &file[range]),
+                    None => ("200 OK", &file[..]),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let stream = reader.get_mut();
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            });
+        }
+    });
+    format!("http://{address}")
+}
+
+/// The DASH fixture `name`, served from `base`.
+fn served_manifest(base: &str, name: &str) -> DashManifest {
+    let xml = String::from_utf8(fixture(name)).unwrap();
+    DashManifest::new(xml)
+        .unwrap()
+        .with_base_url(&format!("{base}/{name}"))
+        .unwrap()
+}
+
+/// Every packet of `stream`.
+fn media_packets(stream: MediaStream) -> Vec<MediaPacket> {
+    stream.map(Result::unwrap).collect()
 }
 
 fn decode(reader: impl std::io::Read + std::io::Seek + Send + Sync + 'static) -> Vec<f32> {
@@ -273,6 +331,35 @@ fn missing_key_fails_before_playback() {
 }
 
 #[test]
+fn media_stream_decrypts_with_keys() {
+    let base = serve_fixtures();
+    for name in ["shaka_cbcs.mpd", "shaka_cenc.mpd"] {
+        let keyed = served_manifest(&base, name)
+            .media_stream("0")
+            .keys(keys())
+            .open()
+            .unwrap();
+        let expected = manifest(name)
+            .media_stream("0")
+            .cache(keyed_cache())
+            .open()
+            .unwrap();
+        assert_eq!(keyed.initialization(), expected.initialization(), "{name}");
+        assert_eq!(media_packets(keyed), media_packets(expected), "{name}");
+    }
+}
+
+#[test]
+fn media_stream_refuses_both_a_cache_and_keys() {
+    let opened = manifest("shaka_cenc.mpd")
+        .media_stream("0")
+        .keys(keys())
+        .cache(keyed_cache())
+        .open();
+    assert!(matches!(opened, Err(Error::Initialization(_))));
+}
+
+#[test]
 fn protected_dash_without_keys_is_rejected() {
     let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures)));
     assert!(matches!(
@@ -287,51 +374,6 @@ mod nonblocking {
     use super::*;
     use futures_util::StreamExt;
     use playdash::nonblocking::{FragmentCache, FragmentStream};
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
-
-    /// Serves the fixtures by file name on a local port, answering `Range`
-    /// requests with 206. Returns the base URL.
-    fn serve_fixtures() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                std::thread::spawn(move || {
-                    let mut reader = BufReader::new(stream.unwrap());
-                    let mut request_line = String::new();
-                    reader.read_line(&mut request_line).unwrap();
-                    let name = request_line.split(' ').nth(1).unwrap()[1..].to_owned();
-                    let mut range = None;
-                    let mut header = String::new();
-                    while reader.read_line(&mut header).unwrap() > 2 {
-                        if let Some(value) = header
-                            .to_ascii_lowercase()
-                            .trim()
-                            .strip_prefix("range: bytes=")
-                        {
-                            let (start, end) = value.split_once('-').unwrap();
-                            range = Some(start.parse::<usize>().unwrap()..=end.parse().unwrap());
-                        }
-                        header.clear();
-                    }
-                    let file = fixture(&name);
-                    let (status, body) = match range {
-                        Some(range) => ("206 Partial Content", &file[range]),
-                        None => ("200 OK", &file[..]),
-                    };
-                    let head = format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let stream = reader.get_mut();
-                    stream.write_all(head.as_bytes()).unwrap();
-                    stream.write_all(body).unwrap();
-                });
-            }
-        });
-        format!("http://{address}")
-    }
 
     /// The DASH fixture `name`, served from `base`.
     fn async_manifest(base: &str, name: &str) -> playdash::nonblocking::DashManifest {
@@ -394,5 +436,39 @@ mod nonblocking {
             .stream_with_cache("0", keyed_cache(keys))
             .await;
         assert!(matches!(opened, Err(Error::MissingContentKey(kid)) if kid == KID));
+    }
+
+    #[tokio::test]
+    async fn media_stream_decrypts_with_keys() {
+        let base = serve_fixtures();
+        for name in ["shaka_cbcs.mpd", "shaka_cenc.mpd"] {
+            let manifest = async_manifest(&base, name);
+            let keyed = manifest
+                .media_stream("0")
+                .keys(keys())
+                .open()
+                .await
+                .unwrap();
+            let expected = super::manifest(name)
+                .media_stream("0")
+                .cache(super::keyed_cache())
+                .open()
+                .unwrap();
+            assert_eq!(keyed.initialization(), expected.initialization(), "{name}");
+            let packets: Vec<MediaPacket> = keyed.map(Result::unwrap).collect().await;
+            assert_eq!(packets, media_packets(expected), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn media_stream_refuses_both_a_cache_and_keys() {
+        let manifest = async_manifest(&serve_fixtures(), "shaka_cenc.mpd");
+        let opened = manifest
+            .media_stream("0")
+            .keys(keys())
+            .cache(keyed_cache(keys()))
+            .open()
+            .await;
+        assert!(matches!(opened, Err(Error::Initialization(_))));
     }
 }

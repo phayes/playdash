@@ -33,15 +33,14 @@ pub use buffer::{BufferAmount, BufferHandle, BufferStatus, BufferTotal};
 #[cfg(feature = "encryption")]
 #[doc(inline)]
 pub use cenc::ContentKeys;
-#[cfg(feature = "sync")]
-#[doc(inline)]
-pub use decoder::DecoderStream;
 #[cfg(any(feature = "sync", feature = "async"))]
 #[doc(inline)]
 pub use decoder::{
-    DecoderFormat, DecoderInitialization, DecoderPacket, DecoderParameters, DecoderSeeked,
-    DecoderStyle,
+    DecoderFormat, DecoderInitialization, DecoderParameters, DecoderStyle, MediaPacket, MediaSeeked,
 };
+#[cfg(feature = "sync")]
+#[doc(inline)]
+pub use decoder::{MediaStream, MediaStreamBuilder};
 #[doc(inline)]
 pub use error::Error;
 #[doc(inline)]

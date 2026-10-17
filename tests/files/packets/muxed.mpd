@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+	profiles="urn:mpeg:dash:profile:isoff-on-demand:2011"
+	type="static"
+	mediaPresentationDuration="PT2.0S"
+	minBufferTime="PT2.0S">
+	<Period id="0" start="PT0.0S">
+		<AdaptationSet id="0">
+			<Representation id="0" mimeType="video/mp4" codecs="avc1.64000a,mp4a.40.2" bandwidth="74000" width="96" height="64">
+				<BaseURL>muxed.mp4</BaseURL>
+				<SegmentList timescale="1000000" duration="1000000" startNumber="1">
+					<Initialization range="0-1238" />
+					<SegmentURL mediaRange="1239-7686" />
+					<SegmentURL mediaRange="7687-14033" />
+				</SegmentList>
+			</Representation>
+		</AdaptationSet>
+	</Period>
+</MPD>

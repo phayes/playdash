@@ -287,6 +287,70 @@ fn representation_prefers_full_id_then_format_token() {
 }
 
 #[test]
+fn picks_representations_by_kind_and_bandwidth() {
+    let xml = r#"
+        <MPD>
+            <Period>
+                <AdaptationSet contentType="video" mimeType="video/mp4">
+                    <Representation id="v-none" codecs="avc1.64001f"/>
+                    <Representation id="v-mid" codecs="avc1.64001f" bandwidth="2000000"/>
+                    <Representation id="v-high" codecs="avc1.64001f" bandwidth="5000000"/>
+                    <Representation id="v-high-again" codecs="avc1.64001f" bandwidth="5000000"/>
+                    <Representation id="v-low" codecs="avc1.64001f" bandwidth="500000"/>
+                    <Representation id="v-low-again" codecs="avc1.64001f" bandwidth="500000"/>
+                </AdaptationSet>
+                <AdaptationSet mimeType="video/mp4">
+                    <Representation id="muxed" codecs="avc1.64001f,mp4a.40.2" bandwidth="9000000"/>
+                </AdaptationSet>
+                <AdaptationSet contentType="audio" mimeType="audio/mp4">
+                    <Representation id="a-none" codecs="mp4a.40.2"/>
+                </AdaptationSet>
+            </Period>
+        </MPD>
+    "#;
+    let manifest = DashManifest::new(xml).unwrap();
+    let ids = |kind| -> Vec<&str> {
+        manifest
+            .representations_of(kind)
+            .map(|representation| representation.id)
+            .collect()
+    };
+
+    // Exactly the kind asked for, in document order.
+    assert_eq!(
+        ids(ContentKind::Video),
+        [
+            "v-none",
+            "v-mid",
+            "v-high",
+            "v-high-again",
+            "v-low",
+            "v-low-again"
+        ]
+    );
+    assert_eq!(ids(ContentKind::Muxed), ["muxed"]);
+    assert!(ids(ContentKind::Text).is_empty());
+
+    // Among advertised bandwidths, the first of equals.
+    let id = |representation: Option<Representation>| representation.map(|r| r.id.to_owned());
+    assert_eq!(
+        id(manifest.highest_bandwidth(ContentKind::Video)).as_deref(),
+        Some("v-high")
+    );
+    assert_eq!(
+        id(manifest.lowest_bandwidth(ContentKind::Video)).as_deref(),
+        Some("v-low")
+    );
+    assert_eq!(
+        id(manifest.highest_bandwidth(ContentKind::Muxed)).as_deref(),
+        Some("muxed")
+    );
+    assert_eq!(id(manifest.highest_bandwidth(ContentKind::Audio)), None);
+    assert_eq!(id(manifest.lowest_bandwidth(ContentKind::Audio)), None);
+    assert_eq!(id(manifest.lowest_bandwidth(ContentKind::Text)), None);
+}
+
+#[test]
 fn rejects_dash_manifest_without_representations() {
     assert!(matches!(
         DashManifest::new("<MPD/>"),

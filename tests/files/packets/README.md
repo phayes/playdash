@@ -11,7 +11,8 @@ packets, codecs and seek results.
   MP3's priming pushes their last packet into a fourth segment that `@duration` places at the
   end of the Period, where segments are dropped.)
 - `muxed.mp4` is one fragmented file holding an H.264 track and an AAC track, which the test
-  splits into fragments itself. `muxed_v.json` and `muxed_a.json` list each track's packets.
+  splits into fragments itself. `muxed.mpd` is a hand-written manifest of its byte ranges.
+  `muxed_v.json` and `muxed_a.json` list each track's packets.
 - `hevc` and `hevc_open_gop` are open-GOP HEVC: x265 starts each GOP after the first with a CRA
   picture, followed in decode order by RASL pictures that reference the GOP before it.
   ffmpeg's DASH muxer mistimes the CRA that starts `hevc`'s second fragment, giving it the
@@ -80,4 +81,5 @@ ffmpeg -y "${video[@]}" -f lavfi -i sine=frequency=440:sample_rate=48000:duratio
 for stream in v a; do
   probe -select_streams "$stream:0" muxed.mp4 > "muxed_$stream.json"
 done
+# Then update the byte ranges in muxed.mpd: ftyp+moov, then each moof+mdat.
 ```

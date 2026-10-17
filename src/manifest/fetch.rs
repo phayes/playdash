@@ -7,6 +7,7 @@ use std::time::Duration;
 use ureq::ResponseExt;
 
 use super::DashManifest;
+use crate::decoder::MediaStreamBuilder;
 use crate::error::Error;
 use crate::fragment::{Fragments, MediaTimeline};
 use crate::stream::{FragmentCache, FragmentStream, Transport};
@@ -150,6 +151,30 @@ impl DashManifest {
     ) -> Result<(FragmentStream, Duration), Error> {
         let (fragments, timeline) = self.stream_parts(representation_id.as_ref())?;
         FragmentStream::starting_at(fragments, timeline, time, cache)
+    }
+
+    /// Returns a builder of a representation's [`MediaStream`](crate::MediaStream): its
+    /// track's packets in the form codec decoders read. Set options on the builder, then
+    /// call [`MediaStreamBuilder::open`].
+    ///
+    /// The representation is matched as by [`DashManifest::representation`]. Never
+    /// fails; errors come from [`MediaStreamBuilder::open`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use playdash::DashManifest;
+    ///
+    /// # fn example() -> Result<(), playdash::Error> {
+    /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
+    /// let input = manifest.media_stream("audio").open()?;
+    /// // configure the decoder with input.initialization(), then decode each packet
+    /// # drop(input);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn media_stream(&self, representation_id: impl AsRef<str>) -> MediaStreamBuilder<'_> {
+        MediaStreamBuilder::new(self, representation_id.as_ref())
     }
 
     fn stream_parts(&self, representation_id: &str) -> Result<(Fragments, MediaTimeline), Error> {
