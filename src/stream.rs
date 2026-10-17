@@ -6,8 +6,10 @@ use crate::buffer::BufferHandle;
 use crate::cenc::ContentKeys;
 use crate::error::Error;
 use crate::fragment::{Fragment, Fragments, MediaTimeline, slice_range};
+use crate::mp4::track::{self, Track};
 use crate::schedule::{
-    self, Cursor, Part, Position, Retention, Schedule, StreamTimeline, TimeAccuracy, WindowChange,
+    self, Cursor, Part, PartBody, Position, Retention, Schedule, StreamTimeline, TimeAccuracy,
+    WindowChange,
 };
 use crate::store::{FragmentData, Store};
 use bytes::Bytes;
@@ -256,7 +258,7 @@ pub(crate) fn ureq_agent() -> ureq::Agent {
 /// and reading share one position: [`Iterator::next`] yields everything from
 /// the current position to the end of its fragment, which is a whole fragment
 /// unless [`Read`] or [`Self::seek_bytes`] left the position inside one. Use
-/// [`Self::seek_bytes`] for byte offsets or [`Self::seek_time_coarse`] to seek
+/// [`Self::seek_bytes`] for byte offsets or [`Self::seek_time`] to seek
 /// to the start of the fragment containing a timestamp. Both iterating and
 /// reading block while the fragment they need downloads.
 ///
@@ -301,7 +303,7 @@ pub(crate) fn ureq_agent() -> ureq::Agent {
 ///
 /// // Bytes, from 30 seconds in.
 /// let mut stream = manifest.stream("audio")?;
-/// stream.seek_time_coarse(Duration::from_secs(30))?;
+/// stream.seek_time(Duration::from_secs(30))?;
 /// let mut bytes = [0; 4096];
 /// let count = stream.read(&mut bytes)?;
 /// # let _ = count;
@@ -503,9 +505,9 @@ impl FragmentStream {
     ///
     /// The returned byte offset is exact, except [`SeekFrom::End`]`(0)` under
     /// [`Self::set_symphonia_compat`], which may report an oversized estimate.
-    /// When a timeline is available, the returned time is exact at a fragment
-    /// boundary and otherwise reports the containing fragment's start as
-    /// [`TimeAccuracy::Coarse`].
+    /// When a timeline is available, the returned time is [`TimeAccuracy::Packet`]
+    /// at a fragment boundary, and otherwise the containing fragment's start as
+    /// [`TimeAccuracy::Fragment`].
     pub fn seek_bytes(&mut self, from: SeekFrom) -> io::Result<Position> {
         // The end, as far as it is known or estimated.
         let reported_end = match from {
@@ -541,7 +543,8 @@ impl FragmentStream {
         })
     }
 
-    /// Coarsely seeks to a media timestamp using the DASH `SegmentTimeline`.
+    /// Seeks to the start of the media fragment containing `time`, using the
+    /// DASH `SegmentTimeline`.
     ///
     /// Time `0` is the start of the first media fragment, after the
     /// initialization segment. The seek lands at byte `0` of the fragment
@@ -549,14 +552,14 @@ impl FragmentStream {
     /// rather than an arbitrary position inside `mdat`. The target fragment is
     /// prioritized and loaded before this method returns.
     ///
-    /// This is segment-granular: playback may begin earlier than `time` by up
-    /// to one media-fragment duration. The returned [`TimePosition`](crate::TimePosition) contains
-    /// the actual fragment-start timestamp and marks it [`TimeAccuracy::Exact`]
-    /// only when the requested time is exactly that boundary. The byte field is
-    /// `None` until every earlier fragment size is known.
-    pub fn seek_time_coarse(&mut self, time: Duration) -> io::Result<Position> {
-        let (media_index, exact) = schedule::time_target(self.timeline.as_ref(), time)?;
-        let target = Part::Media(media_index);
+    /// This is fragment-granular: playback may begin earlier than `time` by up
+    /// to one media-fragment duration. The returned [`TimePosition`](crate::TimePosition)
+    /// holds the fragment's start, which is exact for the position
+    /// ([`TimeAccuracy::Packet`]); compare it with `time` to see how far back
+    /// the seek landed. The byte field is `None` until every earlier fragment
+    /// size is known.
+    pub fn seek_time(&mut self, time: Duration) -> io::Result<Position> {
+        let target = Part::Media(schedule::time_target(self.timeline.as_ref(), time)?);
         let change = {
             let mut schedule = self.shared.lock();
             if schedule.past_end(target) {
@@ -583,14 +586,69 @@ impl FragmentStream {
         self.cursor.place(target, 0, byte_position);
         Ok(Position {
             byte: byte_position,
-            time: schedule::time_at_fragment(
-                self.timeline.as_ref(),
-                target,
-                match exact {
-                    true => TimeAccuracy::Exact,
-                    false => TimeAccuracy::Coarse,
-                },
-            ),
+            time: schedule::time_at_fragment(self.timeline.as_ref(), target, TimeAccuracy::Packet),
+        })
+    }
+
+    /// Fetches media fragment `index` of the representation, blocking until it
+    /// downloads, without moving the stream's position or retention window.
+    ///
+    /// `index` counts the representation's media fragments, as
+    /// [`MediaTimeline::fragment_at`] does, also for a stream from
+    /// [`Self::starting_at`]. A fragment outside the retention window is not
+    /// kept once returned, unless another stream sharing the cache keeps it.
+    ///
+    /// Fails with [`Error::Initialization`] for a fragment before the stream's
+    /// first or past its last, and with the download's error if it fails. A
+    /// failed fetch does not end the stream.
+    pub fn media_fragment(&self, index: usize) -> Result<Bytes, Error> {
+        Ok(self.media_part_body(index)?.body)
+    }
+
+    /// The tracks of the representation's initialization fragment, as a
+    /// [`PacketStream`](crate::PacketStream) reads them.
+    ///
+    /// Fails with [`Error::MalformedMedia`] or [`Error::UnsupportedMedia`] if the
+    /// initialization fragment is not MP4 this crate reads.
+    pub fn tracks(&self) -> Result<Vec<Track>, Error> {
+        let init = self.shared.lock().init.clone();
+        let body = init.body().ok_or_else(|| {
+            Error::Initialization(
+                "MPEG stream no longer holds its initialization fragment".to_owned(),
+            )
+        })?;
+        track::tracks(&body, &init.fragment)
+    }
+
+    /// [`Self::media_fragment`], with where the fragment sits.
+    pub(crate) fn media_part_body(&self, index: usize) -> Result<PartBody, Error> {
+        let part = schedule::media_part(self.timeline.as_ref(), index);
+        let (part, data) = {
+            let schedule = self.shared.lock();
+            part.and_then(|part| Some((part, schedule.fragment(part)?.clone())))
+                .ok_or_else(|| {
+                    Error::Initialization(format!(
+                        "MPEG stream has no media fragment {index} of its representation"
+                    ))
+                })?
+        };
+
+        // Fetch on this thread; the stream's own downloads carry on meanwhile.
+        let body = self.shared.cache.get(&data)?;
+        let kept = {
+            let mut schedule = self.shared.lock();
+            schedule.check_probe(part);
+            schedule.keeps(part)
+        };
+        if !kept {
+            self.shared.cache.store.forget_if_unheld(&data);
+        }
+        self.shared.condvar.notify_all();
+        Ok(PartBody {
+            part,
+            index: Some(index),
+            fragment: data.fragment.clone(),
+            body,
         })
     }
 
@@ -815,12 +873,10 @@ impl Read for FragmentStream {
     }
 }
 
-impl Iterator for FragmentStream {
-    type Item = Result<Bytes, Error>;
-
-    /// The rest of the current fragment: a whole fragment, unless reading or a
-    /// byte seek left the position inside one. Blocks while it downloads.
-    fn next(&mut self) -> Option<Self::Item> {
+impl FragmentStream {
+    /// The rest of the current fragment, as [`Iterator::next`] yields it, with
+    /// where it sits.
+    pub(crate) fn next_part(&mut self) -> Option<Result<PartBody, Error>> {
         if self.failed {
             return None;
         }
@@ -834,8 +890,11 @@ impl Iterator for FragmentStream {
             self.prioritize_fragment(part);
             let waited = self
                 .wait_until(|schedule| !schedule.missing_body(part) || schedule.complete)
-                .map(|mut schedule| schedule.checked_body(part));
-            let body = match waited {
+                .map(|mut schedule| {
+                    let body = schedule.checked_body(part)?;
+                    Some((body, schedule.fragment(part)?.fragment.clone()))
+                });
+            let (body, fragment) = match waited {
                 Ok(body) => body?,
                 Err(error) => {
                     self.failed = true;
@@ -846,10 +905,41 @@ impl Iterator for FragmentStream {
             // Hand over what is left of it and move on to the next.
             let rest = self.cursor.take_rest(body);
             self.publish_cursor();
-            if let Some(rest) = rest {
-                return Some(Ok(rest));
+            if let Some(body) = rest {
+                return Some(Ok(PartBody {
+                    part,
+                    index: schedule::representation_index(self.timeline.as_ref(), part),
+                    fragment,
+                    body,
+                }));
             }
         }
+    }
+
+    /// Whether nothing has been read yet: the position is the start of the
+    /// initialization fragment.
+    pub(crate) fn at_start(&self) -> bool {
+        self.cursor.part == Part::Init && self.cursor.offset_in_fragment == 0
+    }
+
+    /// The representation's timeline, if the stream has one.
+    pub(crate) fn representation_timeline(&self) -> Option<&MediaTimeline> {
+        self.timeline.as_ref().map(StreamTimeline::timeline)
+    }
+
+    /// Index in the representation of the stream's first media fragment.
+    pub(crate) fn first_index(&self) -> usize {
+        self.timeline.as_ref().map_or(0, StreamTimeline::first)
+    }
+}
+
+impl Iterator for FragmentStream {
+    type Item = Result<Bytes, Error>;
+
+    /// The rest of the current fragment: a whole fragment, unless reading or a
+    /// byte seek left the position inside one. Blocks while it downloads.
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.next_part()?.map(|part| part.body))
     }
 }
 
@@ -1255,6 +1345,7 @@ mod tests {
             Fragments::new("init", ["a", "b", "c"]),
             Some(MediaTimeline {
                 timescale: 1,
+                origin: 0,
                 media_durations: vec![1, 1, 1],
             }),
             true,
@@ -1290,7 +1381,7 @@ mod tests {
         .unwrap();
 
         let handle = thread::spawn(move || {
-            let position = reader.seek_time_coarse(Duration::from_secs(2)).unwrap();
+            let position = reader.seek_time(Duration::from_secs(2)).unwrap();
             let error = reader.seek_bytes(SeekFrom::Current(1)).unwrap_err();
             (position, error.kind())
         });
@@ -1306,7 +1397,7 @@ mod tests {
                 byte: None,
                 time: Some(TimePosition {
                     timestamp: Duration::from_secs(2),
-                    accuracy: TimeAccuracy::Exact,
+                    accuracy: TimeAccuracy::Packet,
                 }),
             }
         );
@@ -1316,9 +1407,10 @@ mod tests {
     }
 
     #[test]
-    fn seek_time_coarse_maps_timeline_to_fragment_starts() {
+    fn seek_time_maps_timeline_to_fragment_starts() {
         let timeline = MediaTimeline {
             timescale: 100,
+            origin: 0,
             media_durations: vec![100, 100],
         };
         let mut reader = closure_reader(
@@ -1333,8 +1425,8 @@ mod tests {
         reader.read_to_end(&mut Vec::new()).unwrap();
 
         assert_eq!(
-            reader.seek_time_coarse(Duration::from_secs(0)).unwrap(),
-            position(Some(4), Some((Duration::ZERO, TimeAccuracy::Exact))),
+            reader.seek_time(Duration::from_secs(0)).unwrap(),
+            position(Some(4), Some((Duration::ZERO, TimeAccuracy::Packet))),
             "time 0 is the first media fragment, after init"
         );
         let mut buf = [0u8; 4];
@@ -1342,23 +1434,26 @@ mod tests {
         assert_eq!(&buf, b"AAAA");
 
         assert_eq!(
-            reader.seek_time_coarse(Duration::from_secs(1)).unwrap(),
-            position(Some(8), Some((Duration::from_secs(1), TimeAccuracy::Exact)))
+            reader.seek_time(Duration::from_secs(1)).unwrap(),
+            position(
+                Some(8),
+                Some((Duration::from_secs(1), TimeAccuracy::Packet))
+            )
         );
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"BBBB");
 
         assert_eq!(
-            reader.seek_time_coarse(Duration::from_millis(500)).unwrap(),
-            position(Some(4), Some((Duration::ZERO, TimeAccuracy::Coarse))),
-            "coarse seeks land at the containing fragment's moof"
+            reader.seek_time(Duration::from_millis(500)).unwrap(),
+            position(Some(4), Some((Duration::ZERO, TimeAccuracy::Packet))),
+            "seeks land at the containing fragment's moof, and report its start exactly"
         );
         reader.read_exact(&mut buf[..2]).unwrap();
         assert_eq!(&buf[..2], b"AA");
     }
 
     #[test]
-    fn seek_time_coarse_prioritizes_target_fragment() {
+    fn seek_time_prioritizes_target_fragment() {
         let allow_a = Arc::new(AtomicBool::new(false));
         let allow_b = Arc::new(AtomicBool::new(false));
         let allow_c = Arc::new(AtomicBool::new(false));
@@ -1368,6 +1463,7 @@ mod tests {
             Fragments::new("init", ["a", "b", "c"]),
             Some(MediaTimeline {
                 timescale: 1,
+                origin: 0,
                 media_durations: vec![1, 1, 1],
             }),
             true,
@@ -1413,7 +1509,7 @@ mod tests {
         }
 
         let handle = thread::spawn(move || {
-            let position = reader.seek_time_coarse(Duration::from_secs(2)).unwrap();
+            let position = reader.seek_time(Duration::from_secs(2)).unwrap();
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf).unwrap();
             (position, buf)
@@ -1431,7 +1527,7 @@ mod tests {
                 byte: None,
                 time: Some(TimePosition {
                     timestamp: Duration::from_secs(2),
-                    accuracy: TimeAccuracy::Exact,
+                    accuracy: TimeAccuracy::Packet,
                 }),
             }
         );
@@ -1449,6 +1545,7 @@ mod tests {
             Fragments::new("init", ["a", "b", "c", "d"]),
             Some(MediaTimeline {
                 timescale: 1,
+                origin: 0,
                 media_durations: vec![1, 1, 1, 1],
             }),
             true,
@@ -1481,7 +1578,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
         });
-        reader.seek_time_coarse(Duration::from_secs(2)).unwrap();
+        reader.seek_time(Duration::from_secs(2)).unwrap();
         let _inner = reader.wait_until(|inner| inner.complete).unwrap();
 
         let got = order.lock().unwrap().clone();
@@ -1495,9 +1592,10 @@ mod tests {
     }
 
     #[test]
-    fn seek_time_coarse_returns_known_when_prefix_filled() {
+    fn seek_time_returns_known_when_prefix_filled() {
         let timeline = MediaTimeline {
             timescale: 1,
+            origin: 0,
             media_durations: vec![1, 1],
         };
         let mut reader = closure_reader(
@@ -1511,8 +1609,11 @@ mod tests {
 
         reader.read_to_end(&mut Vec::new()).unwrap();
         assert_eq!(
-            reader.seek_time_coarse(Duration::from_secs(1)).unwrap(),
-            position(Some(8), Some((Duration::from_secs(1), TimeAccuracy::Exact)))
+            reader.seek_time(Duration::from_secs(1)).unwrap(),
+            position(
+                Some(8),
+                Some((Duration::from_secs(1), TimeAccuracy::Packet))
+            )
         );
     }
 
@@ -1543,13 +1644,13 @@ mod tests {
     }
 
     #[test]
-    fn seek_time_coarse_requires_timeline() {
+    fn seek_time_requires_timeline() {
         let mut reader = start_instant(
             Fragments::new("init", Vec::<Fragment>::new()),
             &[("init", b"xyz")],
         )
         .unwrap();
-        let error = reader.seek_time_coarse(Duration::ZERO).unwrap_err();
+        let error = reader.seek_time(Duration::ZERO).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -1645,6 +1746,7 @@ mod tests {
     fn iterates_from_a_coarse_seek() {
         let timeline = MediaTimeline {
             timescale: 1,
+            origin: 0,
             media_durations: vec![1, 1],
         };
         let mut stream = closure_reader(
@@ -1655,9 +1757,7 @@ mod tests {
             failing_head(),
         )
         .unwrap();
-        stream
-            .seek_time_coarse(Duration::from_millis(1_500))
-            .unwrap();
+        stream.seek_time(Duration::from_millis(1_500)).unwrap();
         assert_eq!(texts(stream), ["bb"]);
     }
 
@@ -2087,6 +2187,7 @@ mod tests {
     fn two_second_timeline() -> MediaTimeline {
         MediaTimeline {
             timescale: 44_100,
+            origin: 0,
             media_durations: vec![44_100, 44_100],
         }
     }
@@ -2111,7 +2212,7 @@ mod tests {
             end.time,
             Some(TimePosition {
                 timestamp: Duration::from_secs(2),
-                accuracy: TimeAccuracy::Exact,
+                accuracy: TimeAccuracy::Packet,
             })
         );
 
@@ -2410,6 +2511,7 @@ mod tests {
             Fragments::new("init", ["aa", "bb"]),
             Some(MediaTimeline {
                 timescale: 10,
+                origin: 0,
                 media_durations: vec![10, 10],
             }),
             cache,
@@ -2442,10 +2544,90 @@ mod tests {
         assert_eq!(status.downloaded.bytes, 4);
     }
 
+    #[test]
+    fn media_fragment_fetches_without_moving_the_stream() {
+        let (cache, transport) = counting_cache(&[]);
+        let (fragments, timeline) = uneven();
+        // Keep nothing behind, and only the next second ahead.
+        let (stream, _) =
+            FragmentStream::starting_at(fragments, timeline, Duration::from_secs(2), cache.clone())
+                .unwrap();
+        let mut stream = stream.with_retention(Retention {
+            behind: Some(Duration::ZERO),
+            ahead: Some(Duration::from_secs(1)),
+        });
+        assert_eq!(stream.next().unwrap().unwrap(), &b"init"[..]);
+
+        // Fragment 0 is before this stream's first; fragment 3 does not exist.
+        for index in [0, 3] {
+            assert!(matches!(
+                stream.media_fragment(index),
+                Err(Error::Initialization(_))
+            ));
+        }
+
+        // Fetching the last fragment leaves the stream reading its first.
+        assert_eq!(stream.media_fragment(2).unwrap(), &b"c"[..]);
+        assert_eq!(stream.next().unwrap().unwrap(), &b"b"[..]);
+        assert_eq!(stream.next().unwrap().unwrap(), &b"c"[..]);
+        assert!(stream.next().is_none());
+
+        // Behind the window now, so fetching it again downloads it again and
+        // does not keep it.
+        wait_for(|| cache.cached(&"b".into()).is_none());
+        assert_eq!(stream.media_fragment(1).unwrap(), &b"b"[..]);
+        assert_eq!(cache.cached(&"b".into()), None);
+        assert_eq!(transport.gets().iter().filter(|url| *url == "b").count(), 2);
+    }
+
+    #[test]
+    fn media_fragment_errors_are_the_callers_alone() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let get = {
+            let (failed, released) = (failed.clone(), released.clone());
+            move |fragment: &Fragment, _: Option<u64>| match fragment.url.as_str() {
+                // The stream's own downloads wait at "a" until released.
+                "a" => {
+                    while !released.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(b"a".to_vec())
+                }
+                // The first GET of "b" fails; later ones succeed.
+                "b" if !failed.swap(true, Ordering::SeqCst) => {
+                    Err(Error::Initialization("refused".to_owned()))
+                }
+                url => Ok(url.as_bytes().to_vec()),
+            }
+        };
+        let mut stream = closure_reader(
+            Fragments::new("init", ["a", "b"]),
+            None,
+            false,
+            get,
+            failing_head(),
+        )
+        .unwrap();
+
+        // The side fetch is the first GET of "b", and fails.
+        assert!(matches!(
+            stream.media_fragment(1),
+            Err(Error::Initialization(reason)) if reason == "refused"
+        ));
+
+        // The stream carries on, and downloads "b" itself.
+        released.store(true, Ordering::SeqCst);
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"initab");
+    }
+
     /// Fragments of 1.5, 2 and 1 seconds, whose bodies are their names.
     fn uneven() -> (Fragments, MediaTimeline) {
         let timeline = MediaTimeline {
             timescale: 10,
+            origin: 0,
             media_durations: vec![15, 20, 10],
         };
         (Fragments::new("init", ["a", "b", "c"]), timeline)
@@ -2472,16 +2654,14 @@ mod tests {
         );
         assert_eq!(status.total.fragments, 2);
         assert_eq!(
-            stream
-                .seek_time_coarse(Duration::from_millis(3_500))
-                .unwrap(),
+            stream.seek_time(Duration::from_millis(3_500)).unwrap(),
             position(
                 Some(5),
-                Some((Duration::from_millis(3_500), TimeAccuracy::Exact))
+                Some((Duration::from_millis(3_500), TimeAccuracy::Packet))
             )
         );
         assert_eq!(stream.next().unwrap().unwrap(), &b"c"[..]);
-        let before_start = stream.seek_time_coarse(Duration::from_secs(1)).unwrap_err();
+        let before_start = stream.seek_time(Duration::from_secs(1)).unwrap_err();
         assert_eq!(before_start.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -2682,6 +2862,7 @@ mod tests {
         let fragments = Fragments::new("init", ["1", "2", "3", "4", "5"]);
         let timeline = MediaTimeline {
             timescale: 1,
+            origin: 0,
             media_durations: vec![1; 5],
         };
         FragmentStream::new_with_cache(fragments, Some(timeline), cache).unwrap()
@@ -2718,7 +2899,7 @@ mod tests {
         assert!(cache.cached(&"init".into()).is_some());
         assert_eq!(cache.known_size(&"1".into()), Some(1));
 
-        stream.seek_time_coarse(Duration::ZERO).unwrap();
+        stream.seek_time(Duration::ZERO).unwrap();
         assert_eq!(stream.next().unwrap().unwrap(), &b"1"[..]);
         let fetches_of_1 = transport.gets().iter().filter(|url| *url == "1").count();
         assert_eq!(fetches_of_1, 2);

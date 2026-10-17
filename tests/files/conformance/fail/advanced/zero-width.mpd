@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" minBufferTime="PT1.50S" type="static" mediaPresentationDuration="PT5.00S" profiles="urn:mpeg:dash:profile:isoff-main:2011">
+ <ProgramInformation>
+  <Title>Conformant MPD - @width and @height on a (complementary) Representation to indicate that that representation should not be selected alone</Title>
+ </ProgramInformation>
+
+ <Period>
+  <AdaptationSet>
+   <Representation id="1" mimeType="video/mp4" codecs="avc1.42c01e" width="0" height="0" startWithSAP="1" bandwidth="1000">
+    <SegmentList timescale="1000" duration="1000">
+     <Initialization sourceURL="init.mp4"/>
+     <SegmentURL media="seg1.m4s"/>
+     <SegmentURL media="seg2.m4s"/>
+     <SegmentURL media="seg_empty.m4s"/>
+     <SegmentURL media="seg4.m4s"/>
+     <SegmentURL media="seg5.m4s"/>
+    </SegmentList>   
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>

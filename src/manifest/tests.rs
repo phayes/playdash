@@ -117,6 +117,7 @@ fn parses_segment_timeline_and_unescapes_urls() {
         manifest.media_timeline("AACLC").unwrap(),
         MediaTimeline {
             timescale: 44_100,
+            origin: 0,
             media_durations: vec![176_128, 176_128, 176_128, 108_735],
         }
     );
@@ -156,9 +157,46 @@ fn inherits_segment_template_from_adaptation_set() {
         manifest.media_timeline("FLAC").unwrap(),
         MediaTimeline {
             timescale: 1000,
+            origin: 0,
             media_durations: vec![2000, 2000],
         }
     );
+}
+
+#[test]
+fn media_timeline_origin_is_the_first_segment_media_time() {
+    let manifest = |timing: &str| {
+        DashManifest::new(format!(
+            r#"<MPD mediaPresentationDuration="PT4S"><Period><AdaptationSet mimeType="audio/mp4">
+                <Representation id="FLAC">
+                    <SegmentTemplate initialization="init" media="$Number$" {timing}
+                </Representation>
+            </AdaptationSet></Period></MPD>"#
+        ))
+        .unwrap()
+        .media_timeline("FLAC")
+        .unwrap()
+    };
+
+    // A timeline starting after the presentation time offset.
+    let timeline = manifest(
+        r#"timescale="1000" presentationTimeOffset="500">
+            <SegmentTimeline><S t="700" d="2000" r="1"/></SegmentTimeline>
+        </SegmentTemplate>"#,
+    );
+    assert_eq!(timeline.origin, 700);
+    // The Period ends at media time 4500, cutting the second segment short.
+    assert_eq!(timeline.media_durations, [2000, 1800]);
+
+    // Fixed-duration segments start at the offset.
+    let timeline = manifest(r#"timescale="1000" presentationTimeOffset="500" duration="2000"/>"#);
+    assert_eq!(timeline.origin, 500);
+
+    // Without either, media time starts at zero.
+    let timeline = manifest(
+        r#"timescale="1000"><SegmentTimeline><S d="2000"/></SegmentTimeline></SegmentTemplate>"#,
+    );
+    assert_eq!(timeline.origin, 0);
 }
 
 #[test]
@@ -391,6 +429,7 @@ fn resolves_base_url_chain_and_duration_template() {
         manifest.media_timeline("FLAC").unwrap(),
         MediaTimeline {
             timescale: 1000,
+            origin: 0,
             media_durations: vec![4000, 4000, 1000],
         }
     );
@@ -455,7 +494,7 @@ fn period_duration_runs_to_next_period_start() {
     let manifest = DashManifest::new(xml).unwrap();
     assert_eq!(
         manifest.media_timeline("FIRST").unwrap().media_durations,
-        [2, 2, 2]
+        [2, 2, 1]
     );
     assert_eq!(
         manifest.media_timeline("SECOND").unwrap().media_durations,
@@ -569,6 +608,7 @@ fn segment_list_media_ranges_address_one_file() {
         manifest.media_timeline("FLAC").unwrap(),
         MediaTimeline {
             timescale: 1000,
+            origin: 0,
             media_durations: vec![4000, 4000],
         }
     );

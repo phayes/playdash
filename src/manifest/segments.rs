@@ -31,6 +31,7 @@ impl Segments {
     pub fn media_timeline(&self) -> MediaTimeline {
         MediaTimeline {
             timescale: self.timescale,
+            origin: self.segments.first().map_or(0, |segment| segment.time),
             media_durations: self
                 .segments
                 .iter()
@@ -152,6 +153,15 @@ impl Bounds {
                 });
                 number += 1;
                 time += entry.d;
+            }
+        }
+
+        // Drop segments from the end of the Period on, and cut the last one short there.
+        if let Some(ticks) = self.period_ticks {
+            let end = self.offset + ticks;
+            segments.retain(|segment| segment.time < end);
+            if let Some(last) = segments.last_mut() {
+                last.duration = last.duration.min(end - last.time);
             }
         }
         Ok(segments)

@@ -51,6 +51,12 @@ async = ["dep:reqwest", "dep:futures-util", "dep:bytes", "dep:tokio"]
 rodio = ["sync", "dep:rodio"]
 log = ["dep:log"]
 encryption = ["dep:aes", "dep:ctr"]
+# Test only: runs tests/conformance.rs against GPAC's conformance server. Adds nothing to the
+# library.
+conformance = ["sync"]
+# Test only: decodes tests/decoder.rs's decoder-ready packets with the `ffmpeg` on PATH.
+# Adds nothing to the library.
+ffmpeg-tests = ["sync"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -58,6 +64,8 @@ all-features = true
 [dev-dependencies]
 crossterm = "0.29"
 env_logger = "0.11"
+# Without its default `download_ffmpeg`, it runs the `ffmpeg` on PATH.
+ffmpeg-sidecar = { version = "2.6", default-features = false }
 minifb = "0.29"
 rodio = { version = "0.22", default-features = false, features = [
     "symphonia-aac",
@@ -67,9 +75,22 @@ rodio = { version = "0.22", default-features = false, features = [
 ] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "rt"] }
+ureq = { version = "3.1", default-features = false, features = ["rustls"] }
 
 [[example]]
 name = "list_representations"
+required-features = ["sync"]
+
+[[example]]
+name = "list_packets"
+required-features = ["sync"]
+
+[[example]]
+name = "list_tracks"
+required-features = ["sync"]
+
+[[example]]
+name = "save_flac"
 required-features = ["sync"]
 
 [[example]]

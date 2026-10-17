@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<!-- MPD file Generated with GPAC version 0.5.1-DEV-rev5316  on 2014-07-18T08:35:22Z-->
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" minBufferTime="PT1.500000S" type="static" mediaPresentationDuration="PT0H0M10.00S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+ <Period duration="PT0H0M10.00S">
+  <AdaptationSet segmentAlignment="true" maxWidth="1920" maxHeight="1080" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <Representation id="13" mimeType="video/mp4" codecs="avc1.42c00d" width="320" height="180" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="119638">
+    <BaseURL>counter-tile-3-320x180-I25-96kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+   <Representation id="14" mimeType="video/mp4" codecs="avc1.42c01e" width="640" height="360" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="218294">
+    <BaseURL>counter-tile-3-640x360-I25-192kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="816-967"/>
+   </Representation>
+   <Representation id="15" mimeType="video/mp4" codecs="avc1.42c01f" width="1280" height="720" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="526017">
+    <BaseURL>counter-tile-3-1280x720-I25-512kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+   <Representation id="16" mimeType="video/mp4" codecs="avc1.42c028" width="1920" height="1080" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="771052">
+    <BaseURL>counter-tile-3-1920x1080-I25-768kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>

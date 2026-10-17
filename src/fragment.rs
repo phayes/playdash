@@ -10,7 +10,8 @@ use std::time::Duration;
 /// Media-segment timing used to map playback positions to fragments.
 ///
 /// Durations are expressed in `timescale` ticks. For example, a timescale of
-/// `1_000` makes a duration of `2_500` equal to 2.5 seconds.
+/// `1_000` makes a duration of `2_500` equal to 2.5 seconds. Time zero is the
+/// start of the first media fragment.
 ///
 /// # Examples
 ///
@@ -19,6 +20,7 @@ use std::time::Duration;
 ///
 /// let timeline = MediaTimeline {
 ///     timescale: 1_000,
+///     origin: 0,
 ///     media_durations: vec![2_500, 2_500],
 /// };
 ///
@@ -29,6 +31,11 @@ use std::time::Duration;
 pub struct MediaTimeline {
     /// DASH timescale: ticks per second.
     pub timescale: u32,
+    /// Media time at the start of the first media fragment, in `timescale`
+    /// ticks: the timestamp the media itself gives that instant, including any
+    /// `@presentationTimeOffset`. Subtract it from a media timestamp, such as
+    /// an MP4 decode time, to place that timestamp on this timeline.
+    pub origin: u64,
     /// Duration of each media fragment, in timescale ticks, in playback order.
     pub media_durations: Vec<u64>,
 }
@@ -77,6 +84,7 @@ impl MediaTimeline {
     ///
     /// let timeline = MediaTimeline {
     ///     timescale: 1_000,
+    ///     origin: 0,
     ///     media_durations: vec![2_000, 2_000],
     /// };
     /// assert_eq!(timeline.fragment_at(Duration::ZERO), Some(0));
@@ -256,6 +264,7 @@ mod tests {
     fn two_second_timeline() -> MediaTimeline {
         MediaTimeline {
             timescale: 44_100,
+            origin: 0,
             media_durations: vec![44_100, 44_100],
         }
     }
@@ -287,6 +296,7 @@ mod tests {
 
         let empty = MediaTimeline {
             timescale: 1_000,
+            origin: 0,
             media_durations: Vec::new(),
         };
         assert_eq!(empty.fragment_at(Duration::ZERO), None);

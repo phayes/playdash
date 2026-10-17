@@ -1,0 +1,365 @@
+Decoder-ready packet streams
+============================
+
+Goal
+----
+
+Make playdash the boundary between MPEG-DASH/MP4 and codec implementations.
+The crate should download, decrypt, demux, interpret codec configuration, and
+rewrite MP4 access units into a form suitable for codec decoder crates. It
+should not decompress audio or video itself.
+
+A consumer should not need to understand MP4 sample entries, avcC, hvcC,
+AudioSpecificConfig, dOps, dfLa, NAL length prefixes, or decoder pre-roll. It
+will still choose and operate the actual codec decoder.
+
+
+Design principles
+-----------------
+
+1. Keep PacketStream's current contract. Packet.data is one access unit in the
+   representation used by MP4. Existing users may need those exact bytes.
+
+2. Add a wrapper that produces decoder-ready compressed packets. Do not mutate
+   Packet or silently change the meaning of Packet.data.
+
+3. Preserve packet boundaries and timing. A Read-style elementary byte stream
+   can be added later for programs such as ffmpeg, but it is not the primary
+   abstraction because it loses packet boundaries, timestamps, trimming, and
+   keyframe information.
+
+
+Proposed API
+------------
+
+The normal path should construct the appropriate adapter automatically:
+
+    let packets = PacketStream::new(fragments)?;
+    let mut input = packets.into_decoder_input()?;
+
+    decoder.configure(input.initialization())?;
+
+    for packet in input {
+        let packet = packet?;
+        decoder.decode(&packet.data)?;
+    }
+
+DecoderInput owns PacketStream and a private, codec-specific adapter:
+
+    pub struct DecoderInput {
+        packets: PacketStream,
+        adapter: DecoderAdapter,
+        initialization: DecoderInitialization,
+    }
+
+    enum DecoderAdapter {
+        H264(H264AnnexBAdapter),
+        Hevc(HevcAnnexBAdapter),
+        Aac(AacAdapter),
+        Flac(FlacAdapter),
+        Opus(OpusAdapter),
+        Av1(Av1Adapter),
+        Vp9(Vp9Adapter),
+        Passthrough,
+    }
+
+DecoderAdapter is private. DecoderInput performs the match once during
+construction and presents one uniform iterator or async Stream afterward.
+
+Provide an explicit constructor for decoders which support or require a
+particular representation:
+
+    let input = packets.into_decoder_input_as(DecoderFormat::H264AnnexB)?;
+
+Codec-specific adapters can be public building blocks for advanced consumers:
+
+    let adapter = H264AnnexBAdapter::new(packets.codec())?;
+
+They are not needed on the ordinary path.
+
+
+Public types
+------------
+
+DecoderPacket contains transformed compressed bytes and all of Packet's
+timing information:
+
+    pub struct DecoderPacket {
+        pub data: Bytes,
+        pub pts: i64,
+        pub dts: i64,
+        pub duration: u64,
+        pub timescale: u32,
+        pub keyframe: bool,
+        pub trim_start: u64,
+        pub trim_end: u64,
+    }
+
+It is a separate type from Packet so the two byte contracts cannot be
+confused: Packet is MP4-native; DecoderPacket is in DecoderFormat.
+
+DecoderInitialization describes both the byte representation and semantic
+parameters a decoder may need:
+
+    pub struct DecoderInitialization {
+        pub format: DecoderFormat,
+        pub data: Bytes,
+        pub parameters: DecoderParameters,
+    }
+
+    #[non_exhaustive]
+    pub enum DecoderFormat {
+        H264AnnexB,
+        HevcAnnexB,
+        AacRaw,
+        Mp3,
+        Ac3,
+        Eac3,
+        Flac,
+        OpusPackets,
+        Av1Obu,
+        Vp9Frames,
+        Pcm,
+    }
+
+    #[non_exhaustive]
+    pub enum DecoderParameters {
+        Video {
+            width: u16,
+            height: u16,
+        },
+        Audio {
+            sample_rate: u32,
+            channels: u16,
+        },
+        Opus {
+            channels: u16,
+            pre_skip: u16,
+        },
+        Pcm {
+            sample_rate: u32,
+            channels: u16,
+            bits_per_sample: u16,
+            float: bool,
+            little_endian: bool,
+        },
+    }
+
+The exact structure should be refined while implementing the first adapters.
+In particular, initialization may need to expose several byte units instead
+of one Bytes value if real decoder APIs benefit from that. The invariant is
+that no MP4-specific parsing is left to the consumer.
+
+
+Convenvience API
+----------------
+
+impl PacketStream {
+    pub fn decoder_stream(self) -> Result<DecoderStream, Error>;
+}
+
+DecoderStream would:
+- Automatically select H264AnnexBAdapter, HevcAnnexBAdapter, etc.
+- Hold normalized decoder initialization.
+- Yield decoder-ready compressed DecoderPackets.
+- Transform seek preroll through the same adapter.
+- Preserve timing, trimming, and keyframe metadata.
+
+Canonical codec contracts
+-------------------------
+
+H.264
+
+- Parse the AVCDecoderConfigurationRecord in avcC.
+- Read the NAL length field width.
+- Extract SPS and PPS NAL units.
+- Emit SPS and PPS in Annex-B form as initialization data.
+- Rewrite every length-prefixed packet into Annex-B start-code framing.
+
+HEVC
+
+- Parse hvcC, including its NAL length field width and parameter-set arrays.
+- Emit VPS, SPS, and PPS in Annex-B form as initialization data.
+- Rewrite every packet into Annex-B start-code framing.
+
+AAC
+
+- Expose the AudioSpecificConfig as initialization data.
+- Emit raw AAC access units as packets.
+- Do not make ADTS the default: it cannot faithfully express every MPEG-4
+  Audio configuration and many packet decoders accept AudioSpecificConfig
+  separately.
+- An explicit AacAdts format may be added for decoders that need it; its
+  adapter generates a header for every access unit.
+
+MP3, AC-3, and E-AC-3
+
+- Packets are normally self-framing and can pass through unchanged.
+- Supply normalized sample rate and channel information.
+- Retain any configuration bytes needed by unusual sample entries.
+
+FLAC
+
+- Convert dfLa into decoder-ready FLAC initialization metadata.
+- Emit FLAC frames without their MP4 wrapping.
+- Specify precisely whether initialization includes the fLaC marker and
+  metadata block headers after checking the APIs of representative decoders.
+
+Opus
+
+- Emit raw Opus packets.
+- Normalize dOps into semantic decoder parameters, including pre-skip and any
+  channel mapping fields needed for full support.
+- Expose a decoder-ready OpusHead only if it is useful as an initialization
+  representation. Do not wrap packets in Ogg on the primary packet API.
+
+AV1
+
+- Parse av1C and expose the configuration OBUs and semantic parameters needed
+  by packet decoders.
+- Emit decoder-ready OBU access units, rewriting only where the MP4 form
+  requires it.
+
+VP9
+
+- Emit compressed VP9 frames.
+- Normalize vpcC parameters that decoder APIs need.
+- Do not add IVF framing to the primary packet API.
+
+PCM
+
+- Pass sample bytes through.
+- Fully describe sample rate, channels, bit depth, integer/float format, and
+  byte order in DecoderParameters. PCM has no codec header.
+
+Unknown codecs fail DecoderInput construction with an error that identifies
+the unsupported sample entry. They must not silently pass through as though
+their packet format were known.
+
+
+Seeking and decoder resets
+--------------------------
+
+DecoderInput must own seeking so it also transforms pre-roll packets:
+
+    let seeked = input.seek_time(time, TimeAccuracy::Packet)?;
+
+    decoder.reset()?;
+    decoder.configure(input.initialization())?;
+
+    for packet in seeked.preroll {
+        decoder.decode(&packet.data)?; // discard its output
+    }
+
+    for packet in input {
+        // Decode normally; discard output before seeked.discard_before.
+    }
+
+The seek result mirrors Seeked but contains DecoderPackets:
+
+    pub struct DecoderSeeked {
+        pub requested: Duration,
+        pub landed: i64,
+        pub discard_before: i64,
+        pub preroll: Vec<DecoderPacket>,
+    }
+
+Initialization remains available after every seek because a consumer normally
+resets or recreates its decompressor. Adapter state must also reset when a seek
+requires it.
+
+PacketStream currently rejects samples that switch codec sample descriptions.
+That is sufficient initially. If codec changes are supported later,
+DecoderInput will need an explicit reconfiguration event rather than silently
+changing initialization between packets.
+
+
+Async API
+---------
+
+Provide the same abstraction for nonblocking::PacketStream. Share all codec
+parsing and packet transformation code; only iteration differs. The blocking
+DecoderInput implements Iterator and the async form implements Stream.
+
+Keep names and behavior parallel wherever Rust's sync/async traits allow it.
+
+Error behavior
+--------------
+
+Construction should fail early when:
+
+- the codec is unknown or has no decoder-input adapter;
+- its initialization data is malformed or incomplete;
+- the requested DecoderFormat is incompatible with the codec; or
+- the chosen format cannot represent this codec configuration faithfully.
+
+Packet conversion should fail with a malformed-media error when an access
+unit does not follow the configuration established at construction, such as
+an H.264 NAL length exceeding the remaining packet bytes.
+
+Errors should name the codec, requested format, and violated condition. A
+consumer should not have to discover an adapter failure as a vague error from
+the decompression library.
+
+
+Implementation sequence
+-----------------------
+
+1. Define DecoderFormat, DecoderParameters, DecoderInitialization,
+   DecoderPacket, DecoderSeeked, and the blocking DecoderInput shell.
+
+2. Factor copying Packet timing into DecoderPacket through one internal
+   helper so adapters cannot accidentally lose trims, timestamps, or the
+   keyframe flag.
+
+3. Implement H264AnnexBAdapter. This exercises configuration parsing,
+   initialization generation, and per-packet rewriting and should determine
+   whether the proposed common types are adequate.
+
+4. Route PacketStream::seek_time through DecoderInput and verify that pre-roll
+   packets receive the same transformation as normal packets.
+
+5. Implement HevcAnnexBAdapter using the established H.264 structure.
+
+6. Implement AAC raw access units plus AudioSpecificConfig. Add ADTS only as
+   an explicit additional format if there is a concrete decoder consumer.
+
+7. Implement pass-through adapters for MP3, AC-3, E-AC-3, VP9, and PCM while
+   normalizing their semantic parameters.
+
+8. Implement FLAC, Opus, and AV1 after checking representative decoder APIs
+   to ensure their initialization contract is useful and lossless.
+
+9. Add the async DecoderInput with shared adapters and identical results.
+
+10. Consider elementary Read/AsyncRead output only after packet-oriented
+    decoder integrations have validated the core abstraction.
+
+
+Testing
+-------
+
+- Unit-test configuration parsing and exact byte rewriting for each adapter.
+- Test truncated and inconsistent codec configuration and packet data.
+- Test packets containing multiple H.264/HEVC NAL units and every supported
+  NAL length width.
+- Test that DecoderPacket preserves every timing, trim, and keyframe field.
+- Test that seek pre-roll is transformed identically to normal iteration.
+- Compare blocking and async output byte-for-byte.
+- Feed generated initialization and packets into at least one real decoder
+  per codec and verify successful decompression.
+- Where practical, compare decoded output with decoding the original fMP4
+  through ffmpeg or another reference implementation.
+- Ensure unsupported codecs and incompatible requested formats fail during
+  construction with actionable errors.
+
+
+Non-goals
+---------
+
+- Decoding compressed media into pixels or PCM samples.
+- Choosing, constructing, or owning the consumer's decompression library.
+- Hiding decoder-specific lifecycle requirements such as flush and reset.
+- Turning every codec into a single universal byte-stream format.
+- Adding Codec to every Packet or making the main PacketStream generic over a
+  codec known only after runtime initialization.

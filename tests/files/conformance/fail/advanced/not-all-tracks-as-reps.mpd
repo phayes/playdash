@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" minBufferTime="PT1.500000S" type="static" mediaPresentationDuration="PT0H0M10.00S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+ <ProgramInformation moreInformationURL="http://gpac.sourceforge.net">
+  <Title>Conformant MPD - All tracks in the files are not exposed in the codecs parameter of the Representation</Title>
+ </ProgramInformation>
+
+ <Period>
+  <AdaptationSet>
+   <Representation id="1" mimeType="video/mp4" codecs="avc1.42c01e" width="640" height="360" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="226597">
+    <BaseURL>audio-video.mp4</BaseURL>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>

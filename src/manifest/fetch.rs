@@ -65,7 +65,7 @@ impl DashManifest {
     /// Call [`FragmentStream::start_eager_head`] to discover fragment sizes in
     /// the background, which can make byte seeking faster on servers that
     /// support `HEAD`. Timestamp seeking is available through
-    /// [`FragmentStream::seek_time_coarse`].
+    /// [`FragmentStream::seek_time`].
     ///
     /// # Examples
     ///

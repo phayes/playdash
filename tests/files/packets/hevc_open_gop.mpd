@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+	profiles="urn:mpeg:dash:profile:isoff-on-demand:2011"
+	type="static"
+	mediaPresentationDuration="PT2.0S"
+	minBufferTime="PT2.0S">
+	<Period id="0" start="PT0.0S">
+		<AdaptationSet id="0" contentType="video" frameRate="25/1" maxWidth="96" maxHeight="64">
+			<Representation id="0" mimeType="video/mp4" codecs="hvc1.1.6.L30.90" bandwidth="50000" width="96" height="64">
+				<BaseURL>hevc_open_gop.mp4</BaseURL>
+				<SegmentList timescale="1000000" duration="1000000" startNumber="1">
+					<Initialization range="0-3160" />
+					<SegmentURL mediaRange="3161-5617" />
+					<SegmentURL mediaRange="5618-8296" />
+				</SegmentList>
+			</Representation>
+		</AdaptationSet>
+	</Period>
+</MPD>

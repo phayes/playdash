@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" minBufferTime="PT1.50S" type="static" mediaPresentationDuration="PT5.00S" profiles="urn:mpeg:dash:profile:isoff-main:2011">
+ <ProgramInformation moreInformationURL="http://gpac.sourceforge.net">
+  <Title>Conformant MPD - Representation @width does not match the track width</Title>
+ </ProgramInformation>
+
+ <Period>
+  <AdaptationSet>
+   <Representation id="1" mimeType="video/mp4" codecs="avc1.42c01e" width="10" height="10" startWithSAP="1" bandwidth="226597">
+    <BaseURL>video1.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="837-988"/>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>

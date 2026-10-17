@@ -3,7 +3,7 @@
 //! waits.
 
 use crate::error::Error;
-use crate::fragment::{Fragments, MediaTimeline};
+use crate::fragment::{Fragment, Fragments, MediaTimeline};
 use crate::store::FragmentData;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -68,24 +68,28 @@ pub struct Position {
     pub time: Option<TimePosition>,
 }
 
-/// Media timestamp and the accuracy with which it was resolved.
+/// Media timestamp of a stream position, and how precisely it describes that position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimePosition {
-    /// Actual media timestamp at which reading begins.
+    /// Media timestamp of the position. It may differ from a time a seek asked for;
+    /// compare the two to see by how much.
     pub timestamp: Duration,
 
-    /// Accuracy of `timestamp`: exact, or the start of a containing fragment.
+    /// Precision of `timestamp` for the position.
     pub accuracy: TimeAccuracy,
 }
 
-/// Accuracy of a reported media timestamp.
+/// Granularity of a media time: a seek's target, or how precisely a reported
+/// timestamp describes a stream position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimeAccuracy {
-    /// The byte position is known to land exactly at this media timestamp.
-    Exact,
+    /// To the media fragment. A seek lands at the start of a fragment; a reported
+    /// timestamp is the start of the fragment the position is inside.
+    Fragment,
 
-    /// The timestamp is the start of the fragment containing the requested position.
-    Coarse,
+    /// To the packet. A seek lands at the packet containing its target; a reported
+    /// timestamp is that of the packet at the position.
+    Packet,
 }
 
 /// A place in a stream's bytes: the initialization fragment, or a media
@@ -446,6 +450,16 @@ impl Schedule {
     }
 }
 
+/// The rest of a stream's fragment, with where it sits.
+#[derive(Clone, Debug)]
+pub(crate) struct PartBody {
+    pub(crate) part: Part,
+    /// Index in the representation, for a media fragment.
+    pub(crate) index: Option<usize>,
+    pub(crate) fragment: Fragment,
+    pub(crate) body: Bytes,
+}
+
 /// A stream reader's position: a part, an offset into it, and the absolute
 /// byte offset when the sizes before it are known.
 #[derive(Clone, Copy, Debug)]
@@ -532,7 +546,7 @@ pub(crate) fn seek_target(
             let Some(position) = position else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "MPEG stream absolute byte position is unknown; use seek_time_coarse or SeekFrom::Start",
+                    "MPEG stream absolute byte position is unknown; use seek_time or SeekFrom::Start",
                 ));
             };
             (position, delta)
@@ -562,6 +576,16 @@ impl StreamTimeline {
         Self { timeline, first }
     }
 
+    /// The representation's whole timeline.
+    pub(crate) fn timeline(&self) -> &MediaTimeline {
+        &self.timeline
+    }
+
+    /// Index in the representation of the stream's first media fragment.
+    pub(crate) fn first(&self) -> usize {
+        self.first
+    }
+
     /// Media time spanned by each of the stream's media fragments.
     pub(crate) fn spans(&self) -> Vec<Range<Duration>> {
         let mut spans = self.timeline.spans();
@@ -573,6 +597,10 @@ impl StreamTimeline {
     fn media(&self) -> MediaTimeline {
         MediaTimeline {
             timescale: self.timeline.timescale,
+            origin: self
+                .timeline
+                .origin
+                .saturating_add(self.timeline.media_durations.iter().take(self.first).sum()),
             media_durations: self
                 .timeline
                 .media_durations
@@ -607,31 +635,43 @@ pub(crate) fn start_at(
     Ok((fragments, StreamTimeline::new(timeline, first), span.start))
 }
 
-/// The index of the stream's media fragment a coarse seek to `time` lands
-/// in, and whether `time` is exactly its start.
-pub(crate) fn time_target(
-    timeline: Option<&StreamTimeline>,
-    time: Duration,
-) -> io::Result<(usize, bool)> {
+/// The index of the stream's media fragment a seek to `time` lands in.
+pub(crate) fn time_target(timeline: Option<&StreamTimeline>, time: Duration) -> io::Result<usize> {
     let timeline = timeline.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "MPEG stream has no SegmentTimeline",
         )
     })?;
-    let (index, span) = timeline.timeline.span_at(time).ok_or_else(|| {
+    let index = timeline.timeline.fragment_at(time).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "MPEG stream timeline is missing a timescale or media durations",
         )
     })?;
-    let media_index = index.checked_sub(timeline.first).ok_or_else(|| {
+    index.checked_sub(timeline.first).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "MPEG stream starts after the requested media time",
         )
-    })?;
-    Ok((media_index, span.start == time))
+    })
+}
+
+/// The stream's part for media fragment `index` of the representation, given the
+/// stream's `timeline`. A stream without one starts at the first fragment. `None`
+/// for a fragment before the stream's first.
+pub(crate) fn media_part(timeline: Option<&StreamTimeline>, index: usize) -> Option<Part> {
+    let first = timeline.map_or(0, |timeline| timeline.first);
+    index.checked_sub(first).map(Part::Media)
+}
+
+/// The index in the representation of the stream's `part`, given the stream's
+/// `timeline`. `None` for the initialization fragment.
+pub(crate) fn representation_index(timeline: Option<&StreamTimeline>, part: Part) -> Option<usize> {
+    let Part::Media(index) = part else {
+        return None;
+    };
+    Some(timeline.map_or(0, |timeline| timeline.first) + index)
 }
 
 /// The start of the media fragment at `part` on `timeline`, as a position of
@@ -657,22 +697,24 @@ pub(crate) fn time_at_fragment(
     })
 }
 
-/// The end of `timeline`, as an exact position.
+/// The end of `timeline`, as a packet-accurate position.
 pub(crate) fn time_at_end(timeline: Option<&StreamTimeline>) -> Option<TimePosition> {
     timeline?
         .timeline
         .total_duration()
         .map(|timestamp| TimePosition {
             timestamp,
-            accuracy: TimeAccuracy::Exact,
+            accuracy: TimeAccuracy::Packet,
         })
 }
 
-/// The accuracy of a byte position `offset_in_fragment` bytes into a fragment.
+/// The accuracy of a fragment's start time for a byte position
+/// `offset_in_fragment` bytes into that fragment: exact to the packet at its
+/// start, and only to the fragment past it.
 pub(crate) fn accuracy_at(offset_in_fragment: usize) -> TimeAccuracy {
     match offset_in_fragment == 0 {
-        true => TimeAccuracy::Exact,
-        false => TimeAccuracy::Coarse,
+        true => TimeAccuracy::Packet,
+        false => TimeAccuracy::Fragment,
     }
 }
 
@@ -700,22 +742,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn time_target_is_exact_at_reported_fragment_starts() {
+    fn time_target_lands_on_reported_fragment_starts() {
         // A third of a second does not land on a whole nanosecond.
         let timeline = MediaTimeline {
             timescale: 3,
+            origin: 0,
             media_durations: vec![1, 1],
         };
         let second_start = timeline.spans()[1].start;
         let whole = StreamTimeline::new(timeline, 0);
         let target = |time| time_target(Some(&whole), time).unwrap();
-        assert_eq!(target(second_start), (1, true));
-        assert_eq!(target(second_start - Duration::from_nanos(1)), (0, false));
-        assert_eq!(target(Duration::from_secs(5)), (1, false));
+        assert_eq!(target(second_start), 1);
+        assert_eq!(target(second_start - Duration::from_nanos(1)), 0);
+        assert_eq!(target(Duration::from_secs(5)), 1);
 
         let empty = StreamTimeline::new(
             MediaTimeline {
                 timescale: 3,
+                origin: 0,
                 media_durations: Vec::new(),
             },
             0,
@@ -732,6 +776,7 @@ mod tests {
         let timeline = StreamTimeline::new(
             MediaTimeline {
                 timescale: 1,
+                origin: 0,
                 media_durations: vec![1; 4],
             },
             2,
@@ -741,14 +786,14 @@ mod tests {
 
         // Seeks name the representation's time, and land on the stream's own fragments.
         let target = |time| time_target(Some(&timeline), time);
-        assert_eq!(target(secs(2)).unwrap(), (0, true));
-        assert_eq!(target(Duration::from_millis(3_500)).unwrap(), (1, false));
+        assert_eq!(target(secs(2)).unwrap(), 0);
+        assert_eq!(target(Duration::from_millis(3_500)).unwrap(), 1);
         assert_eq!(
             target(Duration::from_millis(1_500)).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
 
-        let at = |part| time_at_fragment(Some(&timeline), part, TimeAccuracy::Exact);
+        let at = |part| time_at_fragment(Some(&timeline), part, TimeAccuracy::Packet);
         assert_eq!(at(Part::Init), None);
         assert_eq!(at(Part::Media(1)).unwrap().timestamp, secs(3));
         assert_eq!(at(Part::Media(2)), None);

@@ -19,6 +19,8 @@ use crate::vendor::dash_mpd_core::{
 use super::{DashManifest, Selected};
 use crate::error::Error;
 use crate::fragment::{Fragment, parse_byte_range};
+use crate::mp4::reader::ParseError;
+use crate::mp4::sidx;
 
 /// A `SegmentBase` index a [`DashManifest`] needs before one of its
 /// representations can stream: the `sidx` byte range of that
@@ -199,7 +201,10 @@ impl<'a> BaseChain<'a> {
                 segments: index
                     .subsegments
                     .iter()
-                    .map(|subsegment| S {
+                    .enumerate()
+                    .map(|(position, subsegment)| S {
+                        // The first subsegment starts at the earliest presentation time.
+                        t: (position == 0).then_some(index.earliest_presentation_time),
                         d: subsegment.duration,
                         ..S::default()
                     })
@@ -235,6 +240,8 @@ struct Subsegment {
 #[derive(Debug, PartialEq, Eq)]
 struct SegmentIndex {
     timescale: u32,
+    /// Media time at the start of the first subsegment, in `timescale` ticks.
+    earliest_presentation_time: u64,
     subsegments: Vec<Subsegment>,
 }
 
@@ -242,44 +249,32 @@ impl SegmentIndex {
     /// Parses the first `sidx` box in `body`, the bytes of `@indexRange`
     /// starting at absolute offset `body_offset`.
     fn parse(body: &[u8], body_offset: u64) -> Result<Self, Error> {
-        let (box_start, box_end) = find_sidx(body)?;
-        let mut fields = Fields {
-            buf: &body[..box_end],
-            pos: box_start,
+        let index = match sidx::find(body) {
+            Ok(Some(index)) => index,
+            Ok(None) => return Err(invalid("index range contains no sidx box".to_owned())),
+            Err(ParseError::Malformed(reason) | ParseError::Unsupported(reason)) => {
+                return Err(invalid(reason));
+            }
         };
-        let version = fields.u8()?;
-        fields.skip(3 + 4)?; // flags, reference_ID
-        let timescale = fields.u32()?;
-        if timescale == 0 {
+        if index.timescale == 0 {
             return Err(Error::DashManifestMissingTimescale);
         }
-        let first_offset = if version == 0 {
-            fields.skip(4)?; // earliest_presentation_time
-            u64::from(fields.u32()?)
-        } else {
-            fields.skip(8)?;
-            fields.u64()?
-        };
-        fields.skip(2)?; // reserved
-        let reference_count = fields.u16()?;
 
         // Offsets count from the first byte after the sidx box.
         let mut start = body_offset
-            .checked_add(box_end as u64)
-            .and_then(|end| end.checked_add(first_offset))
+            .checked_add(index.end as u64)
+            .and_then(|end| end.checked_add(index.first_offset))
             .ok_or_else(|| invalid("sidx offsets overflow".to_owned()))?;
-        let mut subsegments = Vec::with_capacity(usize::from(reference_count));
-        for _ in 0..reference_count {
-            let reference = fields.u32()?;
-            let duration = u64::from(fields.u32()?);
-            fields.skip(4)?; // SAP fields
-            if reference & 0x8000_0000 != 0 {
+        let mut subsegments = Vec::with_capacity(index.references.len());
+        for reference in index.references {
+            if reference.is_index {
                 return Err(invalid(
                     "hierarchical sidx (references to other sidx boxes) is not supported"
                         .to_owned(),
                 ));
             }
-            let size = u64::from(reference & 0x7fff_ffff);
+            let size = u64::from(reference.size);
+            let duration = u64::from(reference.duration);
             if size == 0 {
                 return Err(invalid("sidx references an empty subsegment".to_owned()));
             }
@@ -296,75 +291,10 @@ impl SegmentIndex {
             return Err(invalid("sidx has no references".to_owned()));
         }
         Ok(Self {
-            timescale,
+            timescale: index.timescale,
+            earliest_presentation_time: index.earliest_presentation_time,
             subsegments,
         })
-    }
-}
-
-/// Payload start and end of the first top-level `sidx` box in `body`.
-fn find_sidx(body: &[u8]) -> Result<(usize, usize), Error> {
-    let mut pos = 0;
-    while pos + 8 <= body.len() {
-        let mut fields = Fields { buf: body, pos };
-        let size = fields.u32()?;
-        let kind = fields.array::<4>()?;
-        let size = match size {
-            0 => (body.len() - pos) as u64,
-            1 => fields.u64()?,
-            size => u64::from(size),
-        };
-        let end = usize::try_from(size)
-            .ok()
-            .and_then(|size| pos.checked_add(size))
-            .filter(|&end| end <= body.len() && end >= fields.pos)
-            .ok_or_else(|| invalid("index range ends inside an MP4 box".to_owned()))?;
-        if &kind == b"sidx" {
-            return Ok((fields.pos, end));
-        }
-        pos = end;
-    }
-    Err(invalid("index range contains no sidx box".to_owned()))
-}
-
-/// Big-endian fields read from a box.
-struct Fields<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl Fields<'_> {
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        let bytes = self
-            .buf
-            .get(self.pos..self.pos + N)
-            .ok_or_else(|| invalid("truncated sidx box".to_owned()))?;
-        self.pos += N;
-        Ok(bytes.try_into().expect("length checked"))
-    }
-
-    fn skip(&mut self, len: usize) -> Result<(), Error> {
-        if self.pos + len > self.buf.len() {
-            return Err(invalid("truncated sidx box".to_owned()));
-        }
-        self.pos += len;
-        Ok(())
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.array::<1>()?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, Error> {
-        self.array().map(u16::from_be_bytes)
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        self.array().map(u32::from_be_bytes)
-    }
-
-    fn u64(&mut self) -> Result<u64, Error> {
-        self.array().map(u64::from_be_bytes)
     }
 }
 
@@ -376,36 +306,7 @@ fn invalid(reason: String) -> Error {
 pub(crate) mod tests {
     use super::*;
     use crate::manifest::tests::ranged;
-
-    /// A `sidx` box with `first_offset` and one `(size, duration)` reference each.
-    pub(crate) fn sidx(
-        version: u8,
-        timescale: u32,
-        first_offset: u32,
-        refs: &[(u32, u32)],
-    ) -> Vec<u8> {
-        let mut payload = vec![version, 0, 0, 0];
-        payload.extend(1u32.to_be_bytes()); // reference_ID
-        payload.extend(timescale.to_be_bytes());
-        if version == 0 {
-            payload.extend(0u32.to_be_bytes());
-            payload.extend(first_offset.to_be_bytes());
-        } else {
-            payload.extend(0u64.to_be_bytes());
-            payload.extend(u64::from(first_offset).to_be_bytes());
-        }
-        payload.extend([0, 0]);
-        payload.extend((refs.len() as u16).to_be_bytes());
-        for &(size, duration) in refs {
-            payload.extend(size.to_be_bytes());
-            payload.extend(duration.to_be_bytes());
-            payload.extend(0x9000_0000u32.to_be_bytes()); // starts_with_SAP, SAP type 1
-        }
-        let mut sidx = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
-        sidx.extend(b"sidx");
-        sidx.extend(payload);
-        sidx
-    }
+    use crate::mp4::sidx::tests::{sidx, sidx_at};
 
     #[test]
     fn parses_sidx_into_absolute_ranges() {
@@ -416,6 +317,7 @@ pub(crate) mod tests {
                 SegmentIndex::parse(&body, 838).unwrap(),
                 SegmentIndex {
                     timescale: 44_100,
+                    earliest_presentation_time: 0,
                     subsegments: vec![
                         Subsegment {
                             range: end + 10..=end + 109,
@@ -451,7 +353,7 @@ pub(crate) mod tests {
     fn rejects_bad_sidx() {
         let reject = |body: &[u8]| SegmentIndex::parse(body, 0).unwrap_err().to_string();
         assert!(reject(b"").contains("no sidx box"));
-        assert!(reject(&sidx(0, 1, 0, &[(1, 1)])[..30]).contains("inside an MP4 box"));
+        assert!(reject(&sidx(0, 1, 0, &[(1, 1)])[..30]).contains("sidx box overruns"));
         assert!(reject(&sidx(0, 1, 0, &[])).contains("no references"));
         assert!(reject(&sidx(0, 1, 0, &[(0x8000_0001, 1)])).contains("hierarchical"));
         assert!(matches!(
@@ -483,7 +385,7 @@ pub(crate) mod tests {
 
     /// An 838-byte initialization, a `sidx` for two subsegments, then their media.
     pub(crate) fn segment_base_file() -> (Vec<u8>, String) {
-        let sidx = sidx(0, 44_100, 0, &[(100, 4096), (50, 1024)]);
+        let sidx = sidx_at(0, 44_100, 2048, 0, &[(100, 4096), (50, 1024)]);
         let index_range = format!("838-{}", 838 + sidx.len() - 1);
         let mut body = vec![b'i'; 838];
         body.extend(sidx);
@@ -547,6 +449,7 @@ pub(crate) mod tests {
             manifest.media_timeline("FLAC").unwrap(),
             MediaTimeline {
                 timescale: 44_100,
+                origin: 2048,
                 media_durations: vec![4096, 1024],
             }
         );

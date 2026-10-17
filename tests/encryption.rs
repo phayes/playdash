@@ -17,7 +17,7 @@ const KEY: &str = "00112233445566778899aabbccddeeff";
 const BASE: &str = "https://cdn.test/encryption/";
 
 fn fixture(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_files/encryption");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/files/encryption");
     std::fs::read(path.join(name)).unwrap_or_else(|error| panic!("{name}: {error}"))
 }
 

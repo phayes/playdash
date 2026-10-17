@@ -13,6 +13,9 @@
 
 use crate::error::Error;
 use crate::fragment::Fragment;
+use crate::mp4::init::TrackDefaults;
+use crate::mp4::reader::{ParseError, atoms, find, fourcc};
+use crate::mp4::{self, fragment, protection};
 use aes::Aes128;
 use aes::cipher::{BlockCipherDecrypt, KeyInit, KeyIvInit, StreamCipher};
 use std::collections::HashMap;
@@ -154,155 +157,12 @@ fn unsupported(reason: impl Into<String>) -> Problem {
     Problem::Unsupported(reason.into())
 }
 
-fn fourcc(kind: &[u8; 4]) -> String {
-    String::from_utf8_lossy(kind).into_owned()
-}
-
-/// One ISO-BMFF box: its type and absolute offsets of its start, payload and end.
-#[derive(Clone, Copy, Debug)]
-struct Atom {
-    kind: [u8; 4],
-    start: usize,
-    payload: usize,
-    end: usize,
-}
-
-impl Atom {
-    fn children(self, buf: &[u8]) -> Atoms<'_> {
-        atoms(buf, self.payload, self.end)
-    }
-
-    fn fields(self, buf: &[u8]) -> Fields<'_> {
-        Fields {
-            buf,
-            pos: self.payload,
-            end: self.end,
-            kind: self.kind,
+impl From<ParseError> for Problem {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::Malformed(reason) => Self::Malformed(reason),
+            ParseError::Unsupported(reason) => Self::Unsupported(reason),
         }
-    }
-}
-
-/// Boxes laid end to end in `buf[pos..end]`.
-struct Atoms<'a> {
-    buf: &'a [u8],
-    pos: usize,
-    end: usize,
-}
-
-fn atoms(buf: &[u8], pos: usize, end: usize) -> Atoms<'_> {
-    Atoms { buf, pos, end }
-}
-
-impl Atoms<'_> {
-    fn read(&self) -> Result<Atom, Problem> {
-        let start = self.pos;
-        let mut header = Fields {
-            buf: self.buf,
-            pos: start,
-            end: self.end,
-            kind: *b"head",
-        };
-        let size = header.u32()?;
-        let kind = header.array::<4>()?;
-        let end = match size {
-            0 => Some(self.end),
-            1 => usize::try_from(header.u64()?)
-                .ok()
-                .and_then(|size| start.checked_add(size)),
-            size => start.checked_add(size as usize),
-        };
-        let payload = header.pos;
-        end.filter(|&end| payload <= end && end <= self.end)
-            .map(|end| Atom {
-                kind,
-                start,
-                payload,
-                end,
-            })
-            .ok_or_else(|| malformed(format!("{} box overruns its parent", fourcc(&kind))))
-    }
-}
-
-impl Iterator for Atoms<'_> {
-    type Item = Result<Atom, Problem>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.end {
-            return None;
-        }
-        let atom = self.read();
-        // After an error, stop so the caller's `?` sees it once.
-        self.pos = atom.as_ref().map_or(self.end, |atom| atom.end);
-        Some(atom)
-    }
-}
-
-fn find(atoms: Atoms<'_>, kind: &[u8; 4]) -> Result<Option<Atom>, Problem> {
-    for atom in atoms {
-        let atom = atom?;
-        if &atom.kind == kind {
-            return Ok(Some(atom));
-        }
-    }
-    Ok(None)
-}
-
-fn require(atoms: Atoms<'_>, kind: &[u8; 4]) -> Result<Atom, Problem> {
-    find(atoms, kind)?.ok_or_else(|| malformed(format!("missing {} box", fourcc(kind))))
-}
-
-/// Big-endian fields read from one box's payload.
-struct Fields<'a> {
-    buf: &'a [u8],
-    pos: usize,
-    end: usize,
-    kind: [u8; 4],
-}
-
-impl<'a> Fields<'a> {
-    fn bytes(&mut self, len: usize) -> Result<&'a [u8], Problem> {
-        let end = self
-            .pos
-            .checked_add(len)
-            .filter(|&end| end <= self.end)
-            .ok_or_else(|| malformed(format!("truncated {} box", fourcc(&self.kind))))?;
-        let bytes = &self.buf[self.pos..end];
-        self.pos = end;
-        Ok(bytes)
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Problem> {
-        Ok(self.bytes(N)?.try_into().expect("length checked"))
-    }
-
-    fn skip(&mut self, len: usize) -> Result<(), Problem> {
-        self.bytes(len).map(drop)
-    }
-
-    fn u8(&mut self) -> Result<u8, Problem> {
-        Ok(self.array::<1>()?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, Problem> {
-        self.array().map(u16::from_be_bytes)
-    }
-
-    fn u32(&mut self) -> Result<u32, Problem> {
-        self.array().map(u32::from_be_bytes)
-    }
-
-    fn i32(&mut self) -> Result<i32, Problem> {
-        self.array().map(i32::from_be_bytes)
-    }
-
-    fn u64(&mut self) -> Result<u64, Problem> {
-        self.array().map(u64::from_be_bytes)
-    }
-
-    /// A full box's version and 24-bit flags.
-    fn version_flags(&mut self) -> Result<(u8, u32), Problem> {
-        let value = self.u32()?;
-        Ok(((value >> 24) as u8, value & 0x00ff_ffff))
     }
 }
 
@@ -315,7 +175,7 @@ enum Scheme {
 }
 
 /// Encryption parameters for one protected audio track's samples, read from
-/// its `tenc` and `trex`.
+/// its `tenc`.
 #[derive(Debug)]
 pub(crate) struct TrackProtection {
     track_id: u32,
@@ -326,8 +186,15 @@ pub(crate) struct TrackProtection {
     constant_iv: [u8; 16],
     crypt_blocks: u8,
     skip_blocks: u8,
-    /// `trex` default, for fragments whose `tfhd` and `trun` omit sizes.
-    default_sample_size: u32,
+}
+
+/// How a representation's media fragments are protected, read from its init.
+#[derive(Debug, Default)]
+pub(crate) struct Protection {
+    /// The protected tracks; empty when nothing needs decrypting.
+    pub(crate) tracks: Vec<TrackProtection>,
+    /// Every track's `trex` defaults, which lay out the samples of fragments.
+    defaults: Vec<(u32, TrackDefaults)>,
 }
 
 /// A fragment's role in decryption, set by the stream that requests it.
@@ -337,8 +204,8 @@ pub(crate) enum FragmentRole {
     /// The initialization segment: protected sample entries get their
     /// original types back.
     Init,
-    /// A media fragment of a representation whose init declared `tracks`.
-    Media(Arc<[TrackProtection]>),
+    /// A media fragment of a representation whose init declared `protection`.
+    Media(Arc<Protection>),
 }
 
 /// A sample entry with a `sinf`, located in an init body.
@@ -350,195 +217,101 @@ struct ProtectedEntry {
     protection: Option<TrackProtection>,
 }
 
-/// Protection for each protected audio track in `init`. Reads raw and
-/// cleared init bodies alike, since clearing keeps `sinf`.
-pub(crate) fn track_protection(init: &[u8]) -> Result<Vec<TrackProtection>, Problem> {
-    Ok(protected_entries(init)?
-        .into_iter()
-        .filter_map(|entry| entry.protection)
-        .collect())
+/// How the media of `init` is protected. Reads raw and cleared init bodies
+/// alike, since clearing keeps `sinf`.
+pub(crate) fn protection(init: &[u8]) -> Result<Protection, Problem> {
+    let (entries, defaults) = protected_entries(init)?;
+    Ok(Protection {
+        tracks: entries
+            .into_iter()
+            .filter_map(|entry| entry.protection)
+            .collect(),
+        defaults,
+    })
 }
 
 /// Restores each protected sample entry's original type, such as `fLaC` for
 /// `enca`.
 pub(crate) fn clear_sample_entries(init: &mut [u8]) -> Result<(), Problem> {
-    for entry in protected_entries(init)? {
+    for entry in protected_entries(init)?.0 {
         init[entry.type_offset..entry.type_offset + 4].copy_from_slice(&entry.original_format);
     }
     Ok(())
 }
 
-fn protected_entries(init: &[u8]) -> Result<Vec<ProtectedEntry>, Problem> {
+/// The protected sample entries of `init`'s audio tracks, and every track's `trex`
+/// defaults. An init without a `moov` has neither.
+type Entries = (Vec<ProtectedEntry>, Vec<(u32, TrackDefaults)>);
+
+fn protected_entries(init: &[u8]) -> Result<Entries, Problem> {
+    if find(atoms(init, 0, init.len()), b"moov")?.is_none() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let tracks = mp4::init::parse(init)?.tracks;
+    let defaults = tracks
+        .iter()
+        .map(|track| (track.id, track.defaults))
+        .collect();
     let mut entries = Vec::new();
-    for moov in atoms(init, 0, init.len()) {
-        let moov = moov?;
-        if &moov.kind != b"moov" {
+    for track in tracks {
+        if &track.handler != b"soun" {
             continue;
         }
-        let sample_sizes = trex_sample_sizes(init, moov)?;
-        for trak in moov.children(init) {
-            let trak = trak?;
-            if &trak.kind == b"trak" {
-                track_entries(init, trak, &sample_sizes, &mut entries)?;
-            }
+        let before = entries.len();
+        for entry in &track.entries {
+            let Some(sinf) = entry.sinf(init)? else {
+                continue;
+            };
+            let sinf = protection::sinf(init, sinf)?;
+            entries.push(ProtectedEntry {
+                type_offset: entry.type_offset(),
+                original_format: sinf.original_format,
+                protection: track_protection_from(&sinf, &track)?,
+            });
+        }
+        if entries.len() - before > 1 {
+            return Err(unsupported(format!(
+                "track {} has several protected sample descriptions",
+                track.id
+            )));
         }
     }
-    Ok(entries)
+    Ok((entries, defaults))
 }
 
-/// `trex` default sample sizes by track ID.
-fn trex_sample_sizes(init: &[u8], moov: Atom) -> Result<HashMap<u32, u32>, Problem> {
-    let mut sizes = HashMap::new();
-    let Some(mvex) = find(moov.children(init), b"mvex")? else {
-        return Ok(sizes);
-    };
-    for trex in mvex.children(init) {
-        let trex = trex?;
-        if &trex.kind != b"trex" {
-            continue;
-        }
-        let mut fields = trex.fields(init);
-        fields.version_flags()?;
-        let track_id = fields.u32()?;
-        // default_sample_description_index, default_sample_duration
-        fields.skip(8)?;
-        sizes.insert(track_id, fields.u32()?);
-    }
-    Ok(sizes)
-}
-
-fn track_entries(
-    init: &[u8],
-    trak: Atom,
-    sample_sizes: &HashMap<u32, u32>,
-    entries: &mut Vec<ProtectedEntry>,
-) -> Result<(), Problem> {
-    let mut tkhd = require(trak.children(init), b"tkhd")?.fields(init);
-    let (version, _) = tkhd.version_flags()?;
-    // creation and modification times
-    tkhd.skip(if version == 1 { 16 } else { 8 })?;
-    let track_id = tkhd.u32()?;
-
-    let mdia = require(trak.children(init), b"mdia")?;
-    let mut hdlr = require(mdia.children(init), b"hdlr")?.fields(init);
-    hdlr.version_flags()?;
-    hdlr.skip(4)?;
-    if &hdlr.array::<4>()? != b"soun" {
-        return Ok(());
-    }
-    let minf = require(mdia.children(init), b"minf")?;
-    let stbl = require(minf.children(init), b"stbl")?;
-    let stsd = require(stbl.children(init), b"stsd")?;
-    let mut fields = stsd.fields(init);
-    fields.version_flags()?;
-    fields.u32()?;
-
-    let before = entries.len();
-    for entry in atoms(init, fields.pos, stsd.end) {
-        let entry = entry?;
-        // AudioSampleEntry: an 8-byte SampleEntry header and 20 bytes of
-        // audio fields, which QuickTime sound description versions 1 and 2
-        // extend before the child boxes.
-        let mut fields = entry.fields(init);
-        fields.skip(8)?;
-        let extension = match fields.u16()? {
-            0 => 0,
-            1 => 16,
-            2 => 36,
-            version => return Err(unsupported(format!("audio sample entry version {version}"))),
-        };
-        let children = entry.payload + 28 + extension;
-        if children > entry.end {
-            return Err(malformed(format!("truncated {} box", fourcc(&entry.kind))));
-        }
-        let Some(sinf) = find(atoms(init, children, entry.end), b"sinf")? else {
-            continue;
-        };
-        let default_sample_size = sample_sizes.get(&track_id).copied().unwrap_or(0);
-        let mut protected = parse_sinf(init, sinf, track_id, default_sample_size)?;
-        protected.type_offset = entry.start + 4;
-        entries.push(protected);
-    }
-    if entries.len() - before > 1 {
-        return Err(unsupported(format!(
-            "track {track_id} has several protected sample descriptions"
-        )));
-    }
-    Ok(())
-}
-
-fn parse_sinf(
-    init: &[u8],
-    sinf: Atom,
-    track_id: u32,
-    default_sample_size: u32,
-) -> Result<ProtectedEntry, Problem> {
-    let original_format = require(sinf.children(init), b"frma")?
-        .fields(init)
-        .array::<4>()?;
-
-    let mut schm = require(sinf.children(init), b"schm")?.fields(init);
-    schm.version_flags()?;
-    let scheme = match &schm.array::<4>()? {
+/// How `track`'s samples are protected under `sinf`, or `None` when its `tenc` marks
+/// them clear by default.
+fn track_protection_from(
+    sinf: &protection::Sinf,
+    track: &mp4::init::Track,
+) -> Result<Option<TrackProtection>, Problem> {
+    let scheme = match &sinf.scheme {
         b"cenc" => Scheme::Cenc,
         b"cbcs" => Scheme::Cbcs,
         other => return Err(unsupported(format!("{} scheme", fourcc(other)))),
     };
-
-    let schi = require(sinf.children(init), b"schi")?;
-    let mut tenc = require(schi.children(init), b"tenc")?.fields(init);
-    let (version, _) = tenc.version_flags()?;
-    tenc.skip(1)?;
-    // Version 0 has a reserved byte where version 1 has the pattern.
-    let pattern = tenc.u8()?;
-    let (crypt_blocks, skip_blocks) = match version {
-        0 => (0, 0),
-        _ => (pattern >> 4, pattern & 0x0f),
-    };
-    let is_protected = tenc.u8()? != 0;
-    let per_sample_iv_size = tenc.u8()?;
-    let kid = tenc.array::<16>()?;
-
-    let mut entry = ProtectedEntry {
-        type_offset: 0,
-        original_format,
-        protection: None,
-    };
-    if !is_protected {
-        return Ok(entry);
-    }
-    let mut constant_iv = [0; 16];
-    match per_sample_iv_size {
-        0 => {
-            let size = usize::from(tenc.u8()?);
-            if !matches!(size, 8 | 16) {
-                return Err(malformed(format!("{size}-byte constant IV")));
-            }
-            constant_iv[..size].copy_from_slice(tenc.bytes(size)?);
-        }
-        8 | 16 => {}
-        size => return Err(malformed(format!("{size}-byte per-sample IV"))),
+    let tenc = &sinf.tenc;
+    if !tenc.is_protected {
+        return Ok(None);
     }
     match scheme {
-        Scheme::Cenc if crypt_blocks != 0 || skip_blocks != 0 => {
+        Scheme::Cenc if tenc.crypt_blocks != 0 || tenc.skip_blocks != 0 => {
             return Err(unsupported("pattern encryption under the cenc scheme"));
         }
-        Scheme::Cbcs if crypt_blocks == 0 && skip_blocks != 0 => {
+        Scheme::Cbcs if tenc.crypt_blocks == 0 && tenc.skip_blocks != 0 => {
             return Err(malformed("cbcs pattern skips blocks but encrypts none"));
         }
         _ => {}
     }
-    entry.protection = Some(TrackProtection {
-        track_id,
+    Ok(Some(TrackProtection {
+        track_id: track.id,
         scheme,
-        kid,
-        per_sample_iv_size,
-        constant_iv,
-        crypt_blocks,
-        skip_blocks,
-        default_sample_size,
-    });
-    Ok(entry)
+        kid: tenc.kid,
+        per_sample_iv_size: tenc.per_sample_iv_size,
+        constant_iv: tenc.constant_iv.unwrap_or_default(),
+        crypt_blocks: tenc.crypt_blocks,
+        skip_blocks: tenc.skip_blocks,
+    }))
 }
 
 /// One protected sample's bytes in a media body and how to decrypt them.
@@ -551,13 +324,17 @@ struct Sample {
     subsamples: Vec<(usize, usize)>,
 }
 
-/// Decrypts every sample of `tracks` in each `moof`/`mdat` of `body`, in place.
+/// Decrypts every protected sample in each `moof`/`mdat` of `body`, in place.
+/// `body_start` is the offset of `body` in its resource, such as the start of a
+/// fragment's byte range.
 pub(crate) fn decrypt_fragment(
     body: &mut [u8],
-    tracks: &[TrackProtection],
+    body_start: u64,
+    protection: &Protection,
     keys: &ContentKeys,
 ) -> Result<(), Problem> {
-    let samples = protected_samples(body, tracks)?;
+    let samples = protected_samples(body, body_start, protection)?;
+    let tracks = &protection.tracks;
     let keys = tracks
         .iter()
         .map(|track| keys.key(&track.kid))
@@ -638,209 +415,77 @@ fn decrypt_cbcs(aes: &Aes128, iv: &[u8; 16], crypt: u8, skip: u8, data: &mut [u8
     }
 }
 
-fn protected_samples(body: &[u8], tracks: &[TrackProtection]) -> Result<Vec<Sample>, Problem> {
-    let mut samples = Vec::new();
-    for moof in atoms(body, 0, body.len()) {
-        let moof = moof?;
-        if &moof.kind != b"moof" {
-            continue;
-        }
-        // A traf without an explicit base starts at the moof if first, else
-        // where the previous traf's data ended.
-        let mut implicit_base = Some(moof.start);
-        for traf in moof.children(body) {
-            let traf = traf?;
-            if &traf.kind == b"traf" {
-                implicit_base =
-                    traf_samples(body, moof, traf, implicit_base, tracks, &mut samples)?;
-            }
-        }
-    }
-    Ok(samples)
-}
-
-/// Appends the protected samples of one `traf`. Returns where its data ends,
-/// or `None` for a track this fragment does not decrypt.
-fn traf_samples(
+/// The protected samples of every `moof` in `body`, which starts `body_start` bytes
+/// into its resource.
+fn protected_samples(
     body: &[u8],
-    moof: Atom,
-    traf: Atom,
-    implicit_base: Option<usize>,
-    tracks: &[TrackProtection],
-    samples: &mut Vec<Sample>,
-) -> Result<Option<usize>, Problem> {
-    let mut tfhd = require(traf.children(body), b"tfhd")?.fields(body);
-    let (_, flags) = tfhd.version_flags()?;
-    let track_id = tfhd.u32()?;
-    let Some(track_index) = tracks.iter().position(|track| track.track_id == track_id) else {
-        return Ok(None);
-    };
-    let track = &tracks[track_index];
-    let explicit_base = if flags & 0x01 != 0 {
-        // Relative to the body, which is the file for whole-segment fetches.
-        Some(usize::try_from(tfhd.u64()?).map_err(|_| malformed("base data offset overflows"))?)
-    } else {
-        None
-    };
-    if flags & 0x02 != 0 {
-        // sample_description_index
-        tfhd.skip(4)?;
-    }
-    if flags & 0x08 != 0 {
-        // default_sample_duration
-        tfhd.skip(4)?;
-    }
-    let default_size = if flags & 0x10 != 0 {
-        tfhd.u32()?
-    } else {
-        track.default_sample_size
-    };
-    let base = match explicit_base {
-        Some(base) => base,
-        None if flags & 0x02_0000 != 0 => moof.start,
-        None => implicit_base
-            .ok_or_else(|| unsupported("implicit data offset after an undecrypted track"))?,
-    };
-
-    let mut ranges = Vec::new();
-    let mut data_end = base;
-    for child in traf.children(body) {
-        let child = child?;
-        match &child.kind {
-            b"trun" => {
-                data_end = trun_ranges(body, child, base, data_end, default_size, &mut ranges)?
-            }
-            b"sgpd" => {
+    body_start: u64,
+    protection: &Protection,
+) -> Result<Vec<Sample>, Problem> {
+    let mut samples = Vec::new();
+    for traf in fragment::parse(body, body_start, &protection.defaults)? {
+        let tracks = &protection.tracks;
+        let Some(track_index) = tracks
+            .iter()
+            .position(|track| track.track_id == traf.track_id)
+        else {
+            continue;
+        };
+        let track = &tracks[track_index];
+        for child in traf.atom.children(body) {
+            let child = child?;
+            if &child.kind == b"sgpd" {
                 let mut sgpd = child.fields(body);
                 sgpd.version_flags()?;
                 if &sgpd.array::<4>()? == b"seig" {
                     return Err(unsupported("key rotation (seig sample groups)"));
                 }
             }
-            _ => {}
         }
-    }
 
-    let Some(senc) = find(traf.children(body), b"senc")? else {
-        if ranges.is_empty() {
-            return Ok(Some(data_end));
-        }
-        return Err(unsupported(
-            "sample encryption information outside a senc box",
-        ));
-    };
-    let mut senc = senc.fields(body);
-    let (_, senc_flags) = senc.version_flags()?;
-    let count = senc.u32()? as usize;
-    if count != ranges.len() {
-        return Err(malformed(format!(
-            "senc describes {count} samples, trun {}",
-            ranges.len()
-        )));
-    }
-    let iv_size = usize::from(track.per_sample_iv_size);
-    for range in ranges {
-        let mut iv = track.constant_iv;
-        if iv_size != 0 {
-            iv = [0; 16];
-            iv[..iv_size].copy_from_slice(senc.bytes(iv_size)?);
-        }
-        let mut subsamples = Vec::new();
-        if senc_flags & 0x02 != 0 {
-            for _ in 0..senc.u16()? {
-                subsamples.push((usize::from(senc.u16()?), senc.u32()? as usize));
+        let Some(senc) = find(traf.atom.children(body), b"senc")? else {
+            if traf.samples.is_empty() {
+                continue;
             }
-        }
-        samples.push(Sample {
-            range,
-            track: track_index,
-            iv,
-            subsamples,
-        });
-    }
-    Ok(Some(data_end))
-}
-
-/// Appends the byte ranges of one `trun`'s samples. Returns where they end.
-fn trun_ranges(
-    body: &[u8],
-    trun: Atom,
-    base: usize,
-    previous_end: usize,
-    default_size: u32,
-    ranges: &mut Vec<Range<usize>>,
-) -> Result<usize, Problem> {
-    let mut fields = trun.fields(body);
-    let (_, flags) = fields.version_flags()?;
-    let count = fields.u32()? as usize;
-    // Samples may be empty, but not more numerous than the body's bytes.
-    if count > body.len() {
-        return Err(malformed(format!("trun claims {count} samples")));
-    }
-    let mut pos = if flags & 0x01 != 0 {
-        let offset = isize::try_from(fields.i32()?).expect("i32 fits isize");
-        base.checked_add_signed(offset)
-            .ok_or_else(|| malformed("trun data offset precedes the body"))?
-    } else {
-        previous_end
-    };
-    if flags & 0x04 != 0 {
-        // first_sample_flags
-        fields.skip(4)?;
-    }
-    for _ in 0..count {
-        if flags & 0x100 != 0 {
-            // sample_duration
-            fields.skip(4)?;
-        }
-        let size = if flags & 0x200 != 0 {
-            fields.u32()?
-        } else {
-            default_size
+            return Err(unsupported(
+                "sample encryption information outside a senc box",
+            ));
         };
-        if flags & 0x400 != 0 {
-            // sample_flags
-            fields.skip(4)?;
+        let entries = protection::senc(body, senc, track.per_sample_iv_size)?;
+        if entries.len() != traf.samples.len() {
+            return Err(malformed(format!(
+                "senc describes {} samples, trun {}",
+                entries.len(),
+                traf.samples.len()
+            )));
         }
-        if flags & 0x800 != 0 {
-            // sample_composition_time_offset
-            fields.skip(4)?;
+        for (sample, entry) in traf.samples.into_iter().zip(entries) {
+            samples.push(Sample {
+                range: sample.range,
+                track: track_index,
+                iv: entry.iv.unwrap_or(track.constant_iv),
+                subsamples: entry
+                    .subsamples
+                    .into_iter()
+                    .map(|(clear, protected)| (usize::from(clear), protected as usize))
+                    .collect(),
+            });
         }
-        let end = pos
-            .checked_add(size as usize)
-            .filter(|&end| end <= body.len())
-            .ok_or_else(|| malformed("sample data extends past the fragment"))?;
-        ranges.push(pos..end);
-        pos = end;
     }
-    Ok(pos)
+    Ok(samples)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mp4::init::TrackDefaults;
+    use crate::mp4::init::tests::{SOUND, TrackSpec, audio_entry, bx, full, init as mp4_init};
+    use crate::mp4::protection::tests::sinf_box;
     use aes::cipher::BlockCipherEncrypt;
 
     const KID: [u8; 16] = *b"0123456789abcdef";
     const KEY: [u8; 16] = *b"fedcba9876543210";
     const TRACK_ID: u32 = 1;
-
-    fn bx(kind: &[u8; 4], parts: &[&[u8]]) -> Vec<u8> {
-        let len = 8 + parts.iter().map(|part| part.len()).sum::<usize>();
-        let mut out = (len as u32).to_be_bytes().to_vec();
-        out.extend(kind);
-        for part in parts {
-            out.extend(*part);
-        }
-        out
-    }
-
-    fn full(kind: &[u8; 4], version: u8, flags: u32, parts: &[&[u8]]) -> Vec<u8> {
-        let header = (u32::from(version) << 24 | flags).to_be_bytes();
-        let mut all: Vec<&[u8]> = vec![&header];
-        all.extend(parts);
-        bx(kind, &all)
-    }
 
     struct Tenc {
         scheme: &'static [u8; 4],
@@ -870,43 +515,31 @@ mod tests {
 
     /// An init segment with one protected `fLaC` audio track.
     fn init(tenc: &Tenc, trex_sample_size: u32) -> Vec<u8> {
-        let (crypt, skip) = tenc.pattern;
-        let mut tenc_body = vec![0, crypt << 4 | skip, 1, tenc.iv_size];
-        tenc_body.extend(KID);
-        if let Some(iv) = tenc.constant_iv {
-            tenc_body.push(16);
-            tenc_body.extend(iv);
-        }
-        let sinf = bx(
-            b"sinf",
-            &[
-                &bx(b"frma", &[b"fLaC"]),
-                &full(b"schm", 0, 0, &[tenc.scheme, &0x1_0000u32.to_be_bytes()]),
-                &bx(b"schi", &[&full(b"tenc", tenc.version, 0, &[&tenc_body])]),
-            ],
+        let sinf = sinf_box(
+            b"fLaC",
+            tenc.scheme,
+            (tenc.version == 1).then_some(tenc.pattern),
+            tenc.iv_size,
+            tenc.constant_iv.as_ref().map(|iv| &iv[..]),
+            KID,
         );
-        let mut audio_fields = [0u8; 28];
-        audio_fields[7] = 1; // data_reference_index
-        let enca = bx(b"enca", &[&audio_fields, &bx(b"dfLa", &[&[0; 4]]), &sinf]);
-        let stsd = full(b"stsd", 0, 0, &[&1u32.to_be_bytes(), &enca]);
-        let minf = bx(b"minf", &[&bx(b"stbl", &[&stsd])]);
-        let hdlr = full(b"hdlr", 0, 0, &[&[0; 4], b"soun", &[0; 13]]);
-        let tkhd = full(b"tkhd", 0, 3, &[&[0; 8], &TRACK_ID.to_be_bytes(), &[0; 68]]);
-        let trak = bx(b"trak", &[&tkhd, &bx(b"mdia", &[&hdlr, &minf])]);
-        let trex = full(
-            b"trex",
-            0,
-            0,
-            &[
-                &TRACK_ID.to_be_bytes(),
-                &1u32.to_be_bytes(),
-                &0u32.to_be_bytes(),
-                &trex_sample_size.to_be_bytes(),
-                &0u32.to_be_bytes(),
-            ],
-        );
-        let moov = bx(b"moov", &[&trak, &bx(b"mvex", &[&trex])]);
-        [bx(b"ftyp", &[b"iso6", &[0; 4]]), moov].concat()
+        let entries = [audio_entry(
+            b"enca",
+            1,
+            22_050,
+            &[&bx(b"dfLa", &[&[0; 4]]), &sinf],
+        )];
+        mp4_init(&[TrackSpec {
+            id: TRACK_ID,
+            entries: &entries,
+            trex: TrackDefaults {
+                sample_description_index: 1,
+                sample_duration: 0,
+                sample_size: trex_sample_size,
+                sample_flags: 0,
+            },
+            ..SOUND
+        }])
     }
 
     struct EncryptedSample {
@@ -920,11 +553,15 @@ mod tests {
         sizes_in_trun: bool,
         /// Split samples across two `trun`s, the second without a data offset.
         two_truns: bool,
+        /// Where the fragment sits in its file, when `tfhd` names an explicit
+        /// base data offset instead of using default-base-is-moof.
+        file_offset: Option<u64>,
     }
 
     const SIZED: Layout = Layout {
         sizes_in_trun: true,
         two_truns: false,
+        file_offset: None,
     };
 
     /// A `moof` + `mdat` media fragment holding `samples`.
@@ -966,7 +603,16 @@ mod tests {
                     }
                 }
             }
-            let tfhd = full(b"tfhd", 0, 0x02_0000, &[&TRACK_ID.to_be_bytes()]);
+            let tfhd = match layout.file_offset {
+                // The base is the moof's own start in the file.
+                Some(offset) => full(
+                    b"tfhd",
+                    0,
+                    0x01,
+                    &[&TRACK_ID.to_be_bytes(), &offset.to_be_bytes()],
+                ),
+                None => full(b"tfhd", 0, 0x02_0000, &[&TRACK_ID.to_be_bytes()]),
+            };
             let senc = full(b"senc", 0, if subsampled { 0x02 } else { 0 }, &[&senc]);
             let traf = bx(b"traf", &[&tfhd, &truns, &senc]);
             bx(
@@ -1087,7 +733,7 @@ mod tests {
     /// Clears `init`, then decrypts `media` with the protection it declares.
     fn decrypt(init: &mut [u8], media: &mut [u8]) -> Result<(), Problem> {
         clear_sample_entries(init)?;
-        decrypt_fragment(media, &track_protection(init)?, &keys())
+        decrypt_fragment(media, 0, &protection(init)?, &keys())
     }
 
     fn mdat(media: &[u8]) -> &[u8] {
@@ -1145,7 +791,7 @@ mod tests {
         assert_eq!(cleared.len(), raw.len());
         let at = raw.windows(4).position(|window| window == b"enca").unwrap();
         assert_eq!(&cleared[at..at + 4], b"fLaC");
-        let tracks = track_protection(&cleared).unwrap();
+        let tracks = protection(&cleared).unwrap().tracks;
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].kid, KID);
         assert_eq!(tracks[0].scheme, Scheme::Cenc);
@@ -1188,10 +834,40 @@ mod tests {
         let layout = Layout {
             sizes_in_trun: false,
             two_truns: true,
+            file_offset: None,
         };
         let mut media = fragment(&samples, &layout);
         decrypt(&mut init, &mut media).unwrap();
         assert_eq!(mdat(&media), plain.concat());
+    }
+
+    #[test]
+    fn explicit_base_data_offsets_count_from_the_file() {
+        // A SegmentBase subsegment: this body is bytes 5000.. of its file, and its
+        // tfhd names the moof's absolute offset.
+        let plain = [plaintext(64, 1), plaintext(20, 2)];
+        let samples: Vec<_> = plain
+            .iter()
+            .map(|sample| cenc_reference(sample, [sample[0]; 8], &[]))
+            .collect();
+        let layout = Layout {
+            file_offset: Some(5000),
+            ..SIZED
+        };
+        let mut init = init(&CENC, 0);
+        clear_sample_entries(&mut init).unwrap();
+        let protection = protection(&init).unwrap();
+
+        let mut media = fragment(&samples, &layout);
+        decrypt_fragment(&mut media, 5000, &protection, &keys()).unwrap();
+        assert_eq!(mdat(&media), plain.concat());
+
+        // Read as if the body started the file, the offset points past it.
+        let mut media = fragment(&samples, &layout);
+        assert!(matches!(
+            decrypt_fragment(&mut media, 0, &protection, &keys()),
+            Err(Problem::Malformed(_))
+        ));
     }
 
     #[test]
@@ -1226,7 +902,8 @@ mod tests {
         let mut media = fragment(&samples, &SIZED);
         let problem = decrypt_fragment(
             &mut media,
-            &track_protection(&init).unwrap(),
+            0,
+            &protection(&init).unwrap(),
             &ContentKeys::new(),
         );
         assert!(matches!(problem, Err(Problem::MissingKey(kid)) if kid == KID));
@@ -1272,7 +949,7 @@ mod tests {
             ..CENC
         };
         assert!(matches!(
-            track_protection(&init(&cens, 0)),
+            protection(&init(&cens, 0)),
             Err(Problem::Unsupported(reason)) if reason.contains("cens")
         ));
         let patterned_cenc = Tenc {
@@ -1281,7 +958,7 @@ mod tests {
             ..CENC
         };
         assert!(matches!(
-            track_protection(&init(&patterned_cenc, 0)),
+            protection(&init(&patterned_cenc, 0)),
             Err(Problem::Unsupported(_))
         ));
     }
@@ -1292,18 +969,18 @@ mod tests {
         for len in 0..full_init.len() {
             let mut prefix = full_init[..len].to_vec();
             let _ = clear_sample_entries(&mut prefix);
-            let _ = track_protection(&prefix);
+            let _ = protection(&prefix);
         }
         let mut cleared = full_init.clone();
         clear_sample_entries(&mut cleared).unwrap();
-        let tracks = track_protection(&cleared).unwrap();
+        let protection = protection(&cleared).unwrap();
         let media = fragment(
             &[cenc_reference(&plaintext(40, 1), [1; 8], &[(3, 30)])],
             &SIZED,
         );
         for len in 0..media.len() {
             let mut prefix = media[..len].to_vec();
-            let _ = decrypt_fragment(&mut prefix, &tracks, &keys());
+            let _ = decrypt_fragment(&mut prefix, 0, &protection, &keys());
         }
     }
 
@@ -1319,7 +996,7 @@ mod tests {
             &SIZED,
         );
         let before = media.clone();
-        decrypt_fragment(&mut media, &[], &keys()).unwrap();
+        decrypt_fragment(&mut media, 0, &Protection::default(), &keys()).unwrap();
         assert_eq!(media, before);
     }
 }

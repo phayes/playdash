@@ -1,0 +1,73 @@
+<?xml version="1.0"?>
+<!-- MPD file Generated with GPAC version 0.5.1-DEV-rev5316  on 2014-07-18T08:35:19Z-->
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" minBufferTime="PT1.500000S" type="static" mediaPresentationDuration="PT0H0M10.00S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+ <ProgramInformation moreInformationURL="http://gpac.sourceforge.net">
+  <Title>MPEG-DASH Conformance File using SRD features (ISO/IEC 23009-1:2013/Amd.2:2014) to describe spatial relationships between media assets. This file correponds to Scenario 2 described in MPEG DASH Guidelines (ISO/IEC 23009-3): a 3x3 tiling of a large panorama, the full panorama is not available.</Title>
+ </ProgramInformation>
+
+ <Period duration="PT0H0M10.00S">
+  <AdaptationSet segmentAlignment="true" maxWidth="320" maxHeight="180" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,0,0,1,1,3,3"/>
+   <Representation id="1" mimeType="video/mp4" codecs="avc1.42c00d" width="320" height="180" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="119744">
+    <BaseURL>counter-tile-1-320x180-I25-96kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+  <AdaptationSet segmentAlignment="true" maxWidth="320" maxHeight="180" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,1,0,1,1,3,3"/>
+   <Representation id="2" mimeType="video/mp4" codecs="avc1.42c00d" width="320" height="180" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="119601">
+    <BaseURL>counter-tile-2-320x180-I25-96kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+  <AdaptationSet segmentAlignment="true" maxWidth="320" maxHeight="180" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,2,0,1,1,3,3"/>
+   <Representation id="3" mimeType="video/mp4" codecs="avc1.42c00d" width="320" height="180" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="119638">
+    <BaseURL>counter-tile-3-320x180-I25-96kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+  <AdaptationSet segmentAlignment="true" maxWidth="320" maxHeight="180" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,0,1,1,1,3,3"/>
+   <Representation id="4" mimeType="video/mp4" codecs="avc1.42c00d" width="320" height="180" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="119586">
+    <BaseURL>counter-tile-4-320x180-I25-96kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+  <AdaptationSet segmentAlignment="true" maxWidth="320" maxHeight="180" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,1,1,1,1,3,3"/>
+   <Representation id="5" mimeType="video/mp4" codecs="avc1.42c00d" width="320" height="180" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="119759">
+    <BaseURL>counter-tile-5-320x180-I25-96kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+  <AdaptationSet segmentAlignment="true" maxWidth="320" maxHeight="180" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,2,1,1,1,3,3"/>
+   <Representation id="6" mimeType="video/mp4" codecs="avc1.42c00d" width="320" height="180" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="119621">
+    <BaseURL>counter-tile-6-320x180-I25-96kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+  <AdaptationSet segmentAlignment="true" maxWidth="320" maxHeight="180" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,0,2,1,1,3,3"/>
+   <Representation id="7" mimeType="video/mp4" codecs="avc1.42c00d" width="320" height="180" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="119616">
+    <BaseURL>counter-tile-7-320x180-I25-96kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+  <AdaptationSet segmentAlignment="true" maxWidth="320" maxHeight="180" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,1,2,1,1,3,3"/>
+   <Representation id="8" mimeType="video/mp4" codecs="avc1.42c00d" width="320" height="180" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="119744">
+    <BaseURL>counter-tile-8-320x180-I25-96kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+  <AdaptationSet segmentAlignment="true" maxWidth="320" maxHeight="180" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,2,2,1,1,3,3"/>
+   <Representation id="9" mimeType="video/mp4" codecs="avc1.42c00d" width="320" height="180" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="119591">
+    <BaseURL>counter-tile-9-320x180-I25-96kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>

@@ -267,14 +267,18 @@ impl Store {
             return Ok(());
         };
         let body = init.body().expect("init fetched before media roles");
-        let tracks = cenc::track_protection(&body).map_err(|problem| problem.at(&init.fragment))?;
-        if let Some(track) = tracks.iter().find(|track| !keys.contains(&track.kid)) {
+        let protection = cenc::protection(&body).map_err(|problem| problem.at(&init.fragment))?;
+        if let Some(track) = protection
+            .tracks
+            .iter()
+            .find(|track| !keys.contains(&track.kid))
+        {
             return Err(Error::MissingContentKey(cenc::hex(&track.kid)));
         }
-        let tracks: Arc<[_]> = tracks.into();
+        let protection = Arc::new(protection);
         for data in media {
             // Already set if another stream of this store got here first.
-            let _ = data.role.set(FragmentRole::Media(tracks.clone()));
+            let _ = data.role.set(FragmentRole::Media(protection.clone()));
         }
         Ok(())
     }
@@ -287,7 +291,9 @@ impl Store {
             return Ok(body);
         };
         let role = match data.role.get() {
-            Some(FragmentRole::Media(tracks)) if tracks.is_empty() => return Ok(body),
+            Some(FragmentRole::Media(protection)) if protection.tracks.is_empty() => {
+                return Ok(body);
+            }
             Some(role) => role,
             None => {
                 debug_assert!(
@@ -302,7 +308,14 @@ impl Store {
         let mut bytes = BytesMut::from(body);
         match role {
             FragmentRole::Init => cenc::clear_sample_entries(&mut bytes),
-            FragmentRole::Media(tracks) => cenc::decrypt_fragment(&mut bytes, tracks, keys),
+            FragmentRole::Media(protection) => {
+                let body_start = data
+                    .fragment
+                    .range
+                    .as_ref()
+                    .map_or(0, |range| *range.start());
+                cenc::decrypt_fragment(&mut bytes, body_start, protection, keys)
+            }
         }
         .map_err(|problem| problem.at(&data.fragment))?;
         Ok(bytes.freeze())

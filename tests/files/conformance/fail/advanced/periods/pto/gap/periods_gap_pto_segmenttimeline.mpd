@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" minBufferTime="PT1.500000S" type="static" mediaPresentationDuration="PT0H0M25.00S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+ <ProgramInformation moreInformationURL="http://gpac.sourceforge.net">
+  <Title>Conformant MPD featuring 2 periods, using SegmentTemplate and SegmentTimeline with $number$, with a gap in between indicated by a @presentationTimeOffset smaller than the earliest media presentation time in the second period</Title>
+ </ProgramInformation>
+
+ <Period start="PT0S">
+  <AdaptationSet segmentAlignment="true" maxWidth="640" maxHeight="360" maxFrameRate="25" par="16:9">
+   <SegmentTemplate timescale="1000" media="period1_video_live_$number$.m4s" startNumber="1" initialization="period1_video_live_init.mp4">
+    <SegmentTimeline>
+     <S t="0" d="1000" r="9"/>
+    </SegmentTimeline>
+   </SegmentTemplate>
+   <Representation id="1" mimeType="video/mp4" codecs="avc1.42c01e" width="640" height="360" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="221311">
+   </Representation>
+  </AdaptationSet>
+ </Period>
+ <Period start="PT0H0M10.00S">
+  <AdaptationSet segmentAlignment="true" maxWidth="640" maxHeight="360" maxFrameRate="25" par="16:9">
+   <SegmentTemplate timescale="1000" media="period1_video_live_$number$.m4s" startNumber="1" initialization="period1_video_live_init.mp4">
+    <SegmentTimeline>
+     <S t="0" d="1000" r="9"/>
+    </SegmentTimeline>
+   </SegmentTemplate>
+   <Representation id="1" mimeType="video/mp4" codecs="avc1.42c01e" width="640" height="360" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="222196">
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>

@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" minBufferTime="PT1.500000S" type="static" mediaPresentationDuration="PT0H0M25.00S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+ <ProgramInformation moreInformationURL="http://gpac.sourceforge.net">
+  <Title>Conformant MPD featuring 2 periods, using SegmentBase, with a gap in between indicated by a @presentationTimeOffset smaller than the earliest media presentation time in the second period</Title>
+ </ProgramInformation>
+
+ <Period start="PT0S">
+  <AdaptationSet segmentAlignment="true" maxWidth="640" maxHeight="360" maxFrameRate="25" par="16:9" lang="und" subsegmentStartsWithSAP="1">
+   <Representation id="1" mimeType="video/mp4" codecs="avc1.42c01e" width="640" height="360" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="221028">
+    <BaseURL>period1_video_10s_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="860-1071"/>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+ <Period start="PT0H0M10.00S">
+  <AdaptationSet segmentAlignment="true" maxWidth="640" maxHeight="360" maxFrameRate="25" par="16:9" lang="und" subsegmentStartsWithSAP="1">
+   <Representation id="1" mimeType="video/mp4" codecs="avc1.42c01e" width="640" height="360" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="221473">
+    <BaseURL>period2_video_10s_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="860-1011"/>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>

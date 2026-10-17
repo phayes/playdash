@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<!-- MPD file Generated with GPAC version 0.5.1-DEV-rev5316  on 2014-07-18T08:35:25Z-->
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" minBufferTime="PT1.500000S" type="static" mediaPresentationDuration="PT0H0M10.00S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+ <ProgramInformation moreInformationURL="http://gpac.sourceforge.net">
+  <Title>MPEG-DASH Conformance File using SRD features (ISO/IEC 23009-1:2013/Amd.2:2014) to describe spatial relationships between media assets. This file correponds to Scenario 1 (version 2) described in MPEG DASH Guidelines (ISO/IEC 23009-3): a video and a zoomed part of the video, there are 2 resolutions per AdaptationSet and their relationship is described using pixel units.</Title>
+ </ProgramInformation>
+
+ <Period duration="PT0H0M10.00S">
+  <AdaptationSet segmentAlignment="true" maxWidth="3840" maxHeight="2160" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,0,0,5760,3240,5760,3240"/>
+   <Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>
+   <Representation id="1" mimeType="video/mp4" codecs="avc1.42c033" width="3840" height="2160" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="1055206">
+    <BaseURL>counter-tiles-3x3-3840x2160-I25-1024kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="818-969"/>
+   </Representation>
+   <Representation id="2" mimeType="video/mp4" codecs="avc1.42c01f" width="1280" height="720" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="585483">
+    <BaseURL>counter-tiles-3x3-1280x720-I25-512kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-884"/>
+   </Representation>
+  </AdaptationSet>
+  <AdaptationSet segmentAlignment="true" maxWidth="1920" maxHeight="1080" maxFrameRate="25" par="16:9" subsegmentStartsWithSAP="1">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:srd:2014" value="0,1920,1080,1920,1080"/>
+   <Role schemeIdUri="urn:mpeg:dash:role:2011" value="supplementary"/>
+   <Representation id="3" mimeType="video/mp4" codecs="avc1.42c028" width="1920" height="1080" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="770399">
+    <BaseURL>counter-tile-5-1920x1080-I25-768kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+   <Representation id="4" mimeType="video/mp4" codecs="avc1.42c01f" width="1280" height="720" frameRate="25" sar="1:1" startWithSAP="1" bandwidth="526559">
+    <BaseURL>counter-tile-5-1280x720-I25-512kbps-baseline_dashinit.mp4</BaseURL>
+    <SegmentBase indexRangeExact="true" indexRange="817-968"/>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>

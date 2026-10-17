@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" minBufferTime="PT1.500000S" type="static" mediaPresentationDuration="PT0H0M10.00S" profiles="urn:mpeg:dash:profile:isoff-live:2011">
+ <ProgramInformation>
+  <Title>Conformant MPD - SegmentTemplate at 2 levels (period and representation)</Title>
+ </ProgramInformation>
+
+ <Period>
+  <SegmentTemplate timescale="1000" duration="1000" initialization="period1_audio_video_live_init.mp4"/>
+  <AdaptationSet>
+   <Representation id="1" mimeType="video/mp4" codecs="avc1.42c01e" startWithSAP="1" bandwidth="226597">
+   <SegmentTemplate media="period1_video_live_$Number$.m4s" startNumber="1"/>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>

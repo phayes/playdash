@@ -103,7 +103,6 @@ pub struct Representation<'a> {
 /// Serialized in lowercase, such as `"video"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-#[non_exhaustive]
 pub enum ContentKind {
     /// Video only.
     Video,

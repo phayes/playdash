@@ -1,0 +1,222 @@
+{
+  "advanced/durations_mismatch.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/durations_mismatch.mpd",
+    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+  },
+  "advanced/empty-segments.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/empty-segments.mpd",
+    "invalid_reason": "Its Representation has no @id, which DASH requires, and its media is missing from GPAC's server (404)."
+  },
+  "advanced/non-matching-codec.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/non-matching-codec.mpd",
+    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+  },
+  "advanced/non-matching-frame-rate.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/non-matching-frame-rate.mpd",
+    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+  },
+  "advanced/non-matching-width.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/non-matching-width.mpd",
+    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+  },
+  "advanced/not-all-tracks-as-reps.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/not-all-tracks-as-reps.mpd",
+    "invalid_reason": "audio-video.mp4 is missing from GPAC's server (404). playdash also does not support a Representation addressed by a BaseURL alone, as a single segment."
+  },
+  "advanced/par_w_h.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/par_w_h.mpd",
+    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+  },
+  "advanced/periods/gap/periods_gap_segmentbase-extra-media.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/gap/periods_gap_segmentbase-extra-media.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/gap/periods_gap_segmentbase.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/gap/periods_gap_segmentbase.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/gap/periods_gap_segmenttemplate.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/gap/periods_gap_segmenttemplate.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/gap/periods_gap_segmenttimeline-mismatch.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/gap/periods_gap_segmenttimeline-mismatch.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/gap/periods_gap_segmenttimeline.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/gap/periods_gap_segmenttimeline.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/overlap/periods_overlap_segmentbase.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/overlap/periods_overlap_segmentbase.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/overlap/periods_overlap_segmenttemplate.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/overlap/periods_overlap_segmenttemplate.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/overlap/periods_overlap_segmenttimeline.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/overlap/periods_overlap_segmenttimeline.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/pto/gap/periods_gap_pto_segmentbase.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/pto/gap/periods_gap_pto_segmentbase.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/pto/gap/periods_gap_pto_segmenttemplate.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/pto/gap/periods_gap_pto_segmenttemplate.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/pto/gap/periods_gap_pto_segmenttimeline.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/pto/gap/periods_gap_pto_segmenttimeline.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/pto/overlap/periods_overlap_segmentbase.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/pto/overlap/periods_overlap_segmentbase.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/pto/overlap/periods_overlap_segmenttemplate.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/pto/overlap/periods_overlap_segmenttemplate.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/periods/pto/overlap/periods_overlap_segmenttimeline.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/periods/pto/overlap/periods_overlap_segmenttimeline.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/pto/periods_overlap_segmentbase.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/pto/periods_overlap_segmentbase.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/pto/periods_overlap_segmenttemplate.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/pto/periods_overlap_segmenttemplate.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/pto/periods_overlap_segmenttimeline.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/pto/periods_overlap_segmenttimeline.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/pto/pto_segmentbase.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/pto/pto_segmentbase.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/pto/pto_segmenttemplate.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/pto/pto_segmenttemplate.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "advanced/pto/pto_segmenttimeline.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/pto/pto_segmenttimeline.mpd" },
+  "advanced/same_init_as.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/same_init_as.mpd",
+    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+  },
+  "advanced/segmenttemplate_merge.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/segmenttemplate_merge.mpd",
+    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+  },
+  "advanced/segmenttimeline_time.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/segmenttimeline_time.mpd",
+    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+  },
+  "advanced/zero-width.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/advanced/zero-width.mpd",
+    "invalid_reason": "Media it references is missing from GPAC's server (404)."
+  },
+  "mp4-full-gdr/mp4-full-gdr-mpd-AV-BS.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-full-gdr/mp4-full-gdr-mpd-AV-BS.mpd",
+    "reason": "Samples starting a video 'roll' sample group (gradual decoding refresh) are not keyframes; ffprobe marks them as keyframes."
+  },
+  "mp4-full-gdr/mp4-full-gdr-mpd-AV-NBS.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-full-gdr/mp4-full-gdr-mpd-AV-NBS.mpd",
+    "reason": "Samples starting a video 'roll' sample group (gradual decoding refresh) are not keyframes; ffprobe marks them as keyframes."
+  },
+  "mp4-full-gdr/mp4-full-gdr-mpd-V-BS.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-full-gdr/mp4-full-gdr-mpd-V-BS.mpd",
+    "reason": "Samples starting a video 'roll' sample group (gradual decoding refresh) are not keyframes; ffprobe marks them as keyframes."
+  },
+  "mp4-full-gdr/mp4-full-gdr-mpd-V-NBS.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-full-gdr/mp4-full-gdr-mpd-V-NBS.mpd",
+    "reason": "Samples starting a video 'roll' sample group (gradual decoding refresh) are not keyframes; ffprobe marks them as keyframes."
+  },
+  "mp4-live-1s/mp4-live-1s-mpd-A-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-1s/mp4-live-1s-mpd-A-BS.mpd" },
+  "mp4-live-1s/mp4-live-1s-mpd-A-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-1s/mp4-live-1s-mpd-A-NBS.mpd" },
+  "mp4-live-1s/mp4-live-1s-mpd-AV-BS-period.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-1s/mp4-live-1s-mpd-AV-BS-period.mpd",
+    "invalid_reason": "A bare Period for xlink, not an MPD."
+  },
+  "mp4-live-1s/mp4-live-1s-mpd-AV-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-1s/mp4-live-1s-mpd-AV-BS.mpd" },
+  "mp4-live-1s/mp4-live-1s-mpd-AV-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-1s/mp4-live-1s-mpd-AV-NBS.mpd" },
+  "mp4-live-1s/mp4-live-1s-mpd-V-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-1s/mp4-live-1s-mpd-V-BS.mpd" },
+  "mp4-live-1s/mp4-live-1s-mpd-V-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-1s/mp4-live-1s-mpd-V-NBS.mpd" },
+  "mp4-live-3s/dash-live-AV-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-3s/dash-live-AV-NBS.mpd" },
+  "mp4-live-3s/dash-live-V-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-3s/dash-live-V-NBS.mpd" },
+  "mp4-live-group/mp4-live-group-mpd-A-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-group/mp4-live-group-mpd-A-NBS.mpd" },
+  "mp4-live-mux/mp4-live-mux-mpd-AV-BS.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-mux/mp4-live-mux-mpd-AV-BS.mpd"
+  },
+  "mp4-live-mux/mp4-live-mux-mpd-AV-NBS.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-mux/mp4-live-mux-mpd-AV-NBS.mpd"
+  },
+  "mp4-live-periods/mp4-live-periods-mpd.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-periods/mp4-live-periods-mpd.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "mp4-live-periods/mp4-live-periods-reversed-mpd.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-periods/mp4-live-periods-reversed-mpd.mpd",
+    "reason": "Its periods repeat representation IDs, and DashManifest reaches only the first period's representation by ID, so later periods cannot be streamed."
+  },
+  "mp4-live-subtitle/mp4-live-subtitle-mpd-AVST.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live-subtitle/mp4-live-subtitle-mpd-AVST.mpd" },
+  "mp4-live/mp4-live-mpd-A-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live/mp4-live-mpd-A-BS.mpd" },
+  "mp4-live/mp4-live-mpd-A-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live/mp4-live-mpd-A-NBS.mpd" },
+  "mp4-live/mp4-live-mpd-AV-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live/mp4-live-mpd-AV-BS.mpd" },
+  "mp4-live/mp4-live-mpd-AV-NBS-30s.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live/mp4-live-mpd-AV-NBS-30s.mpd" },
+  "mp4-live/mp4-live-mpd-AV-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live/mp4-live-mpd-AV-NBS.mpd" },
+  "mp4-live/mp4-live-mpd-V-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live/mp4-live-mpd-V-BS.mpd" },
+  "mp4-live/mp4-live-mpd-V-NBS-30s.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live/mp4-live-mpd-V-NBS-30s.mpd" },
+  "mp4-live/mp4-live-mpd-V-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-live/mp4-live-mpd-V-NBS.mpd" },
+  "mp4-main-multi/mp4-main-multi-mpd-A-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-multi/mp4-main-multi-mpd-A-BS.mpd" },
+  "mp4-main-multi/mp4-main-multi-mpd-A-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-multi/mp4-main-multi-mpd-A-NBS.mpd" },
+  "mp4-main-multi/mp4-main-multi-mpd-AV-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-multi/mp4-main-multi-mpd-AV-BS.mpd" },
+  "mp4-main-multi/mp4-main-multi-mpd-AV-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-multi/mp4-main-multi-mpd-AV-NBS.mpd" },
+  "mp4-main-multi/mp4-main-multi-mpd-V-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-multi/mp4-main-multi-mpd-V-BS.mpd" },
+  "mp4-main-multi/mp4-main-multi-mpd-V-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-multi/mp4-main-multi-mpd-V-NBS.mpd" },
+  "mp4-main-ogop/mp4-main-ogop-mpd-AV-BS.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-ogop/mp4-main-ogop-mpd-AV-BS.mpd",
+    "reason": "Open-GOP random access points, non-sync samples in a 'rap ' sample group, are not keyframes; ffprobe marks them as keyframes."
+  },
+  "mp4-main-ogop/mp4-main-ogop-mpd-AV-NBS.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-ogop/mp4-main-ogop-mpd-AV-NBS.mpd",
+    "reason": "Open-GOP random access points, non-sync samples in a 'rap ' sample group, are not keyframes; ffprobe marks them as keyframes."
+  },
+  "mp4-main-ogop/mp4-main-ogop-mpd-V-BS.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-ogop/mp4-main-ogop-mpd-V-BS.mpd",
+    "reason": "Open-GOP random access points, non-sync samples in a 'rap ' sample group, are not keyframes; ffprobe marks them as keyframes."
+  },
+  "mp4-main-ogop/mp4-main-ogop-mpd-V-NBS.mpd": {
+    "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-ogop/mp4-main-ogop-mpd-V-NBS.mpd",
+    "reason": "Open-GOP random access points, non-sync samples in a 'rap ' sample group, are not keyframes; ffprobe marks them as keyframes."
+  },
+  "mp4-main-single/mp4-main-single-mpd-A-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-single/mp4-main-single-mpd-A-BS.mpd" },
+  "mp4-main-single/mp4-main-single-mpd-A-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-single/mp4-main-single-mpd-A-NBS.mpd" },
+  "mp4-main-single/mp4-main-single-mpd-AV-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-single/mp4-main-single-mpd-AV-BS.mpd" },
+  "mp4-main-single/mp4-main-single-mpd-AV-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-single/mp4-main-single-mpd-AV-NBS.mpd" },
+  "mp4-main-single/mp4-main-single-mpd-V-BS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-single/mp4-main-single-mpd-V-BS.mpd" },
+  "mp4-main-single/mp4-main-single-mpd-V-NBS.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-main-single/mp4-main-single-mpd-V-NBS.mpd" },
+  "mp4-onDemand/mp4-onDemand-mpd-A.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-onDemand/mp4-onDemand-mpd-A.mpd" },
+  "mp4-onDemand/mp4-onDemand-mpd-AV.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-onDemand/mp4-onDemand-mpd-AV.mpd" },
+  "mp4-onDemand/mp4-onDemand-mpd-V.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/mp4-onDemand/mp4-onDemand-mpd-V.mpd" },
+  "SRD/mp4-live/srd-3x3.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-live/srd-3x3.mpd" },
+  "SRD/mp4-onDemand/counter-tiles-2x2-main.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/counter-tiles-2x2-main.mpd" },
+  "SRD/mp4-onDemand/counter-tiles-2x2-no-full.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/counter-tiles-2x2-no-full.mpd" },
+  "SRD/mp4-onDemand/counter-tiles-2x2-tile1.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/counter-tiles-2x2-tile1.mpd" },
+  "SRD/mp4-onDemand/counter-tiles-2x2-tile2.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/counter-tiles-2x2-tile2.mpd" },
+  "SRD/mp4-onDemand/counter-tiles-2x2-tile3.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/counter-tiles-2x2-tile3.mpd" },
+  "SRD/mp4-onDemand/counter-tiles-2x2-tile4.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/counter-tiles-2x2-tile4.mpd" },
+  "SRD/mp4-onDemand/counter-tiles-2x2.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/counter-tiles-2x2.mpd" },
+  "SRD/mp4-onDemand/counter-tiles-3x3-no-full.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/counter-tiles-3x3-no-full.mpd" },
+  "SRD/mp4-onDemand/counter-tiles-3x3.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/counter-tiles-3x3.mpd" },
+  "SRD/mp4-onDemand/scenario1-zoom-v1.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/scenario1-zoom-v1.mpd" },
+  "SRD/mp4-onDemand/scenario1-zoom-v2.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/scenario1-zoom-v2.mpd" },
+  "SRD/mp4-onDemand/scenario1-zoom-v3.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/scenario1-zoom-v3.mpd" },
+  "SRD/mp4-onDemand/scenario2-3x3-tiling.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/scenario2-3x3-tiling.mpd" },
+  "SRD/mp4-onDemand/scenario3-2x2-tiling.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/scenario3-2x2-tiling.mpd" },
+  "SRD/mp4-onDemand/scenario4-overlap.mpd": { "url": "https://download.tsi.telecom-paristech.fr/gpac/DASH_CONFORMANCE/TelecomParisTech/SRD/mp4-onDemand/scenario4-overlap.mpd" }
+}

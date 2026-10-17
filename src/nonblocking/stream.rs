@@ -5,8 +5,10 @@ use super::{FragmentCache, Transport};
 use crate::buffer::BufferHandle;
 use crate::error::Error;
 use crate::fragment::{Fragments, MediaTimeline};
+use crate::mp4::track::{self, Track};
 use crate::schedule::{
-    self, Cursor, Part, Position, Retention, Schedule, StreamTimeline, TimeAccuracy, WindowChange,
+    self, Cursor, Part, PartBody, Position, Retention, Schedule, StreamTimeline, TimeAccuracy,
+    WindowChange,
 };
 use crate::store::FragmentData;
 use bytes::Bytes;
@@ -37,7 +39,7 @@ type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + 
 /// and reading share one position: each item is everything from the current
 /// position to the end of its fragment, which is a whole fragment unless
 /// reading or [`Self::seek_bytes`] left the position inside one. Use
-/// [`Self::seek_bytes`] for byte offsets or [`Self::seek_time_coarse`] to seek
+/// [`Self::seek_bytes`] for byte offsets or [`Self::seek_time`] to seek
 /// to the start of the fragment containing a timestamp. Both streaming and
 /// reading wait while the fragment they need downloads.
 ///
@@ -86,7 +88,7 @@ type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + 
 ///
 /// // Bytes, from 30 seconds in.
 /// let mut stream = manifest.stream("audio").await?;
-/// stream.seek_time_coarse(Duration::from_secs(30)).await?;
+/// stream.seek_time(Duration::from_secs(30)).await?;
 /// let mut bytes = [0; 4096];
 /// let count = stream.read(&mut bytes).await?;
 /// # let _ = count;
@@ -239,6 +241,68 @@ impl FragmentStream {
         self
     }
 
+    /// Fetches media fragment `index` of the representation, without moving the
+    /// stream's position or retention window.
+    ///
+    /// `index` counts the representation's media fragments, as
+    /// [`MediaTimeline::fragment_at`] does, also for a stream from
+    /// [`Self::starting_at`]. A fragment outside the retention window is not
+    /// kept once returned, unless another stream sharing the cache keeps it.
+    ///
+    /// Fails with [`Error::Initialization`] for a fragment before the stream's
+    /// first or past its last, and with the download's error if it fails. A
+    /// failed fetch does not end the stream.
+    pub async fn media_fragment(&self, index: usize) -> Result<Bytes, Error> {
+        Ok(self.media_part_body(index).await?.body)
+    }
+
+    /// The tracks of the representation's initialization fragment, as a
+    /// [`PacketStream`](super::PacketStream) reads them.
+    ///
+    /// Fails with [`Error::MalformedMedia`] or [`Error::UnsupportedMedia`] if the
+    /// initialization fragment is not MP4 this crate reads.
+    pub fn tracks(&self) -> Result<Vec<Track>, Error> {
+        let init = self.shared.lock().init.clone();
+        let body = init.body().ok_or_else(|| {
+            Error::Initialization(
+                "MPEG stream no longer holds its initialization fragment".to_owned(),
+            )
+        })?;
+        track::tracks(&body, &init.fragment)
+    }
+
+    /// [`Self::media_fragment`], with where the fragment sits.
+    pub(crate) async fn media_part_body(&self, index: usize) -> Result<PartBody, Error> {
+        let (part, data) = {
+            let part = schedule::media_part(self.timeline.as_deref(), index);
+            let schedule = self.shared.lock();
+            part.and_then(|part| Some((part, schedule.fragment(part)?.clone())))
+                .ok_or_else(|| {
+                    Error::Initialization(format!(
+                        "MPEG stream has no media fragment {index} of its representation"
+                    ))
+                })?
+        };
+
+        // Fetch in this task; the stream's own downloads carry on meanwhile.
+        let body = self.shared.cache.get(&data).await?;
+        let kept = {
+            let mut schedule = self.shared.lock();
+            schedule.check_probe(part);
+            schedule.keeps(part)
+        };
+        if !kept {
+            self.shared.cache.store.forget_if_unheld(&data);
+        }
+        self.shared.changed();
+        Ok(PartBody {
+            part,
+            index: Some(index),
+            fragment: data.fragment.clone(),
+            body,
+        })
+    }
+
     /// A handle reporting how much of this stream's media its cache holds.
     /// `None` if the stream has no timeline.
     pub fn buffer(&self) -> Option<BufferHandle> {
@@ -302,9 +366,9 @@ impl FragmentStream {
     ///
     /// The returned byte offset is exact, except [`SeekFrom::End`]`(0)` under
     /// [`Self::set_symphonia_compat`], which may report an oversized estimate.
-    /// When a timeline is available, the returned time is exact at a fragment
-    /// boundary and otherwise reports the containing fragment's start as
-    /// [`TimeAccuracy::Coarse`].
+    /// When a timeline is available, the returned time is [`TimeAccuracy::Packet`]
+    /// at a fragment boundary, and otherwise the containing fragment's start as
+    /// [`TimeAccuracy::Fragment`].
     pub async fn seek_bytes(&mut self, from: SeekFrom) -> io::Result<Position> {
         let seek = seek_bytes(
             self.shared.clone(),
@@ -318,7 +382,8 @@ impl FragmentStream {
         Ok(position)
     }
 
-    /// Coarsely seeks to a media timestamp using the DASH `SegmentTimeline`.
+    /// Seeks to the start of the media fragment containing `time`, using the
+    /// DASH `SegmentTimeline`.
     ///
     /// Time `0` is the start of the first media fragment, after the
     /// initialization segment. The seek lands at byte `0` of the fragment
@@ -326,14 +391,15 @@ impl FragmentStream {
     /// rather than an arbitrary position inside `mdat`. The target fragment is
     /// prioritized and loaded before this returns.
     ///
-    /// This is segment-granular: playback may begin earlier than `time` by up
-    /// to one media-fragment duration. The returned position contains the
-    /// actual fragment-start timestamp and marks it [`TimeAccuracy::Exact`]
-    /// only when the requested time is exactly that boundary. The byte field is
-    /// `None` until every earlier fragment size is known.
-    pub async fn seek_time_coarse(&mut self, time: Duration) -> io::Result<Position> {
+    /// This is fragment-granular: playback may begin earlier than `time` by up
+    /// to one media-fragment duration. The returned position holds the
+    /// fragment's start, which is exact for the position
+    /// ([`TimeAccuracy::Packet`]); compare it with `time` to see how far back
+    /// the seek landed. The byte field is `None` until every earlier fragment
+    /// size is known.
+    pub async fn seek_time(&mut self, time: Duration) -> io::Result<Position> {
         let (cursor, position) =
-            seek_time_coarse(self.shared.clone(), self.timeline.clone(), time).await?;
+            seek_time(self.shared.clone(), self.timeline.clone(), time).await?;
         self.cursor = cursor;
         Ok(position)
     }
@@ -616,14 +682,13 @@ async fn seek_bytes(
     ))
 }
 
-/// [`FragmentStream::seek_time_coarse`], on owned state.
-async fn seek_time_coarse(
+/// [`FragmentStream::seek_time`], on owned state.
+async fn seek_time(
     shared: Arc<StreamShared>,
     timeline: Option<Arc<StreamTimeline>>,
     time: Duration,
 ) -> io::Result<(Cursor, Position)> {
-    let (media_index, exact) = schedule::time_target(timeline.as_deref(), time)?;
-    let target = Part::Media(media_index);
+    let target = Part::Media(schedule::time_target(timeline.as_deref(), time)?);
     let change = {
         let mut schedule = shared.lock();
         if schedule.past_end(target) {
@@ -651,11 +716,7 @@ async fn seek_time_coarse(
 
     let mut cursor = Cursor::start();
     cursor.place(target, 0, byte_position);
-    let accuracy = match exact {
-        true => TimeAccuracy::Exact,
-        false => TimeAccuracy::Coarse,
-    };
-    let time = schedule::time_at_fragment(timeline.as_deref(), target, accuracy);
+    let time = schedule::time_at_fragment(timeline.as_deref(), target, TimeAccuracy::Packet);
     Ok((
         cursor,
         Position {
@@ -665,45 +726,82 @@ async fn seek_time_coarse(
     ))
 }
 
+impl FragmentStream {
+    /// The rest of the current fragment, as [`Stream::poll_next`] yields it,
+    /// with where it sits.
+    pub(crate) fn poll_next_part(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<PartBody, Error>>> {
+        if self.failed {
+            return Poll::Ready(None);
+        }
+        loop {
+            let part = self.cursor.part;
+            if self.shared.lock().past_end(part) {
+                return Poll::Ready(None);
+            }
+
+            // Wait for the fragment under the cursor.
+            self.shared.request(part);
+            let waited = self.shared.poll_until(cx, |schedule| {
+                !schedule.missing_body(part) || schedule.complete
+            });
+            let found = match ready!(waited) {
+                Ok(mut schedule) => schedule
+                    .checked_body(part)
+                    .and_then(|body| Some((body, schedule.fragment(part)?.fragment.clone()))),
+                Err(error) => {
+                    self.failed = true;
+                    return Poll::Ready(Some(Err(error.into())));
+                }
+            };
+            let Some((body, fragment)) = found else {
+                return Poll::Ready(None);
+            };
+
+            // Hand over what is left of it and move on to the next.
+            let rest = self.cursor.take_rest(body);
+            self.shared.publish_cursor(self.cursor.part);
+            if let Some(body) = rest {
+                return Poll::Ready(Some(Ok(PartBody {
+                    part,
+                    index: schedule::representation_index(self.timeline.as_deref(), part),
+                    fragment,
+                    body,
+                })));
+            }
+        }
+    }
+
+    /// Whether nothing has been read yet: the position is the start of the
+    /// initialization fragment, with no seek under way.
+    pub(crate) fn at_start(&self) -> bool {
+        self.cursor.part == Part::Init
+            && self.cursor.offset_in_fragment == 0
+            && self.seeking.is_none()
+    }
+
+    /// The representation's timeline, if the stream has one.
+    pub(crate) fn representation_timeline(&self) -> Option<&MediaTimeline> {
+        self.timeline.as_deref().map(StreamTimeline::timeline)
+    }
+
+    /// Index in the representation of the stream's first media fragment.
+    pub(crate) fn first_index(&self) -> usize {
+        self.timeline.as_deref().map_or(0, StreamTimeline::first)
+    }
+}
+
 impl Stream for FragmentStream {
     type Item = Result<Bytes, Error>;
 
     /// The rest of the current fragment: a whole fragment, unless reading or a
     /// byte seek left the position inside one.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.failed {
-            return Poll::Ready(None);
-        }
-        loop {
-            let part = this.cursor.part;
-            if this.shared.lock().past_end(part) {
-                return Poll::Ready(None);
-            }
-
-            // Wait for the fragment under the cursor.
-            this.shared.request(part);
-            let waited = this.shared.poll_until(cx, |schedule| {
-                !schedule.missing_body(part) || schedule.complete
-            });
-            let body = match ready!(waited) {
-                Ok(mut schedule) => schedule.checked_body(part),
-                Err(error) => {
-                    this.failed = true;
-                    return Poll::Ready(Some(Err(error.into())));
-                }
-            };
-            let Some(body) = body else {
-                return Poll::Ready(None);
-            };
-
-            // Hand over what is left of it and move on to the next.
-            let rest = this.cursor.take_rest(body);
-            this.shared.publish_cursor(this.cursor.part);
-            if let Some(rest) = rest {
-                return Poll::Ready(Some(Ok(rest)));
-            }
-        }
+        self.get_mut()
+            .poll_next_part(cx)
+            .map(|part| part.map(|part| part.map(|part| part.body)))
     }
 }
 
@@ -830,6 +928,7 @@ mod tests {
         );
         let timeline = MediaTimeline {
             timescale: 1,
+            origin: 0,
             media_durations: vec![1; 5],
         };
         FragmentStream::new_with_cache(fragments, Some(timeline), cache)
@@ -850,6 +949,37 @@ mod tests {
             behind: behind.map(Duration::from_secs),
             ahead: ahead.map(Duration::from_secs),
         }
+    }
+
+    #[tokio::test]
+    async fn media_fragment_fetches_without_moving_the_stream() {
+        // The first request for fragment 3 fails.
+        let refused = Arc::new(AtomicBool::new(false));
+        let (base, counts) = serve({
+            let refused = refused.clone();
+            move |path, _| match path {
+                "/3" if !refused.swap(true, Ordering::SeqCst) => (500, Vec::new()),
+                path => (200, path.trim_start_matches('/').as_bytes().to_vec()),
+            }
+        });
+        let stream = one_second_stream(&base, client_cache()).await;
+        let mut stream = stream.with_retention(seconds(Some(0), Some(1)));
+
+        // Fetching the last fragment leaves the stream at its start.
+        assert_eq!(stream.media_fragment(4).await.unwrap(), &b"5"[..]);
+        assert!(matches!(
+            stream.media_fragment(5).await,
+            Err(Error::Initialization(_))
+        ));
+        assert_eq!(stream.next().await.unwrap().unwrap(), &b"init"[..]);
+        assert_eq!(stream.next().await.unwrap().unwrap(), &b"1"[..]);
+
+        // A failed fetch is this caller's; the stream still downloads it itself.
+        assert!(stream.media_fragment(2).await.is_err());
+        assert_eq!(texts(&mut stream).await, ["2", "3", "4", "5"]);
+        assert_eq!(requests(&counts, "/3"), 2);
+        // Fragment 5 was outside the window, so it was not kept the first time.
+        assert_eq!(requests(&counts, "/5"), 2);
     }
 
     #[tokio::test]
@@ -882,13 +1012,10 @@ mod tests {
     async fn seeks_by_time_to_a_fragment_start() {
         let (base, _) = serve(named());
         let mut stream = one_second_stream(&base, client_cache()).await;
-        let position = stream
-            .seek_time_coarse(Duration::from_secs(2))
-            .await
-            .unwrap();
+        let position = stream.seek_time(Duration::from_secs(2)).await.unwrap();
         assert_eq!(
             position.time.map(|time| (time.timestamp, time.accuracy)),
-            Some((Duration::from_secs(2), TimeAccuracy::Exact))
+            Some((Duration::from_secs(2), TimeAccuracy::Packet))
         );
         assert_eq!(texts(&mut stream).await, ["3", "4", "5"]);
     }
@@ -984,7 +1111,7 @@ mod tests {
         assert!(cache.cached(&Fragment::new(format!("{base}/2"))).is_some());
         assert_eq!(cache.known_size(&one), Some(1));
 
-        stream.seek_time_coarse(Duration::ZERO).await.unwrap();
+        stream.seek_time(Duration::ZERO).await.unwrap();
         assert_eq!(stream.next().await.unwrap().unwrap(), &b"1"[..]);
         assert_eq!(requests(&counts, "/1"), 2);
     }

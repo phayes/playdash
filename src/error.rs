@@ -126,6 +126,52 @@ pub enum Error {
         source: reqwest::Error,
     },
 
+    /// A fragment's MP4 boxes are truncated or inconsistent
+    #[cfg(any(feature = "sync", feature = "async"))]
+    #[error("Fragment {fragment} has malformed MP4 boxes: {reason}")]
+    MalformedMedia {
+        /// The fragment URL and range
+        fragment: String,
+        /// What is malformed
+        reason: String,
+    },
+
+    /// A fragment uses MP4 features a `PacketStream` does not read, such as
+    /// several tracks or samples still encrypted
+    #[cfg(any(feature = "sync", feature = "async"))]
+    #[error("Fragment {fragment} uses unsupported MP4 features: {reason}")]
+    UnsupportedMedia {
+        /// The fragment URL and range
+        fragment: String,
+        /// What is unsupported
+        reason: String,
+    },
+
+    /// A track cannot be turned into decoder input: its codec has no adapter, or the
+    /// requested format cannot carry it
+    #[cfg(any(feature = "sync", feature = "async"))]
+    #[error("{codec} cannot be decoder input in {}: {reason}", format_name(.format))]
+    UnsupportedDecoderInput {
+        /// The codec, such as `H.264`, or the sample entry type of an unknown one
+        codec: String,
+        /// The format asked for or chosen, or `None` if none was chosen
+        format: Option<crate::decoder::DecoderFormat>,
+        /// What is unsupported
+        reason: String,
+    },
+
+    /// A codec configuration or packet does not follow its codec's format
+    #[cfg(any(feature = "sync", feature = "async"))]
+    #[error("Malformed {codec} decoder input in {format}: {reason}")]
+    MalformedDecoderInput {
+        /// The codec, such as `H.264`, or the sample entry type of an unknown one
+        codec: String,
+        /// The format being produced
+        format: crate::decoder::DecoderFormat,
+        /// What is malformed
+        reason: String,
+    },
+
     /// Rodio could not initialize a decoder for the selected representation.
     #[cfg(feature = "rodio")]
     #[error("Audio decoder initialization failed: {0}")]
@@ -166,4 +212,13 @@ pub enum Error {
         /// What is malformed
         reason: String,
     },
+}
+
+/// A decoder-input error's format, for its message.
+#[cfg(any(feature = "sync", feature = "async"))]
+fn format_name(format: &Option<crate::decoder::DecoderFormat>) -> String {
+    match format {
+        Some(format) => format.to_string(),
+        None => "any format".to_owned(),
+    }
 }

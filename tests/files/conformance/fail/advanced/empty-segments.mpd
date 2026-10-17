@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" minBufferTime="PT1.50S" type="static" mediaPresentationDuration="PT5.00S">
+ <ProgramInformation>
+  <Title>Conformant MPD - One media segment not containing any media data</Title>
+ </ProgramInformation>
+
+ <Period>
+  <AdaptationSet>
+   <Representation mimeType="video/mp4" codecs="avc1.42c01e" startWithSAP="1" bandwidth="226597">
+    <SegmentList timescale="1000" duration="1000">
+     <Initialization sourceURL="period1_video_live_init.mp4"/>
+     <SegmentURL media="period1_video_live_1.m4s"/>
+     <SegmentURL media="period1_video_live_2.m4s"/>
+     <SegmentURL media="empty_segment.m4s"/>
+     <SegmentURL media="period1_video_live_3.m4s"/>
+     <SegmentURL media="period1_video_live_4.m4s"/>
+    </SegmentList>   
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>

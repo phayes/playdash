@@ -23,8 +23,9 @@ pub(crate) struct TemplateValues<'a> {
 
 /// Substitutes DASH identifiers in a URL template.
 ///
-/// `$$` becomes a literal `$`. A `$` that does not start a known identifier is
-/// kept as-is, matching common players. Identifiers without a value (such as
+/// Identifiers match regardless of case. `$$` becomes a literal `$`. A `$` that
+/// does not start a known identifier is kept as-is, matching common players.
+/// Identifiers without a value (such as
 /// `$Number$` in an initialization template) are rejected.
 pub(crate) fn fill(template: &str, values: &TemplateValues) -> Result<String, Error> {
     let mut url = String::with_capacity(template.len());
@@ -64,11 +65,12 @@ fn identifier_value(
         Some((name, format)) => (name, Some(format)),
         None => (token, None),
     };
-    let value = match name {
-        "RepresentationID" => Some(values.representation_id.to_owned()),
-        "Number" => values.number.map(|number| number.to_string()),
-        "Time" => values.time.map(|time| time.to_string()),
-        "Bandwidth" => values.bandwidth.map(|bandwidth| bandwidth.to_string()),
+    // Identifiers are case-sensitive in DASH, but some manifests write `$number$`.
+    let value = match name.to_ascii_lowercase().as_str() {
+        "representationid" => Some(values.representation_id.to_owned()),
+        "number" => values.number.map(|number| number.to_string()),
+        "time" => values.time.map(|time| time.to_string()),
+        "bandwidth" => values.bandwidth.map(|bandwidth| bandwidth.to_string()),
         _ => return Ok(None),
     }
     .ok_or_else(|| invalid_template(template, &format!("${name}$ has no value here")))?;
@@ -195,6 +197,18 @@ mod tests {
     }
 
     #[test]
+    fn fills_identifiers_in_any_case() {
+        assert_eq!(
+            fill(
+                "$representationid$/$BANDWIDTH$/$time$-$number%03d$.m4s",
+                &values()
+            )
+            .unwrap(),
+            "FLAC,44100,16/1411200/176128-042.m4s"
+        );
+    }
+
+    #[test]
     fn fills_width_format_tags() {
         assert_eq!(
             fill("$Number%05d$/$Number%010d$/$Time%02d$", &values()).unwrap(),
@@ -300,7 +314,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             summarize(&segments),
-            [(1, 10_000, 1000), (2, 11_000, 1000), (3, 12_000, 1000)]
+            [(1, 10_000, 1000), (2, 11_000, 1000), (3, 12_000, 500)]
+        );
+    }
+
+    #[test]
+    fn timeline_is_clipped_to_period_end() {
+        let mut template = template(Some(vec![entry(Some(10_000), 1000, Some(49))]));
+        template.presentationTimeOffset = Some(10_000);
+        let segments = TemplateChain::new([Some(&template), None, None])
+            .segments(Some(Duration::from_millis(2500)))
+            .unwrap();
+        assert_eq!(
+            summarize(&segments),
+            [(1, 10_000, 1000), (2, 11_000, 1000), (3, 12_000, 500)]
         );
     }
 

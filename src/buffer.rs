@@ -294,6 +294,7 @@ mod tests {
     fn spans() -> Vec<Range<Duration>> {
         MediaTimeline {
             timescale: 10,
+            origin: 0,
             media_durations: vec![20, 20, 20],
         }
         .spans()
@@ -410,6 +411,7 @@ mod tests {
         // Audio ends at 4 seconds and is fully buffered; video runs to 6.
         let short = MediaTimeline {
             timescale: 10,
+            origin: 0,
             media_durations: vec![20, 20],
         }
         .spans();
