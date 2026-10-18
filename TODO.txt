@@ -269,3 +269,62 @@ Open questions
   container, or keep counting?
 - IVF's header has a frame count, unknown while streaming: write 0, as ffmpeg
   accepts?
+
+
+Additional TODOs:
+
+These are ranked by how much they matter. These are candidates for follow-up work where a firm decision hasn't been taken.
+
+1. **Representations are found by ID across all periods.**
+   - dash.js identifies a representation by Period → AdaptationSet → Representation: one `Stream` per period, and `path [p,a,r]` on each representation.
+   - playdash finds one by ID across the whole MPD, ignoring case, with a fallback to the token before the first comma. The first match wins (mod.rs:458).
+   - So when periods repeat IDs, every period after the first is unreachable. That accounts for 24 of the 30 conformance `fail/` entries.
+   - It also explains a latent bug nothing ever hit: a later `Period` with no `@start` is treated as starting at 0 (mod.rs:240, mod.rs:197).
+
+2. **SegmentBase works by rewriting the parsed MPD.**
+   - `apply_index` writes a synthetic `SegmentList`/`SegmentTimeline` into the vendored MPD structs (segment_base.rs:75-93). Load failures are kept in a side map, `segment_index_errors`.
+   - dash.js keeps `SEGMENT_BASE` as its own segment-info type, with `SegmentBaseLoader` and `SegmentBaseGetter`; the parsed manifest is never altered.
+   - Consequences:
+     - `DashManifest::new` can return representations that cannot be streamed until I/O has run.
+     - The manifest no longer matches the document it came from.
+     - Errors surface late, through the side map.
+
+3. **Inheritance is worked out again on every query.**
+   - Three ad-hoc chain types do it: `TemplateChain`, `ListChain` and `BaseChain`.
+   - Two more functions repeat the "which addressing applies" decision: `needs_segment_index` and `uses_segment_list` (mod.rs:131-166).
+   - dash.js resolves inheritance once, at parse time (objectiron), and computes `segmentInfoType` once per representation.
+   - A single resolved representation, built once, would replace all of this.
+
+4. **Segment timing and URLs are built as two separate lists, then zipped together** (mod.rs:242-245).
+   - `zip` silently truncates if the two lengths ever differ.
+   - dash.js builds one `Segment` object that carries both the URL and the timing.
+   - Naming adds to the confusion: `manifest::segments` (timing) and `segment::Segments` (the public list) are different things.
+
+5. **No retries, failover or error types.**
+   - The first failed GET ends the stream.
+   - The GET worker converts the error to a string (segment/stream.rs:552), so callers get `Error::Io` instead of the original type.
+   - A single failed HEAD turns size probing off for good.
+   - Only the first `BaseURL` at each level is used (mod.rs:267).
+   - dash.js has retry counts and intervals per request type (media 3×1000 ms, MPD 3×500 ms), timeouts per type, a BaseURL blacklist, and failover with DVB priority and weight.
+
+6. **The blocking and async code are near-copies of each other.**
+   - `segment/stream.rs` and `nonblocking/segment/stream.rs` differ in about 3,000 lines.
+   - Cache, transport, the packet-stream seek loop and the `MediaStream` builder are also copied.
+   - `Schedule` and `Store` already contain no I/O. More of the shared logic could move into them: the worker step, `ensure_sizes`, and the seek loop in `packet/stream.rs` and `nonblocking/packet.rs`. dash.js has a single code path, so there is no direct comparison.
+
+7. **The manifest fetch skips `Transport`.**
+   - fetch.rs:17 uses the global `ureq::get`, then builds a second agent to load indexes. The async version uses `Client::new`.
+   - dash.js loads the MPD, init, index and media segments through one HTTPLoader.
+   - As a result, custom transports and test fixtures cannot intercept the MPD load. TODO §1 Phase 4 already mentions this.
+
+8. **Code written for one consumer's quirks sits in the core segment layer.**
+   - The symphonia-compat length padding is in `segment/mod.rs:142-145`, `Segments::estimate_len`, `Schedule::reported_end_len` and `SegmentStream::set_symphonia_compat`.
+   - rodio.rs never calls any of it.
+   - It belongs in the rodio adapter, or can be removed.
+
+9. **Protection info in the MPD is ignored, and decryption is audio-only.**
+   - `cenc:default_KID` and `pssh` are parsed by the vendored crate but never read. Keys come only from `tenc` in the init segment.
+   - `protected_entries` skips any track whose handler is not `soun` (cenc.rs:272). Encrypted video therefore fails later with "samples are encrypted", not with a clear "unsupported" error.
+
+10. **Every segment is built up front.** playdash creates a `Vec` of all segments; dash.js getters compute a segment from its index or time when asked. TODO §1 Phase 3 already plans the on-demand approach (ExoPlayer-style), so this is listed only for completeness.
+```
