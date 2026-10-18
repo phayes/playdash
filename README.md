@@ -175,7 +175,7 @@ let input = manifest
 ```
 
 `input.buffer()` returns a handle for observing download progress. Supply a shared
-[`FragmentCache`](https://docs.rs/playdash/latest/playdash/struct.FragmentCache.html) with
+[`SegmentCache`](https://docs.rs/playdash/latest/playdash/struct.SegmentCache.html) with
 [`MediaStreamBuilder::cache`](https://docs.rs/playdash/latest/playdash/struct.MediaStreamBuilder.html#method.cache)
 when several streams should reuse connections and downloaded
 segments, or when you need a custom transport.
@@ -220,8 +220,8 @@ more control:
 - [`PacketStream`](https://docs.rs/playdash/latest/playdash/packet/struct.PacketStream.html)
   demultiplexes fragmented MP4 into packets exactly as MP4 stores them. Use it when your pipeline
   needs original MP4 samples or when you want to apply codec conversion yourself.
-- [`FragmentStream`](https://docs.rs/playdash/latest/playdash/fragment/struct.FragmentStream.html)
-  downloads initialization and media segments. It can yield complete fragments or act as a
+- [`SegmentStream`](https://docs.rs/playdash/latest/playdash/segment/struct.SegmentStream.html)
+  downloads initialization and media segments. It can yield complete segments or act as a
   seekable byte reader. Use it when you already have an MP4 demuxer or need segment-level access.
 
 The async equivalents are under

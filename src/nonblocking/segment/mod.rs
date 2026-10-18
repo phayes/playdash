@@ -8,6 +8,6 @@ mod manifest;
 mod stream;
 mod transport;
 
-pub use cache::FragmentCache;
-pub use stream::FragmentStream;
+pub use cache::SegmentCache;
+pub use stream::SegmentStream;
 pub use transport::Transport;

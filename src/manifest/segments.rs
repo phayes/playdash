@@ -1,6 +1,6 @@
 //! MPEG-DASH segment timing shared by `SegmentTemplate` and `SegmentList`
 //! addressing: media segments from either a `SegmentTimeline` or a fixed
-//! `@duration`, and `Initialization` elements as fragments.
+//! `@duration`, and `Initialization` elements as segment locations.
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -8,11 +8,11 @@ use std::time::Duration;
 use crate::vendor::dash_mpd_core::{Initialization, S, SegmentTimeline};
 
 use crate::error::Error;
-use crate::fragment::{Fragment, parse_byte_range};
+use crate::segment::{SegmentLocation, parse_byte_range};
 
-/// One media segment generated from a template.
+/// One media segment's number and timing, generated from a template or list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Segment {
+pub(crate) struct SegmentTime {
     /// Value of `$Number$`.
     pub number: u64,
     /// Value of `$Time$`: media time in timescale units, including `@presentationTimeOffset`.
@@ -21,20 +21,20 @@ pub(crate) struct Segment {
     pub duration: u64,
 }
 
-/// Media segments of a representation, in timeline order.
+/// The timing of a representation's media segments, in timeline order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Segments {
+pub(crate) struct SegmentTimes {
     pub timescale: NonZeroU32,
     /// `@presentationTimeOffset`: media time at the start of the Period.
     pub presentation_time_offset: u64,
-    pub segments: Vec<Segment>,
+    pub segments: Vec<SegmentTime>,
 }
 
-/// A representation's fragments with unresolved URLs: its initialization
-/// fragment and one media fragment per segment, in timeline order.
+/// The locations of a representation's segments with unresolved URLs: its
+/// initialization segment and one per media segment, in timeline order.
 pub(crate) struct SegmentUrls {
-    pub init: Fragment,
-    pub media: Vec<Fragment>,
+    pub init: SegmentLocation,
+    pub media: Vec<SegmentLocation>,
 }
 
 /// Segment timing: an explicit timeline, or a fixed segment duration.
@@ -54,11 +54,11 @@ pub(crate) struct Timing<'a> {
 }
 
 impl Timing<'_> {
-    /// Lists media segments.
+    /// Lists the media segments' times.
     ///
     /// `period_duration` bounds open-ended `S@r="-1"` repeats and `@duration`
     /// addressing; it may be omitted when `end_number` provides the bound instead.
-    pub fn segments(self, period_duration: Option<Duration>) -> Result<Segments, Error> {
+    pub fn segment_times(self, period_duration: Option<Duration>) -> Result<SegmentTimes, Error> {
         let timescale = u32::try_from(self.timescale.unwrap_or(1))
             .ok()
             .and_then(NonZeroU32::new)
@@ -78,7 +78,7 @@ impl Timing<'_> {
             segments.retain(|segment| segment.number <= end_number);
         }
 
-        Ok(Segments {
+        Ok(SegmentTimes {
             timescale,
             presentation_time_offset: bounds.offset,
             segments,
@@ -86,9 +86,12 @@ impl Timing<'_> {
     }
 }
 
-/// An `Initialization` element as a fragment; a missing `@sourceURL` means the BaseURL itself.
-pub(crate) fn initialization_fragment(initialization: &Initialization) -> Result<Fragment, Error> {
-    Ok(Fragment {
+/// An `Initialization` element as a segment location; a missing `@sourceURL` means the
+/// BaseURL itself.
+pub(crate) fn initialization_location(
+    initialization: &Initialization,
+) -> Result<SegmentLocation, Error> {
+    Ok(SegmentLocation {
         url: initialization.sourceURL.clone().unwrap_or_default(),
         range: initialization
             .range
@@ -109,7 +112,7 @@ struct Bounds {
 }
 
 impl Bounds {
-    fn timeline_segments(&self, entries: &[S]) -> Result<Vec<Segment>, Error> {
+    fn timeline_segments(&self, entries: &[S]) -> Result<Vec<SegmentTime>, Error> {
         if entries.is_empty() {
             return Err(Error::DashManifestMissingTimeline);
         }
@@ -143,7 +146,7 @@ impl Bounds {
                 }
             };
             for _ in 0..count {
-                segments.push(Segment {
+                segments.push(SegmentTime {
                     number,
                     time,
                     duration: entry.d,
@@ -165,7 +168,7 @@ impl Bounds {
     }
 
     /// Segments of a fixed `duration`; the last one is cut short at the end of the Period.
-    fn duration_segments(&self, duration: f64) -> Result<Vec<Segment>, Error> {
+    fn duration_segments(&self, duration: f64) -> Result<Vec<SegmentTime>, Error> {
         if !(duration.is_finite() && duration > 0.0) {
             return Err(Error::DashManifestInvalidSegments(format!(
                 "segment @duration {duration} is not positive"
@@ -190,7 +193,7 @@ impl Bounds {
                 Some(ticks) => boundary(index + 1).min(ticks),
                 None => boundary(index + 1),
             };
-            segments.push(Segment {
+            segments.push(SegmentTime {
                 number,
                 time: self.offset + start,
                 duration: end - start,

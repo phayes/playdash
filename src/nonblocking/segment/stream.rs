@@ -1,14 +1,14 @@
 //! Async, lower-level access to downloaded DASH segments and bytes.
 
-use super::{FragmentCache, Transport};
+use super::{SegmentCache, Transport};
 use crate::error::Error;
-use crate::fragment::buffer::BufferHandle;
-use crate::fragment::schedule::{
+use crate::mp4::track::{self, Track};
+use crate::segment::buffer::BufferHandle;
+use crate::segment::schedule::{
     self, Cursor, Part, PartBody, Position, Retention, Schedule, TimeAccuracy, WindowChange,
 };
-use crate::fragment::store::FragmentData;
-use crate::fragment::{Fragments, SegmentNumber};
-use crate::mp4::track::{self, Track};
+use crate::segment::store::SegmentData;
+use crate::segment::{SegmentNumber, Segments};
 use bytes::Bytes;
 use futures_util::Stream;
 use std::fmt;
@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 /// position it lands on.
 type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + Send>>;
 
-/// Downloads a representation's segments and exposes them as fragments or bytes.
+/// Downloads a representation's segments and exposes them as whole segments or bytes.
 ///
 /// This is a lower-level API. Use [`MediaStream`](crate::nonblocking::MediaStream) for
 /// packets ready for a codec decoder. This type implements [`Stream`] for segment bodies
@@ -48,11 +48,11 @@ type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + 
 /// mean instead:
 ///
 /// ```no_run
-/// # async fn example(mut stream: playdash::nonblocking::fragment::FragmentStream) {
+/// # async fn example(mut stream: playdash::nonblocking::segment::SegmentStream) {
 /// use futures_util::StreamExt;
 /// use tokio::io::AsyncReadExt;
 ///
-/// let first_three = StreamExt::take(&mut stream, 3); // fragments
+/// let first_three = StreamExt::take(&mut stream, 3); // segments
 /// # drop(first_three);
 /// let first_kib = AsyncReadExt::take(stream, 1024); // bytes
 /// # drop(first_kib);
@@ -70,15 +70,15 @@ type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + 
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd").await?;
 ///
-/// // Whole fragments.
-/// let mut stream = manifest.fragment_stream("audio").await?;
-/// while let Some(fragment) = stream.next().await {
-///     let bytes = fragment?;
+/// // Whole segments.
+/// let mut stream = manifest.segment_stream("audio").await?;
+/// while let Some(segment) = stream.next().await {
+///     let bytes = segment?;
 ///     # drop(bytes);
 /// }
 ///
 /// // Bytes, from 30 seconds in.
-/// let mut stream = manifest.fragment_stream("audio").await?;
+/// let mut stream = manifest.segment_stream("audio").await?;
 /// stream.seek_time(Duration::from_secs(30)).await?;
 /// let mut bytes = [0; 4096];
 /// let count = stream.read(&mut bytes).await?;
@@ -86,14 +86,14 @@ type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + 
 /// # Ok(())
 /// # }
 /// ```
-pub struct FragmentStream {
+pub struct SegmentStream {
     shared: Arc<StreamShared>,
     cursor: Cursor,
-    /// The representation's whole fragments, of which the stream reads those
+    /// The representation's whole segments, of which the stream reads those
     /// from its schedule's first media segment on.
-    fragments: Arc<Fragments>,
+    segments: Arc<Segments>,
     /// Estimated stream length. When set, [`SeekFrom::End`]`(0)` may report it
-    /// instead of waiting for every fragment size.
+    /// instead of waiting for every segment size.
     length_estimate: Option<u64>,
     /// Set once the stream has yielded an error, so it ends rather than
     /// yielding the same error forever.
@@ -113,76 +113,76 @@ struct StreamShared {
     /// Wakes the GET task when there may be something new to fetch.
     work: Notify,
     cancelled: AtomicBool,
-    cache: Arc<FragmentCache>,
+    cache: Arc<SegmentCache>,
     /// The runtime the stream was created on, which runs its tasks.
     runtime: Handle,
     /// The GET and HEAD tasks, aborted when the stream is dropped.
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-impl FragmentStream {
-    /// Creates a stream of `fragments` fetching through a new
-    /// [`reqwest::Client`]. The initialization fragment is fetched before
+impl SegmentStream {
+    /// Creates a stream of `segments` fetching through a new
+    /// [`reqwest::Client`]. The initialization segment is fetched before
     /// this returns. Must run on a tokio runtime.
     ///
-    /// Call [`Self::start_eager_head`] to discover unknown fragment sizes in
+    /// Call [`Self::start_eager_head`] to discover unknown segment sizes in
     /// the background for faster byte seeking.
-    pub async fn new(fragments: Fragments) -> Result<Self, Error> {
-        Self::new_with_cache(fragments, Arc::default()).await
+    pub async fn new(segments: Segments) -> Result<Self, Error> {
+        Self::new_with_cache(segments, Arc::default()).await
     }
 
     /// Like [`Self::new`], but fetches through `transport` with a new
-    /// [`FragmentCache`] dedicated to this stream.
+    /// [`SegmentCache`] dedicated to this stream.
     pub async fn new_with_transport(
-        fragments: Fragments,
+        segments: Segments,
         transport: Arc<dyn Transport>,
     ) -> Result<Self, Error> {
-        let cache = FragmentCache::new(transport);
-        Self::new_with_cache(fragments, Arc::new(cache)).await
+        let cache = SegmentCache::new(transport);
+        Self::new_with_cache(segments, Arc::new(cache)).await
     }
 
     /// Like [`Self::new`], but reuses data from `cache`.
     pub async fn new_with_cache(
-        fragments: Fragments,
-        cache: Arc<FragmentCache>,
+        segments: Segments,
+        cache: Arc<SegmentCache>,
     ) -> Result<Self, Error> {
-        let first = fragments.numbers().start;
-        Self::open(Arc::new(fragments), first, cache).await
+        let first = segments.numbers().start;
+        Self::open(Arc::new(segments), first, cache).await
     }
 
-    /// Creates a stream that reads the initialization fragment of
-    /// `fragments`, then its media from the fragment covering `time`, through
-    /// `cache`. Returns the stream and the start of that fragment, which is at
-    /// or before `time`. The initialization fragment is fetched before this
+    /// Creates a stream that reads the initialization segment of
+    /// `segments`, then its media from the segment covering `time`, through
+    /// `cache`. Returns the stream and the start of that segment, which is at
+    /// or before `time`. The initialization segment is fetched before this
     /// returns. Must run on a tokio runtime.
     ///
-    /// The stream reports and seeks by the presentation time of `fragments`,
-    /// as a stream of every fragment would; seeking to a time before its start
-    /// fails. A `time` before the first media fragment starts at the first,
+    /// The stream reports and seeks by the presentation time of `segments`,
+    /// as a stream of every segment would; seeking to a time before its start
+    /// fails. A `time` before the first media segment starts at the first,
     /// and a `time` at or past the end starts at the last.
     ///
-    /// Fails with [`Error::Initialization`] if `fragments` are untimed or have
-    /// no media fragments.
+    /// Fails with [`Error::Initialization`] if `segments` are untimed or have
+    /// no media segments.
     pub async fn starting_at(
-        fragments: Fragments,
+        segments: Segments,
         time: Duration,
-        cache: Arc<FragmentCache>,
+        cache: Arc<SegmentCache>,
     ) -> Result<(Self, Duration), Error> {
-        let (first, start) = schedule::start_at(&fragments, time)?;
-        Ok((Self::open(Arc::new(fragments), first, cache).await?, start))
+        let (first, start) = schedule::start_at(&segments, time)?;
+        Ok((Self::open(Arc::new(segments), first, cache).await?, start))
     }
 
-    /// A stream of `fragments` from the media segment numbered `first`,
+    /// A stream of `segments` from the media segment numbered `first`,
     /// fetching through `cache`.
     async fn open(
-        fragments: Arc<Fragments>,
+        segments: Arc<Segments>,
         first: SegmentNumber,
-        cache: Arc<FragmentCache>,
+        cache: Arc<SegmentCache>,
     ) -> Result<Self, Error> {
-        // Fetch the initialization fragment, which tells how to decrypt the media.
-        let init = cache.data(fragments.init().clone());
-        let media: Vec<_> = schedule::media_from(&fragments, first)
-            .map(|(fragment, span)| (cache.data(fragment.clone()), span))
+        // Fetch the initialization segment, which tells how to decrypt the media.
+        let init = cache.data(segments.init().clone());
+        let media: Vec<_> = schedule::media_from(&segments, first)
+            .map(|(segment, span)| (cache.data(segment.clone()), span))
             .collect();
         #[cfg(feature = "encryption")]
         cache.store.assign_init_role(&init);
@@ -209,7 +209,7 @@ impl FragmentStream {
         Ok(Self {
             shared,
             cursor: Cursor::start(first),
-            fragments,
+            segments,
             length_estimate: None,
             failed: false,
             seeking: None,
@@ -225,45 +225,45 @@ impl FragmentStream {
         self
     }
 
-    /// Fetches media fragment `index` of the representation, without moving the
+    /// Fetches media segment `index` of the representation, without moving the
     /// stream's position or retention window.
     ///
-    /// `index` counts the representation's media fragments, as
-    /// [`Fragments::segment_at`] does, also for a stream from
-    /// [`Self::starting_at`]. A fragment outside the retention window is not
+    /// `index` counts the representation's media segments, as
+    /// [`Segments::segment_at`] does, also for a stream from
+    /// [`Self::starting_at`]. A segment outside the retention window is not
     /// kept once returned, unless another stream sharing the cache keeps it.
     ///
-    /// Fails with [`Error::Initialization`] for a fragment before the stream's
+    /// Fails with [`Error::Initialization`] for a segment before the stream's
     /// first or past its last, and with the download's error if it fails. A
     /// failed fetch does not end the stream.
-    pub async fn media_fragment(&self, index: usize) -> Result<Bytes, Error> {
+    pub async fn media_segment(&self, index: usize) -> Result<Bytes, Error> {
         Ok(self
             .media_part_body(SegmentNumber(index as u64))
             .await?
             .body)
     }
 
-    /// The tracks of the representation's initialization fragment, as a
+    /// The tracks of the representation's initialization segment, as a
     /// [`PacketStream`](crate::nonblocking::packet::PacketStream) reads them.
     ///
     /// Fails with [`Error::MalformedMedia`] or [`Error::UnsupportedMedia`] if the
-    /// initialization fragment is not MP4 this crate reads.
+    /// initialization segment is not MP4 this crate reads.
     pub fn tracks(&self) -> Result<Vec<Track>, Error> {
         let init = self.shared.lock().init.clone();
         let body = init.body().ok_or_else(|| {
             Error::Initialization(
-                "MPEG stream no longer holds its initialization fragment".to_owned(),
+                "MPEG stream no longer holds its initialization segment".to_owned(),
             )
         })?;
-        track::tracks(&body, &init.fragment)
+        track::tracks(&body, &init.location)
     }
 
-    /// [`Self::media_fragment`], with where the fragment sits.
+    /// [`Self::media_segment`], with where the segment sits.
     pub(crate) async fn media_part_body(&self, number: SegmentNumber) -> Result<PartBody, Error> {
         let part = Part::Media(number);
-        let data = self.shared.lock().fragment(part).cloned().ok_or_else(|| {
+        let data = self.shared.lock().part_data(part).cloned().ok_or_else(|| {
             Error::Initialization(format!(
-                "MPEG stream has no media fragment {number} of its representation"
+                "MPEG stream has no media segment {number} of its representation"
             ))
         })?;
 
@@ -281,20 +281,20 @@ impl FragmentStream {
         Ok(PartBody {
             part,
             number: Some(number),
-            fragment: data.fragment.clone(),
+            location: data.location.clone(),
             body,
         })
     }
 
     /// A handle reporting how much of this stream's media its cache holds.
-    /// `None` if the stream's fragments are untimed.
+    /// `None` if the stream's segments are untimed.
     pub fn buffer(&self) -> Option<BufferHandle> {
-        self.fragments.timing()?;
+        self.segments.timing()?;
         let media = self.shared.lock().timed_media()?;
         Some(BufferHandle::new(&self.shared.cache.store, media))
     }
 
-    /// Starts background HEAD prefetch of unknown fragment sizes.
+    /// Starts background HEAD prefetch of unknown segment sizes.
     ///
     /// This is a no-op when all sizes are known or the server does not support
     /// usable `HEAD` responses.
@@ -323,12 +323,12 @@ impl FragmentStream {
     }
 
     /// Allows a demuxer to query an estimated stream length with
-    /// [`SeekFrom::End`]`(0)` before every fragment size is known.
+    /// [`SeekFrom::End`]`(0)` before every segment size is known.
     ///
     /// Once all sizes are known, the exact length is returned. Other
     /// [`SeekFrom::End`] offsets always wait for exact sizes.
     ///
-    /// Fails with [`Error::Initialization`] if the stream's fragments are
+    /// Fails with [`Error::Initialization`] if the stream's segments are
     /// untimed or have no media, or `bitrate_bps` is zero.
     pub fn set_symphonia_compat(&mut self, enabled: bool, bitrate_bps: u32) -> Result<(), Error> {
         if !enabled {
@@ -339,27 +339,27 @@ impl FragmentStream {
             let schedule = self.shared.lock();
             (schedule.init.size().unwrap_or(0), schedule.first())
         };
-        let estimate = schedule::compat_estimate(&self.fragments, first, init_len, bitrate_bps)?;
+        let estimate = schedule::compat_estimate(&self.segments, first, init_len, bitrate_bps)?;
         self.length_estimate = Some(estimate);
         Ok(())
     }
 
     /// Seeks to an exact offset in the concatenated initialization + media bytes.
     ///
-    /// When HEAD is available, discovers lengths for skipped fragments without
-    /// downloading them, then prioritizes a GET of the target fragment.
+    /// When HEAD is available, discovers lengths for skipped segments without
+    /// downloading them, then prioritizes a GET of the target segment.
     /// Otherwise downloads bodies until the offset is reachable.
     /// [`SeekFrom::Current`] requires a known absolute byte cursor.
     ///
     /// The returned byte offset is exact, except [`SeekFrom::End`]`(0)` under
     /// [`Self::set_symphonia_compat`], which may report an oversized estimate.
-    /// For timed fragments, the returned time is [`TimeAccuracy::Packet`] at a
-    /// fragment boundary, and otherwise the containing fragment's start as
-    /// [`TimeAccuracy::Fragment`].
+    /// For timed segments, the returned time is [`TimeAccuracy::Packet`] at a
+    /// segment boundary, and otherwise the containing segment's start as
+    /// [`TimeAccuracy::Segment`].
     pub async fn seek_bytes(&mut self, from: SeekFrom) -> io::Result<Position> {
         let seek = seek_bytes(
             self.shared.clone(),
-            self.fragments.clone(),
+            self.segments.clone(),
             self.cursor,
             self.length_estimate,
             from,
@@ -369,24 +369,24 @@ impl FragmentStream {
         Ok(position)
     }
 
-    /// Seeks to the start of the media fragment containing presentation time
+    /// Seeks to the start of the media segment containing presentation time
     /// `time`.
     ///
-    /// A `time` before the first media fragment lands on the first. The seek
-    /// lands at byte `0` of the fragment
-    /// containing `time`, so an fMP4 consumer receives the fragment's `moof`
-    /// rather than an arbitrary position inside `mdat`. The target fragment is
+    /// A `time` before the first media segment lands on the first. The seek
+    /// lands at byte `0` of the segment
+    /// containing `time`, so an fMP4 consumer receives the segment's leading `moof`
+    /// rather than an arbitrary position inside `mdat`. The target segment is
     /// prioritized and loaded before this returns.
     ///
-    /// This is fragment-granular: playback may begin earlier than `time` by up
-    /// to one media-fragment duration. The returned position holds the
-    /// fragment's start, which is exact for the position
+    /// This is segment-granular: playback may begin earlier than `time` by up
+    /// to one media-segment duration. The returned position holds the
+    /// segment's start, which is exact for the position
     /// ([`TimeAccuracy::Packet`]); compare it with `time` to see how far back
-    /// the seek landed. The byte field is `None` until every earlier fragment
+    /// the seek landed. The byte field is `None` until every earlier segment
     /// size is known.
     pub async fn seek_time(&mut self, time: Duration) -> io::Result<Position> {
         let (cursor, position) =
-            seek_time(self.shared.clone(), self.fragments.clone(), time).await?;
+            seek_time(self.shared.clone(), self.segments.clone(), time).await?;
         self.cursor = cursor;
         Ok(position)
     }
@@ -433,7 +433,7 @@ impl StreamShared {
         self.window_moved(change);
     }
 
-    /// Asks the GET task for the fragment at `part` before anything else, if
+    /// Asks the GET task for the segment at `part` before anything else, if
     /// it is missing.
     fn request(&self, part: Part) {
         let mut schedule = self.lock();
@@ -488,9 +488,9 @@ impl StreamShared {
         .await
     }
 
-    /// HEADs `data`, the fragment at `part`, unless its size is known, or
+    /// HEADs `data`, the segment at `part`, unless its size is known, or
     /// disables HEAD probing if the request fails.
-    async fn probe(&self, part: Part, data: &FragmentData) {
+    async fn probe(&self, part: Part, data: &SegmentData) {
         let result = self.cache.probe(data).await;
         if let Err(error) = result {
             self.lock()
@@ -500,7 +500,7 @@ impl StreamShared {
     }
 }
 
-/// Downloads the stream's fragments one at a time, in the order its schedule
+/// Downloads the stream's segments one at a time, in the order its schedule
 /// says, waiting whenever the window holds everything it should, until the
 /// stream is dropped or a download fails.
 async fn fetch_task(shared: Arc<StreamShared>) {
@@ -544,7 +544,7 @@ async fn fetch_task(shared: Arc<StreamShared>) {
     }
 }
 
-/// Learns unknown fragment sizes with HEAD while eager probing is wanted.
+/// Learns unknown segment sizes with HEAD while eager probing is wanted.
 async fn probe_task(shared: Arc<StreamShared>) {
     loop {
         if shared.cancelled.load(Ordering::SeqCst) {
@@ -594,7 +594,7 @@ async fn ensure_sizes(
         shared.probe(part, &data).await;
     }
 
-    // Without HEAD, download the first fragment whose size is unknown, even
+    // Without HEAD, download the first segment whose size is unknown, even
     // outside the window: its size is kept after its body is dropped.
     {
         let mut schedule = shared.lock();
@@ -611,11 +611,11 @@ async fn ensure_sizes(
         .await
 }
 
-/// [`FragmentStream::seek_bytes`] from `cursor`, on owned state so an
+/// [`SegmentStream::seek_bytes`] from `cursor`, on owned state so an
 /// [`AsyncSeek`] can keep it while it runs.
 async fn seek_bytes(
     shared: Arc<StreamShared>,
-    fragments: Arc<Fragments>,
+    segments: Arc<Segments>,
     mut cursor: Cursor,
     length_estimate: Option<u64>,
     from: SeekFrom,
@@ -629,7 +629,7 @@ async fn seek_bytes(
     if let Some(len) = reported_end {
         let end = shared.lock().end();
         cursor.place(end, 0, Some(len));
-        let time = schedule::time_at_end(&fragments);
+        let time = schedule::time_at_end(&segments);
         return Ok((
             cursor,
             Position {
@@ -639,7 +639,7 @@ async fn seek_bytes(
         ));
     }
 
-    // Resolve the target to a fragment, learning sizes as needed.
+    // Resolve the target to a segment, learning sizes as needed.
     if let SeekFrom::End(_) = from {
         ensure_sizes(&shared, Schedule::all_sizes_known).await?;
     }
@@ -649,16 +649,15 @@ async fn seek_bytes(
         schedule.resolve_cursor(target).is_some()
     })
     .await?;
-    let (part, offset_in_fragment) = shared
+    let (part, offset_in_segment) = shared
         .lock()
         .resolve_cursor(target)
         .ok_or_else(|| io::Error::other("MPEG stream ended before the requested byte offset"))?;
 
-    cursor.place(part, offset_in_fragment, Some(target));
+    cursor.place(part, offset_in_segment, Some(target));
     shared.publish_cursor(part);
     shared.request(part);
-    let time =
-        schedule::time_at_fragment(&fragments, part, schedule::accuracy_at(offset_in_fragment));
+    let time = schedule::time_at_segment(&segments, part, schedule::accuracy_at(offset_in_segment));
     Ok((
         cursor,
         Position {
@@ -668,14 +667,14 @@ async fn seek_bytes(
     ))
 }
 
-/// [`FragmentStream::seek_time`], on owned state.
+/// [`SegmentStream::seek_time`], on owned state.
 async fn seek_time(
     shared: Arc<StreamShared>,
-    fragments: Arc<Fragments>,
+    segments: Arc<Segments>,
     time: Duration,
 ) -> io::Result<(Cursor, Position)> {
     let first = shared.lock().first();
-    let target = Part::Media(schedule::time_target(&fragments, first, time)?);
+    let target = Part::Media(schedule::time_target(&segments, first, time)?);
     let change = {
         let mut schedule = shared.lock();
         if schedule.past_end(target) {
@@ -703,7 +702,7 @@ async fn seek_time(
 
     let mut cursor = Cursor::start(first);
     cursor.place(target, 0, byte_position);
-    let time = schedule::time_at_fragment(&fragments, target, TimeAccuracy::Packet);
+    let time = schedule::time_at_segment(&segments, target, TimeAccuracy::Packet);
     Ok((
         cursor,
         Position {
@@ -713,8 +712,8 @@ async fn seek_time(
     ))
 }
 
-impl FragmentStream {
-    /// The rest of the current fragment, as [`Stream::poll_next`] yields it,
+impl SegmentStream {
+    /// The rest of the current segment, as [`Stream::poll_next`] yields it,
     /// with where it sits.
     pub(crate) fn poll_next_part(
         &mut self,
@@ -729,7 +728,7 @@ impl FragmentStream {
                 return Poll::Ready(None);
             }
 
-            // Wait for the fragment under the cursor.
+            // Wait for the segment under the cursor.
             self.shared.request(part);
             let waited = self.shared.poll_until(cx, |schedule| {
                 !schedule.missing_body(part) || schedule.complete
@@ -737,13 +736,13 @@ impl FragmentStream {
             let found = match ready!(waited) {
                 Ok(mut schedule) => schedule
                     .checked_body(part)
-                    .and_then(|body| Some((body, schedule.fragment(part)?.fragment.clone()))),
+                    .and_then(|body| Some((body, schedule.part_data(part)?.location.clone()))),
                 Err(error) => {
                     self.failed = true;
                     return Poll::Ready(Some(Err(error.into())));
                 }
             };
-            let Some((body, fragment)) = found else {
+            let Some((body, location)) = found else {
                 return Poll::Ready(None);
             };
 
@@ -754,7 +753,7 @@ impl FragmentStream {
                 return Poll::Ready(Some(Ok(PartBody {
                     part,
                     number: part.number(),
-                    fragment,
+                    location,
                     body,
                 })));
             }
@@ -762,16 +761,16 @@ impl FragmentStream {
     }
 
     /// Whether nothing has been read yet: the position is the start of the
-    /// initialization fragment, with no seek under way.
+    /// initialization segment, with no seek under way.
     pub(crate) fn at_start(&self) -> bool {
         self.cursor.part == Part::Init
-            && self.cursor.offset_in_fragment == 0
+            && self.cursor.offset_in_segment == 0
             && self.seeking.is_none()
     }
 
-    /// The representation's whole fragments.
-    pub(crate) fn representation_fragments(&self) -> &Arc<Fragments> {
-        &self.fragments
+    /// The representation's whole segments.
+    pub(crate) fn representation_segments(&self) -> &Arc<Segments> {
+        &self.segments
     }
 
     /// Number of the stream's first media segment in its representation.
@@ -780,10 +779,10 @@ impl FragmentStream {
     }
 }
 
-impl Stream for FragmentStream {
+impl Stream for SegmentStream {
     type Item = Result<Bytes, Error>;
 
-    /// The rest of the current fragment: a whole fragment, unless reading or a
+    /// The rest of the current segment: a whole segment, unless reading or a
     /// byte seek left the position inside one.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.get_mut()
@@ -792,7 +791,7 @@ impl Stream for FragmentStream {
     }
 }
 
-impl AsyncRead for FragmentStream {
+impl AsyncRead for SegmentStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -811,7 +810,7 @@ impl AsyncRead for FragmentStream {
                     .map_ok(drop);
             }
 
-            // Wait for the fragment under the cursor.
+            // Wait for the segment under the cursor.
             this.shared.request(part);
             let waited = this.shared.poll_until(cx, |schedule| {
                 !schedule.missing_body(part) || schedule.complete
@@ -820,7 +819,7 @@ impl AsyncRead for FragmentStream {
                 return Poll::Ready(Ok(()));
             };
 
-            // Copy from it, moving on to the next fragment once it is used up.
+            // Copy from it, moving on to the next segment once it is used up.
             let copied = this.cursor.read(&body, buf.initialize_unfilled());
             buf.advance(copied);
             if this.cursor.part != part {
@@ -833,7 +832,7 @@ impl AsyncRead for FragmentStream {
     }
 }
 
-impl AsyncSeek for FragmentStream {
+impl AsyncSeek for SegmentStream {
     fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
         let this = self.get_mut();
         if this.seeking.is_some() {
@@ -843,7 +842,7 @@ impl AsyncSeek for FragmentStream {
         }
         this.seeking = Some(Box::pin(seek_bytes(
             this.shared.clone(),
-            this.fragments.clone(),
+            this.segments.clone(),
             this.cursor,
             this.length_estimate,
             position,
@@ -865,7 +864,7 @@ impl AsyncSeek for FragmentStream {
     }
 }
 
-impl Drop for FragmentStream {
+impl Drop for SegmentStream {
     fn drop(&mut self) {
         self.shared.cancelled.store(true, Ordering::SeqCst);
         let tasks = std::mem::take(
@@ -886,9 +885,9 @@ impl Drop for FragmentStream {
     }
 }
 
-impl fmt::Debug for FragmentStream {
+impl fmt::Debug for SegmentStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FragmentStream")
+        f.debug_struct("SegmentStream")
             .field("cursor", &self.cursor)
             .field("cache", &self.shared.cache)
             .field("seeking", &self.seeking.is_some())
@@ -899,29 +898,29 @@ impl fmt::Debug for FragmentStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fragment::{Fragment, timed_for_test};
     use crate::nonblocking::tests::{Counts, named, serve, texts};
+    use crate::segment::{SegmentLocation, timed_for_test};
     use futures_util::StreamExt;
     use reqwest::Client;
     use std::sync::atomic::AtomicBool;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    /// The init and five one-second media fragments named "1" to "5" at
+    /// The init and five one-second media segments named "1" to "5" at
     /// `base`, whose bodies are their names.
-    async fn one_second_stream(base: &str, cache: Arc<FragmentCache>) -> FragmentStream {
-        let fragments = timed_for_test(
+    async fn one_second_stream(base: &str, cache: Arc<SegmentCache>) -> SegmentStream {
+        let segments = timed_for_test(
             format!("{base}/init"),
             (1..=5).map(|name| format!("{base}/{name}")),
             1,
             &[1; 5],
         );
-        FragmentStream::new_with_cache(fragments, cache)
+        SegmentStream::new_with_cache(segments, cache)
             .await
             .unwrap()
     }
 
-    fn client_cache() -> Arc<FragmentCache> {
-        Arc::new(FragmentCache::new(Arc::new(Client::new())))
+    fn client_cache() -> Arc<SegmentCache> {
+        Arc::new(SegmentCache::new(Arc::new(Client::new())))
     }
 
     fn requests(counts: &Counts, path: &str) -> usize {
@@ -936,8 +935,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_fragment_fetches_without_moving_the_stream() {
-        // The first request for fragment 3 fails.
+    async fn media_segment_fetches_without_moving_the_stream() {
+        // The first request for segment 3 fails.
         let refused = Arc::new(AtomicBool::new(false));
         let (base, counts) = serve({
             let refused = refused.clone();
@@ -949,25 +948,25 @@ mod tests {
         let stream = one_second_stream(&base, client_cache()).await;
         let mut stream = stream.with_retention(seconds(Some(0), Some(1)));
 
-        // Fetching the last fragment leaves the stream at its start.
-        assert_eq!(stream.media_fragment(4).await.unwrap(), &b"5"[..]);
+        // Fetching the last segment leaves the stream at its start.
+        assert_eq!(stream.media_segment(4).await.unwrap(), &b"5"[..]);
         assert!(matches!(
-            stream.media_fragment(5).await,
+            stream.media_segment(5).await,
             Err(Error::Initialization(_))
         ));
         assert_eq!(stream.next().await.unwrap().unwrap(), &b"init"[..]);
         assert_eq!(stream.next().await.unwrap().unwrap(), &b"1"[..]);
 
         // A failed fetch is this caller's; the stream still downloads it itself.
-        assert!(stream.media_fragment(2).await.is_err());
+        assert!(stream.media_segment(2).await.is_err());
         assert_eq!(texts(&mut stream).await, ["2", "3", "4", "5"]);
         assert_eq!(requests(&counts, "/3"), 2);
-        // Fragment 5 was outside the window, so it was not kept the first time.
+        // Segment 5 was outside the window, so it was not kept the first time.
         assert_eq!(requests(&counts, "/5"), 2);
     }
 
     #[tokio::test]
-    async fn streams_whole_fragments_in_order() {
+    async fn streams_whole_segments_in_order() {
         let (base, _) = serve(named());
         let mut stream = one_second_stream(&base, client_cache()).await;
         assert_eq!(texts(&mut stream).await, ["init", "1", "2", "3", "4", "5"]);
@@ -981,7 +980,7 @@ mod tests {
         stream.read_exact(&mut head).await.unwrap();
         assert_eq!(&head, b"init1");
 
-        // Fragment 1 was read whole, so the next item is fragment 2.
+        // Segment 1 was read whole, so the next item is segment 2.
         assert_eq!(stream.next().await.unwrap().unwrap(), &b"2"[..]);
         let mut rest = Vec::new();
         stream.read_to_end(&mut rest).await.unwrap();
@@ -993,7 +992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seeks_by_time_to_a_fragment_start() {
+    async fn seeks_by_time_to_a_segment_start() {
         let (base, _) = serve(named());
         let mut stream = one_second_stream(&base, client_cache()).await;
         let position = stream.seek_time(Duration::from_secs(2)).await.unwrap();
@@ -1015,19 +1014,20 @@ mod tests {
             ("/short", Some(_)) => (206, b"x".to_vec()),
             _ => (200, FILE.to_vec()),
         });
-        let ranged = |path: &str, range| Fragment::with_range(format!("{base}{path}"), range);
-        let fragments = Fragments::new(
+        let ranged =
+            |path: &str, range| SegmentLocation::with_range(format!("{base}{path}"), range);
+        let segments = Segments::new(
             ranged("/ranged", 0..=3),
             [ranged("/plain", 8..=13), ranged("/ranged", 14..=15)],
         );
-        let mut stream = FragmentStream::new(fragments).await.unwrap();
+        let mut stream = SegmentStream::new(segments).await.unwrap();
         assert_eq!(texts(&mut stream).await, ["INIT", "BBBBBB", "cc"]);
 
-        let short = Fragments::new(ranged("/short", 0..=3), Vec::<Fragment>::new());
-        let short = FragmentStream::new(short).await;
+        let short = Segments::new(ranged("/short", 0..=3), Vec::<SegmentLocation>::new());
+        let short = SegmentStream::new(short).await;
         assert!(matches!(
             short,
-            Err(Error::FragmentLength {
+            Err(Error::SegmentLength {
                 expected: 4,
                 actual: 1,
                 ..
@@ -1065,7 +1065,7 @@ mod tests {
             .with_retention(seconds(None, Some(2)));
         released.store(true, Ordering::SeqCst);
 
-        // Two seconds ahead of the start is fragments 1 and 2, then it waits.
+        // Two seconds ahead of the start is segments 1 and 2, then it waits.
         stream
             .shared
             .wait_until(|schedule| schedule.complete, |_| ())
@@ -1089,10 +1089,14 @@ mod tests {
             .await;
         assert_eq!(first, [&b"init"[..], b"1", b"2"]);
 
-        // At fragment 3, one second behind keeps 2 and lets 1 go.
-        let one = Fragment::new(format!("{base}/1"));
+        // At segment 3, one second behind keeps 2 and lets 1 go.
+        let one = SegmentLocation::new(format!("{base}/1"));
         assert_eq!(cache.cached(&one), None);
-        assert!(cache.cached(&Fragment::new(format!("{base}/2"))).is_some());
+        assert!(
+            cache
+                .cached(&SegmentLocation::new(format!("{base}/2")))
+                .is_some()
+        );
         assert_eq!(cache.known_size(&one), Some(1));
 
         stream.seek_time(Duration::ZERO).await.unwrap();

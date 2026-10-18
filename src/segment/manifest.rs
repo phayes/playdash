@@ -1,15 +1,15 @@
-//! Opening a manifest's representations as blocking [`FragmentStream`]s.
+//! Opening a manifest's representations as blocking [`SegmentStream`]s.
 
-use super::{FragmentCache, FragmentStream};
+use super::{SegmentCache, SegmentStream};
 use crate::error::Error;
 use crate::manifest::DashManifest;
 use std::sync::Arc;
 use std::time::Duration;
 
 impl DashManifest {
-    /// Opens a representation as a [`FragmentStream`]: an iterator of its
-    /// whole fragments, and a progressive [`std::io::Read`] and
-    /// [`std::io::Seek`] view of them. The initialization fragment is fetched
+    /// Opens a representation as a [`SegmentStream`]: an iterator of its
+    /// whole segments, and a progressive [`std::io::Read`] and
+    /// [`std::io::Seek`] view of them. The initialization segment is fetched
     /// before this returns.
     ///
     /// Use [`DashManifest::representations`] to inspect the available choices,
@@ -17,10 +17,10 @@ impl DashManifest {
     /// uses the same full-ID or format-token matching as
     /// [`DashManifest::representation`].
     ///
-    /// Call [`FragmentStream::start_eager_head`] to discover fragment sizes in
+    /// Call [`SegmentStream::start_eager_head`] to discover segment sizes in
     /// the background, which can make byte seeking faster on servers that
     /// support `HEAD`. Timestamp seeking is available through
-    /// [`FragmentStream::seek_time`].
+    /// [`SegmentStream::seek_time`].
     ///
     /// # Examples
     ///
@@ -42,38 +42,38 @@ impl DashManifest {
     ///     .representations()
     ///     .find(|representation| representation.bandwidth.is_some())
     ///     .expect("manifest has no streamable representation");
-    /// let stream = manifest.fragment_stream(representation.id)?;
+    /// let stream = manifest.segment_stream(representation.id)?;
     /// stream.start_eager_head();
     /// # Ok(())
     /// # }
     /// ```
-    pub fn fragment_stream(
+    pub fn segment_stream(
         &self,
         representation_id: impl AsRef<str>,
-    ) -> Result<FragmentStream, Error> {
-        FragmentStream::new(self.fragments(representation_id)?)
+    ) -> Result<SegmentStream, Error> {
+        SegmentStream::new(self.segments(representation_id)?)
     }
 
-    /// Like [`DashManifest::fragment_stream`], but fetches through `cache`.
+    /// Like [`DashManifest::segment_stream`], but fetches through `cache`.
     ///
-    /// Pass clones of one [`FragmentCache`] to share pooled connections and
-    /// downloaded fragments between streams, such as a stream rebuilt after a
+    /// Pass clones of one [`SegmentCache`] to share pooled connections and
+    /// downloaded segments between streams, such as a stream rebuilt after a
     /// seek.
-    pub fn fragment_stream_with_cache(
+    pub fn segment_stream_with_cache(
         &self,
         representation_id: impl AsRef<str>,
-        cache: Arc<FragmentCache>,
-    ) -> Result<FragmentStream, Error> {
-        FragmentStream::new_with_cache(self.fragments(representation_id)?, cache)
+        cache: Arc<SegmentCache>,
+    ) -> Result<SegmentStream, Error> {
+        SegmentStream::new_with_cache(self.segments(representation_id)?, cache)
     }
 
-    /// Opens a representation as a [`FragmentStream`] that reads its
-    /// initialization fragment, then its media from the fragment covering
+    /// Opens a representation as a [`SegmentStream`] that reads its
+    /// initialization segment, then its media from the segment covering
     /// `time`, as a decoder starting there needs. Returns the stream and the
-    /// start of that fragment, at or before `time`.
+    /// start of that segment, at or before `time`.
     ///
     /// The stream reports and seeks by the representation's media time. See
-    /// [`FragmentStream::starting_at`].
+    /// [`SegmentStream::starting_at`].
     ///
     /// # Examples
     ///
@@ -83,27 +83,27 @@ impl DashManifest {
     ///
     /// # fn example() -> Result<(), playdash::Error> {
     /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd")?;
-    /// let (stream, start) = manifest.fragment_stream_at("video", Duration::from_secs(90))?;
+    /// let (stream, start) = manifest.segment_stream_at("video", Duration::from_secs(90))?;
     /// // Decoding begins at `start`; skip what comes before 90 seconds.
     /// # drop((stream, start));
     /// # Ok(())
     /// # }
     /// ```
-    pub fn fragment_stream_at(
+    pub fn segment_stream_at(
         &self,
         representation_id: impl AsRef<str>,
         time: Duration,
-    ) -> Result<(FragmentStream, Duration), Error> {
-        self.fragment_stream_at_with_cache(representation_id, time, Arc::default())
+    ) -> Result<(SegmentStream, Duration), Error> {
+        self.segment_stream_at_with_cache(representation_id, time, Arc::default())
     }
 
-    /// Like [`DashManifest::fragment_stream_at`], but fetches through `cache`.
-    pub fn fragment_stream_at_with_cache(
+    /// Like [`DashManifest::segment_stream_at`], but fetches through `cache`.
+    pub fn segment_stream_at_with_cache(
         &self,
         representation_id: impl AsRef<str>,
         time: Duration,
-        cache: Arc<FragmentCache>,
-    ) -> Result<(FragmentStream, Duration), Error> {
-        FragmentStream::starting_at(self.fragments(representation_id)?, time, cache)
+        cache: Arc<SegmentCache>,
+    ) -> Result<(SegmentStream, Duration), Error> {
+        SegmentStream::starting_at(self.segments(representation_id)?, time, cache)
     }
 }

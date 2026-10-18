@@ -38,7 +38,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             .to_owned(),
     };
 
-    let mut packets = PacketStream::new(manifest.fragment_stream(&id)?)?;
+    let mut packets = PacketStream::new(manifest.segment_stream(&id)?)?;
     println!("representation {id}, track {}", packets.track_id());
     println!("codec {:?}", packets.codec());
     println!(

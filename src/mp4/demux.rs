@@ -1,5 +1,5 @@
 //! The demuxer behind both `PacketStream`s: one track's packets from its initialization
-//! and media fragments, and where a time seek lands. Nothing here does I/O.
+//! and media segments, and where a time seek lands. Nothing here does I/O.
 
 use super::codec::{self, Codec};
 use super::fragment;
@@ -7,7 +7,7 @@ use super::init::{self, RollGroups, SampleEntry, TrackDefaults};
 use super::packet::{Packet, PacketSeeked, duration_to_ticks, ticks_to_duration};
 use super::reader::ParseError;
 use crate::error::Error;
-use crate::fragment::{Fragment, Fragments, SegmentNumber};
+use crate::segment::{SegmentLocation, SegmentNumber, Segments};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::io;
@@ -24,20 +24,20 @@ pub(crate) struct Entry {
     leading: bool,
 }
 
-/// The packets of one media fragment, in decode order.
+/// The packets of one media segment, in decode order.
 #[derive(Debug)]
 pub(crate) struct Loaded {
-    /// The fragment's number among the representation's media fragments.
+    /// The segment's number among the representation's media segments.
     number: SegmentNumber,
     entries: Vec<Entry>,
-    /// Pre-roll in samples that the fragment's own `roll` or `prol` group signals.
+    /// Pre-roll in samples that the segment's own `roll` or `prol` group signals.
     roll: Option<u32>,
-    /// Decode time just past the fragment's last sample, in media ticks.
+    /// Decode time just past the segment's last sample, in media ticks.
     end_decode_time: Option<u64>,
 }
 
 impl Loaded {
-    /// The fragment's number among the representation's media fragments.
+    /// The segment's number among the representation's media segments.
     pub(crate) fn number(&self) -> SegmentNumber {
         self.number
     }
@@ -55,18 +55,18 @@ pub(crate) enum Landing {
 /// A seek's next step.
 #[derive(Debug)]
 pub(crate) enum Split {
-    /// The fragment before the earliest one loaded: none has a sync sample early
+    /// The segment before the earliest one loaded: none has a sync sample early
     /// enough to start decoding at.
     Earlier,
-    /// The fragment after the last one loaded: none of their packets presents at or after
-    /// the time to land at, as when a timeline that only approximates fragment boundaries
-    /// puts the time in a fragment ending before it.
+    /// The segment after the last one loaded: none of their packets presents at or after
+    /// the time to land at, as when a timeline that only approximates segment boundaries
+    /// puts the time in a segment ending before it.
     Later,
     /// The seek is done.
     Done(PacketSeeked),
 }
 
-/// One track's packets from its fragments, in decode order.
+/// One track's packets from its segments, in decode order.
 #[derive(Debug)]
 pub(crate) struct Demuxer {
     track_id: u32,
@@ -78,15 +78,15 @@ pub(crate) struct Demuxer {
     entries: Vec<SampleEntry>,
     /// The 1-based index of the entry `codec` describes.
     description_index: u32,
-    /// Every track's `trex` defaults, which lay out fragments.
+    /// Every track's `trex` defaults, which lay out movie fragments.
     defaults: Vec<(u32, TrackDefaults)>,
     /// `trex` default sample duration, in media ticks.
     sample_duration: u32,
     /// Pre-roll in samples that the initialization's `roll` or `prol` group signals.
     init_roll: Option<u32>,
-    /// The representation's fragments, which place media fragments in time when
+    /// The representation's segments, which place media segments in time when
     /// timed.
-    fragments: Option<Arc<Fragments>>,
+    segments: Option<Arc<Segments>>,
     /// Media time of presentation time zero, in media ticks: the edit-list
     /// start, the presentation time offset, less the period start.
     shift: i64,
@@ -95,7 +95,7 @@ pub(crate) struct Demuxer {
     /// Pre-roll set by the caller, overriding what the media signals.
     preroll: Option<Duration>,
     queue: VecDeque<Entry>,
-    /// The next media fragment's number and decode time, for one without `tfdt`.
+    /// The next media segment's number and decode time, for one without `tfdt`.
     next_decode: Option<(SegmentNumber, u64)>,
     /// After a seek to a sync sample at this presentation time, leading samples
     /// before it are dropped until the next sync sample.
@@ -105,24 +105,24 @@ pub(crate) struct Demuxer {
 }
 
 impl Demuxer {
-    /// A demuxer of track `track_id` of `init`, the body of `init_fragment`, or of its
-    /// only track without one. `fragments`, when timed, place its media fragments in
+    /// A demuxer of track `track_id` of `init`, the body of `init_location`, or of its
+    /// only track without one. `segments`, when timed, place its media segments in
     /// time.
     pub(crate) fn new(
         init: Bytes,
-        init_fragment: &Fragment,
-        fragments: Option<Arc<Fragments>>,
+        init_location: &SegmentLocation,
+        segments: Option<Arc<Segments>>,
         track_id: Option<u32>,
     ) -> Result<Self, Error> {
-        let error = |error| media_error(init_fragment, error);
+        let error = |error| media_error(init_location, error);
         let parsed = init::parse(&init).map_err(error)?;
         let track = match (track_id, &parsed.tracks[..]) {
             (None, [track]) => track,
             (None, tracks) => {
                 return Err(Error::UnsupportedMedia {
-                    fragment: init_fragment.to_string(),
+                    segment: init_location.to_string(),
                     reason: format!(
-                        "{} tracks; choose one from FragmentStream::tracks with \
+                        "{} tracks; choose one from SegmentStream::tracks with \
                          PacketStream::with_track",
                         tracks.len()
                     ),
@@ -130,17 +130,17 @@ impl Demuxer {
             }
             (Some(id), tracks) => tracks.iter().find(|track| track.id == id).ok_or_else(|| {
                 Error::Initialization(format!(
-                    "{init_fragment} has no track {id}; it has {:?}",
+                    "{init_location} has no track {id}; it has {:?}",
                     tracks.iter().map(|track| track.id).collect::<Vec<_>>()
                 ))
             })?,
         };
 
-        // The sample description fragments use unless they say otherwise.
+        // The sample description movie fragments use unless they say otherwise.
         let description_index = default_description_index(track);
         let entry = description(&track.entries, description_index).map_err(error)?;
         if entry.is_encrypted() {
-            return Err(encrypted(init_fragment));
+            return Err(encrypted(init_location));
         }
         let codec = codec::codec(&init, track, &entry).map_err(error)?;
 
@@ -158,9 +158,9 @@ impl Demuxer {
             }
         };
         // The presentation time offset presents at the period start.
-        let origin = fragments
+        let origin = segments
             .as_ref()
-            .and_then(|fragments| fragments.timing())
+            .and_then(|segments| segments.timing())
             .map_or(0, |timing| {
                 let offset = rescale(
                     timing.presentation_time_offset,
@@ -202,7 +202,7 @@ impl Demuxer {
                 .collect(),
             sample_duration: track.defaults.sample_duration,
             init_roll: track.roll.as_ref().filter(|_| audio).and_then(roll_samples),
-            fragments,
+            segments,
             shift,
             end,
             preroll: None,
@@ -246,20 +246,20 @@ impl Demuxer {
         }
     }
 
-    /// Parses the representation's media fragment numbered `number`, the body of
-    /// `fragment`.
+    /// Parses the representation's media segment numbered `number`, the body of
+    /// `location`.
     pub(crate) fn load(
         &mut self,
         number: SegmentNumber,
         body: &Bytes,
-        fragment: &Fragment,
+        location: &SegmentLocation,
     ) -> Result<Loaded, Error> {
-        let body_start = fragment.range.as_ref().map_or(0, |range| *range.start());
+        let body_start = location.range.as_ref().map_or(0, |range| *range.start());
         let trafs = fragment::parse(body, body_start, &self.defaults)
-            .map_err(|error| media_error(fragment, error))?;
+            .map_err(|error| media_error(location, error))?;
 
-        // A fragment without `tfdt` continues from the one before, or starts where
-        // the timeline says.
+        // A track fragment without `tfdt` continues from the one before, even in the
+        // segment before, or starts where the timeline says.
         let mut decode_time = match self.next_decode {
             Some((next, time)) if next == number => Some(time),
             _ => None,
@@ -275,7 +275,7 @@ impl Demuxer {
                 roll = roll_samples(groups).filter(|_| self.audio);
             }
             for sample in &traf.samples {
-                self.check_description(sample.description_index, fragment)?;
+                self.check_description(sample.description_index, location)?;
                 entries.push(self.entry(start, sample, body));
             }
             let duration: u64 = traf
@@ -294,7 +294,7 @@ impl Demuxer {
         })
     }
 
-    /// Queues the packets of `loaded`, the fragment after the last one queued.
+    /// Queues the packets of `loaded`, the segment after the last one queued.
     pub(crate) fn push(&mut self, loaded: Loaded) {
         for entry in loaded.entries {
             self.enqueue(entry);
@@ -306,27 +306,27 @@ impl Demuxer {
         self.queue.pop_front().map(|entry| entry.packet)
     }
 
-    /// The media fragments a seek to `time` loads first: from where decoding may
+    /// The media segments a seek to `time` loads first: from where decoding may
     /// have to start, to the one containing `time`.
     pub(crate) fn seek_range(&self, time: Duration) -> io::Result<RangeInclusive<SegmentNumber>> {
         let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, reason);
-        let fragments = self
-            .fragments
+        let segments = self
+            .segments
             .as_ref()
-            .filter(|fragments| fragments.timing().is_some())
+            .filter(|segments| segments.timing().is_some())
             .ok_or_else(|| invalid("MPEG stream has no media timeline"))?;
-        let fragment_at = |time| {
-            fragments
+        let segment_at = |time| {
+            segments
                 .number_at(time)
-                .ok_or_else(|| invalid("MPEG stream has no media fragments"))
+                .ok_or_else(|| invalid("MPEG stream has no media segments"))
         };
-        Ok(fragment_at(time.saturating_sub(self.preroll()))?..=fragment_at(time)?)
+        Ok(segment_at(time.saturating_sub(self.preroll()))?..=segment_at(time)?)
     }
 
-    /// Completes a seek to `time` from `loaded`, consecutive fragments ending with the
-    /// one containing `time`, landing as `landing` says. Asks for the fragment before
+    /// Completes a seek to `time` from `loaded`, consecutive segments ending with the
+    /// one containing `time`, landing as `landing` says. Asks for the segment before
     /// them when none has a sync sample early enough, unless `at_first`: they start at the
-    /// stream's first. Asks for the fragment after them when none of their packets
+    /// stream's first. Asks for the segment after them when none of their packets
     /// presents at or after the time to land at, unless `at_last`: they end at the
     /// stream's last.
     /// When done, the queue holds the packets from where the seek landed.
@@ -506,19 +506,19 @@ impl Demuxer {
     }
 
     /// Checks that samples described by `index` are of the codec this demuxer reports.
-    fn check_description(&self, index: u32, fragment: &Fragment) -> Result<(), Error> {
+    fn check_description(&self, index: u32, location: &SegmentLocation) -> Result<(), Error> {
         if index == self.description_index {
             return Ok(());
         }
-        let error = |error| media_error(fragment, error);
+        let error = |error| media_error(location, error);
         let entry = description(&self.entries, index).map_err(error)?;
         let main = description(&self.entries, self.description_index).map_err(error)?;
         if entry.is_encrypted() {
-            return Err(encrypted(fragment));
+            return Err(encrypted(location));
         }
         if entry.format(&self.init).map_err(error)? != main.format(&self.init).map_err(error)? {
             return Err(Error::UnsupportedMedia {
-                fragment: fragment.to_string(),
+                segment: location.to_string(),
                 reason: "samples change codec between sample descriptions".to_owned(),
             });
         }
@@ -526,7 +526,7 @@ impl Demuxer {
     }
 
     /// Pre-roll in ticks for a seek landing in `target`: the caller's, else the
-    /// fragment's or initialization's roll group, else the codec's default.
+    /// segment's or initialization's roll group, else the codec's default.
     fn preroll_ticks(&self, target: &Loaded) -> i64 {
         if let Some(preroll) = self.preroll {
             return duration_to_ticks(preroll, self.timescale);
@@ -544,26 +544,26 @@ impl Demuxer {
         }
     }
 
-    /// The presentation time at which the media fragment numbered `number`
+    /// The presentation time at which the media segment numbered `number`
     /// starts.
-    fn fragment_start(&self, number: SegmentNumber) -> Duration {
-        self.fragments
+    fn segment_start(&self, number: SegmentNumber) -> Duration {
+        self.segments
             .as_ref()
-            .and_then(|fragments| fragments.span_of(number))
+            .and_then(|segments| segments.span_of(number))
             .map(|span| span.start)
             .unwrap_or_default()
     }
 
-    /// The decode time the timeline puts the media fragment numbered `number`
-    /// at, for a fragment without `tfdt`.
+    /// The decode time the timeline puts the media segment numbered `number`
+    /// at, for a track fragment without `tfdt`.
     fn timeline_decode_time(&self, number: SegmentNumber) -> u64 {
-        let start = duration_to_ticks(self.fragment_start(number), self.timescale);
+        let start = duration_to_ticks(self.segment_start(number), self.timescale);
         u64::try_from(start + self.shift).unwrap_or(0)
     }
 }
 
-/// The 1-based index of the sample description `track`'s fragments use unless they
-/// say otherwise.
+/// The 1-based index of the sample description `track`'s movie fragments use unless
+/// they say otherwise.
 pub(crate) fn default_description_index(track: &init::Track) -> u32 {
     track.defaults.sample_description_index.max(1)
 }
@@ -629,19 +629,19 @@ fn is_rasl(sample: &[u8], length_size: usize) -> bool {
     false
 }
 
-/// `error`, from parsing the body of `fragment`, as a public error.
-pub(crate) fn media_error(fragment: &Fragment, error: ParseError) -> Error {
-    let fragment = fragment.to_string();
+/// `error`, from parsing the body of `location`, as a public error.
+pub(crate) fn media_error(location: &SegmentLocation, error: ParseError) -> Error {
+    let segment = location.to_string();
     match error {
-        ParseError::Malformed(reason) => Error::MalformedMedia { fragment, reason },
-        ParseError::Unsupported(reason) => Error::UnsupportedMedia { fragment, reason },
+        ParseError::Malformed(reason) => Error::MalformedMedia { segment, reason },
+        ParseError::Unsupported(reason) => Error::UnsupportedMedia { segment, reason },
     }
 }
 
-fn encrypted(fragment: &Fragment) -> Error {
+fn encrypted(location: &SegmentLocation) -> Error {
     Error::UnsupportedMedia {
-        fragment: fragment.to_string(),
-        reason: "samples are encrypted; read them through a FragmentCache with content keys"
+        segment: location.to_string(),
+        reason: "samples are encrypted; read them through a SegmentCache with content keys"
             .to_owned(),
     }
 }
@@ -649,9 +649,9 @@ fn encrypted(fragment: &Fragment) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fragment::{MediaSegment, MediaTiming, timed_for_test};
-    use crate::mp4::fragment::tests::{RunSample, segment_from};
+    use crate::mp4::fragment::tests::{RunSample, movie_fragment_from};
     use crate::mp4::init::tests::{SOUND, TrackSpec, audio_entry, bx, full, init, video_entry};
+    use crate::segment::{MediaSegment, MediaTiming, timed_for_test};
     use std::num::NonZeroU32;
 
     const SYNC: u32 = 0x0200_0000;
@@ -696,8 +696,8 @@ mod tests {
         }]))
     }
 
-    /// Media fragments lasting `durations` in milliseconds, back to back from zero.
-    fn timeline(durations: &[u64]) -> Arc<Fragments> {
+    /// Media segments lasting `durations` in milliseconds, back to back from zero.
+    fn timeline(durations: &[u64]) -> Arc<Segments> {
         let media = (0..durations.len()).map(|index| format!("{index}"));
         Arc::new(timed_for_test("init", media, 1000, durations))
     }
@@ -705,7 +705,7 @@ mod tests {
     fn demuxer(init: Bytes, durations: &[u64]) -> Demuxer {
         Demuxer::new(
             init,
-            &Fragment::new("init"),
+            &SegmentLocation::new("init"),
             Some(timeline(durations)),
             None,
         )
@@ -729,8 +729,8 @@ mod tests {
             .collect()
     }
 
-    /// Media fragment `index` holding `samples` from `decode_time`, its bytes counting
-    /// up from `first_byte`.
+    /// Media segment `index`, one movie fragment holding `samples` from `decode_time`,
+    /// its bytes counting up from `first_byte`.
     fn load(
         demuxer: &mut Demuxer,
         index: usize,
@@ -739,14 +739,18 @@ mod tests {
         first_byte: u8,
     ) -> Loaded {
         let data: Vec<u8> = (0..samples.len() as u8).map(|n| first_byte + n).collect();
-        let body = Bytes::from(segment_from(1, decode_time, samples, &[], &data));
+        let body = Bytes::from(movie_fragment_from(1, decode_time, samples, &[], &data));
         let number = SegmentNumber(index as u64);
         demuxer
-            .load(number, &body, &Fragment::new(format!("media{index}")))
+            .load(
+                number,
+                &body,
+                &SegmentLocation::new(format!("media{index}")),
+            )
             .unwrap()
     }
 
-    /// The media fragments numbered `range`.
+    /// The media segments numbered `range`.
     fn numbers(range: RangeInclusive<u64>) -> RangeInclusive<SegmentNumber> {
         SegmentNumber(*range.start())..=SegmentNumber(*range.end())
     }
@@ -762,14 +766,14 @@ mod tests {
     fn done(split: Split) -> PacketSeeked {
         match split {
             Split::Done(seeked) => seeked,
-            Split::Earlier => panic!("seek wanted an earlier fragment"),
-            Split::Later => panic!("seek wanted a later fragment"),
+            Split::Earlier => panic!("seek wanted an earlier segment"),
+            Split::Later => panic!("seek wanted a later segment"),
         }
     }
 
     #[test]
     fn edit_list_priming_becomes_negative_pts_and_trims() {
-        // A ten-tick priming packet: the first fragment presents 30 ticks.
+        // A ten-tick priming packet: the first segment presents 30 ticks.
         let mut demuxer = demuxer(one_track(b"soun", Some(10), &[]), &[30, 40]);
         let first = load(&mut demuxer, 0, Some(0), &audio_samples(4), 0);
         demuxer.push(first);
@@ -791,20 +795,20 @@ mod tests {
         assert_eq!(data, [0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
-    /// One 20-tick fragment at media time 450 of a 500 Hz timeline, in a period
+    /// One 20-tick segment at media time 450 of a 500 Hz timeline, in a period
     /// starting at `period_start` whose presentation time offset is 450.
-    fn offset_timeline(period_start: Duration) -> Arc<Fragments> {
+    fn offset_timeline(period_start: Duration) -> Arc<Segments> {
         let timing = MediaTiming {
             timescale: NonZeroU32::new(500).unwrap(),
             presentation_time_offset: 450,
             period_start,
         };
         let segment = MediaSegment {
-            fragment: Fragment::new("0"),
+            location: SegmentLocation::new("0"),
             start: 450,
             duration: 20,
         };
-        Arc::new(Fragments::timed("init", timing, [segment]).unwrap())
+        Arc::new(Segments::timed("init", timing, [segment]).unwrap())
     }
 
     #[test]
@@ -814,7 +818,7 @@ mod tests {
             let timeline = offset_timeline(Duration::from_secs(period_start));
             let mut demuxer = Demuxer::new(
                 one_track(b"soun", None, &[]),
-                &Fragment::new("init"),
+                &SegmentLocation::new("init"),
                 Some(timeline.clone()),
                 None,
             )
@@ -823,7 +827,7 @@ mod tests {
             demuxer.push(loaded);
             assert_eq!(pts(drain(&mut demuxer)), [first_pts, first_pts + 10]);
 
-            // Packets present when the fragments say they do.
+            // Packets present when the segments say they do.
             let start = timeline.span(0).unwrap().start;
             assert_eq!(start, Duration::from_millis(first_pts as u64));
         }
@@ -862,7 +866,7 @@ mod tests {
         assert_eq!(pts(seeked.preroll), [30]);
         assert_eq!(pts(drain(&mut demuxer)), [40, 50, 60, 70]);
 
-        // The next fragment carries on from there.
+        // The next segment carries on from there.
         let next = load(&mut demuxer, 2, None, &audio_samples(1), 8);
         demuxer.push(next);
         assert_eq!(pts(drain(&mut demuxer)), [80]);
@@ -948,7 +952,7 @@ mod tests {
     #[test]
     fn video_seeks_step_back_to_an_earlier_keyframe() {
         let mut demuxer = demuxer(one_track(b"vide", Some(20), &[]), &[70, 70]);
-        // The second fragment has no sync sample.
+        // The second segment has no sync sample.
         let mut open = gop();
         open[0].flags = Some(NON_SYNC);
         let second = load(&mut demuxer, 1, Some(70), &open, 7);
@@ -980,8 +984,8 @@ mod tests {
     }
 
     #[test]
-    fn seeks_past_the_named_fragments_end_move_on_to_the_next() {
-        // The timeline says 70 ticks a fragment, but the first holds only 60.
+    fn seeks_past_the_named_segments_end_move_on_to_the_next() {
+        // The timeline says 70 ticks a segment, but the first holds only 60.
         let mut demuxer = demuxer(one_track(b"vide", Some(20), &[]), &[70, 70]);
         let short = video_samples(&[(SYNC, 20), (NON_SYNC, 20), (NON_SYNC, 20)]);
         let first = load(&mut demuxer, 0, Some(0), &short, 0);
@@ -993,7 +997,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 10, 20]
         );
-        // 30 is in the first fragment by the timeline, but after its last packet.
+        // 30 is in the first segment by the timeline, but after its last packet.
         let time = Duration::from_millis(30);
         assert!(matches!(
             demuxer.seek(
@@ -1006,7 +1010,7 @@ mod tests {
             Split::Later
         ));
 
-        // With the next fragment, decoding starts at its keyframe, where the stream lands.
+        // With the next segment, decoding starts at its keyframe, where the stream lands.
         let second = load(&mut demuxer, 1, Some(30), &gop(), 3);
         let loaded = [first, second];
         let seeked = done(demuxer.seek(time, Landing::Exact, &loaded, true, false));
@@ -1130,7 +1134,7 @@ mod tests {
             entries: &entries,
             ..SOUND
         }]));
-        let demuxer = Demuxer::new(aac, &Fragment::new("init"), None, None).unwrap();
+        let demuxer = Demuxer::new(aac, &SegmentLocation::new("init"), None, None).unwrap();
         assert!(matches!(demuxer.codec(), Codec::Aac(_)));
         assert_eq!(demuxer.preroll(), Duration::from_secs(1024) / 44_100);
     }
@@ -1164,29 +1168,29 @@ mod tests {
                 ..SOUND
             },
         ]));
-        let init_fragment = Fragment::new("init");
+        let init_location = SegmentLocation::new("init");
         assert!(matches!(
-            Demuxer::new(two.clone(), &init_fragment, None, None),
+            Demuxer::new(two.clone(), &init_location, None, None),
             Err(Error::UnsupportedMedia { reason, .. }) if reason.contains("2 tracks")
         ));
         assert!(matches!(
-            Demuxer::new(two.clone(), &init_fragment, None, Some(3)),
+            Demuxer::new(two.clone(), &init_location, None, Some(3)),
             Err(Error::Initialization(reason)) if reason.contains("[1, 2]")
         ));
 
-        // A fragment holding both tracks: each demuxer takes only its own.
+        // A segment of one movie fragment per track: each demuxer takes only its own.
         let both = [
-            segment_from(1, Some(0), &audio_samples(2), &[], &[1, 2]),
-            segment_from(2, Some(0), &audio_samples(1), &[], &[3]),
+            movie_fragment_from(1, Some(0), &audio_samples(2), &[], &[1, 2]),
+            movie_fragment_from(2, Some(0), &audio_samples(1), &[], &[3]),
         ]
         .concat();
         let body = Bytes::from(both);
         for (track_id, expected) in [(1, vec![(0, 1), (10, 2)]), (2, vec![(0, 3)])] {
             let mut demuxer =
-                Demuxer::new(two.clone(), &init_fragment, None, Some(track_id)).unwrap();
+                Demuxer::new(two.clone(), &init_location, None, Some(track_id)).unwrap();
             assert_eq!(demuxer.track_id(), track_id);
             let loaded = demuxer
-                .load(SegmentNumber(0), &body, &Fragment::new("media0"))
+                .load(SegmentNumber(0), &body, &SegmentLocation::new("media0"))
                 .unwrap();
             demuxer.push(loaded);
             let packets: Vec<(i64, u8)> = drain(&mut demuxer)
@@ -1206,7 +1210,7 @@ mod tests {
             ..SOUND
         }]));
         assert!(matches!(
-            Demuxer::new(protected, &Fragment::new("init"), None, None),
+            Demuxer::new(protected, &SegmentLocation::new("init"), None, None),
             Err(Error::UnsupportedMedia { reason, .. }) if reason.contains("encrypted")
         ));
     }
@@ -1215,7 +1219,7 @@ mod tests {
     fn seeking_needs_a_timeline() {
         let demuxer = Demuxer::new(
             one_track(b"soun", None, &[]),
-            &Fragment::new("init"),
+            &SegmentLocation::new("init"),
             None,
             None,
         )

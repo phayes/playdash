@@ -1,6 +1,6 @@
-//! Errors returned by DASH parsing and fragment streaming.
+//! Errors returned by DASH parsing and segment streaming.
 
-/// Errors that can occur when parsing a DASH manifest or streaming fragments.
+/// Errors that can occur when parsing a DASH manifest or streaming segments.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Manifest was not a base64-encoded `data:` URL
@@ -91,16 +91,16 @@ pub enum Error {
     InvalidByteRange(String),
 
     /// Media segments from a manifest or passed to
-    /// [`Fragments::timed`](crate::fragment::Fragments::timed) had a zero duration, or
+    /// [`Segments::timed`](crate::segment::Segments::timed) had a zero duration, or
     /// started before the previous segment ended
     #[error("Invalid segment timing: {0}")]
     InvalidSegmentTiming(String),
 
-    /// A ranged fragment's body did not match the length of its range
-    #[error("Fragment {fragment} returned {actual} bytes, expected {expected}")]
-    FragmentLength {
-        /// The fragment URL and range
-        fragment: String,
+    /// A ranged segment's body did not match the length of its range
+    #[error("Segment {segment} returned {actual} bytes, expected {expected}")]
+    SegmentLength {
+        /// The segment URL and range
+        segment: String,
         /// Bytes covered by the range
         expected: u64,
         /// Bytes received
@@ -112,43 +112,43 @@ pub enum Error {
     #[error("Initialization error: {0}")]
     Initialization(String),
 
-    /// IO error while reading a media fragment body
+    /// IO error while reading a media segment body
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// HTTP request for a media fragment failed
+    /// HTTP request for a segment failed
     #[cfg(feature = "sync")]
-    #[error("Fetching fragment failed: {0}")]
-    FragmentFetch(#[from] ureq::Error),
+    #[error("Fetching segment failed: {0}")]
+    SegmentFetch(#[from] ureq::Error),
 
-    /// HTTP request for a media fragment failed
+    /// HTTP request for a segment failed
     #[cfg(feature = "async")]
-    #[error("Fragment {fragment} request failed: {source}")]
-    FragmentRequest {
-        /// The fragment URL and range
-        fragment: String,
+    #[error("Segment {segment} request failed: {source}")]
+    SegmentRequest {
+        /// The segment URL and range
+        segment: String,
         /// Why the request failed
         #[source]
         source: reqwest::Error,
     },
 
-    /// A fragment's MP4 boxes are truncated or inconsistent
+    /// A segment's MP4 boxes are truncated or inconsistent
     #[cfg(any(feature = "sync", feature = "async"))]
-    #[error("Fragment {fragment} has malformed MP4 boxes: {reason}")]
+    #[error("Segment {segment} has malformed MP4 boxes: {reason}")]
     MalformedMedia {
-        /// The fragment URL and range
-        fragment: String,
+        /// The segment URL and range
+        segment: String,
         /// What is malformed
         reason: String,
     },
 
-    /// A fragment uses MP4 features a [`PacketStream`](crate::packet::PacketStream) does not read, such as
+    /// A segment uses MP4 features a [`PacketStream`](crate::packet::PacketStream) does not read, such as
     /// several tracks or samples still encrypted
     #[cfg(any(feature = "sync", feature = "async"))]
-    #[error("Fragment {fragment} uses unsupported MP4 features: {reason}")]
+    #[error("Segment {segment} uses unsupported MP4 features: {reason}")]
     UnsupportedMedia {
-        /// The fragment URL and range
-        fragment: String,
+        /// The segment URL and range
+        segment: String,
         /// What is unsupported
         reason: String,
     },
@@ -199,22 +199,22 @@ pub enum Error {
     #[error("No content key for KID {0}")]
     MissingContentKey(String),
 
-    /// A fragment uses Common Encryption features this crate does not decrypt
+    /// A segment uses Common Encryption features this crate does not decrypt
     #[cfg(feature = "encryption")]
-    #[error("Fragment {fragment} uses unsupported content protection: {reason}")]
+    #[error("Segment {segment} uses unsupported content protection: {reason}")]
     UnsupportedProtection {
-        /// The fragment URL and range
-        fragment: String,
+        /// The segment URL and range
+        segment: String,
         /// What is unsupported
         reason: String,
     },
 
-    /// A fragment's Common Encryption boxes are truncated or inconsistent
+    /// A segment's Common Encryption boxes are truncated or inconsistent
     #[cfg(feature = "encryption")]
-    #[error("Fragment {fragment} has malformed content protection: {reason}")]
+    #[error("Segment {segment} has malformed content protection: {reason}")]
     MalformedProtection {
-        /// The fragment URL and range
-        fragment: String,
+        /// The segment URL and range
+        segment: String,
         /// What is malformed
         reason: String,
     },

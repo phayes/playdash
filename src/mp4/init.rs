@@ -25,7 +25,7 @@ pub(crate) struct Track {
     pub(crate) timescale: u32,
     /// `elst` entries, in order. Empty without an edit list.
     pub(crate) edits: Vec<Edit>,
-    /// `stsd` sample entries; fragments pick one by 1-based index.
+    /// `stsd` sample entries; movie fragments pick one by 1-based index.
     pub(crate) entries: Vec<SampleEntry>,
     pub(crate) defaults: TrackDefaults,
     /// `roll` or `prol` sample group descriptions from `stbl`.
@@ -126,7 +126,7 @@ pub(crate) fn parse(buf: &[u8]) -> Result<Init, ParseError> {
     mvhd.skip(if version == 1 { 16 } else { 8 })?;
     let movie_timescale = mvhd.u32()?;
 
-    // Fragment defaults and the overall duration.
+    // Track fragment defaults and the overall duration.
     let mut defaults = Vec::new();
     let mut fragment_duration = None;
     if let Some(mvex) = find(moov.children(buf), b"mvex")? {

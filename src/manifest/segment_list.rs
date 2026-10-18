@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use crate::vendor::dash_mpd_core::{SegmentList, SegmentURL};
 
-use super::segments::{Addressing, SegmentUrls, Segments, Timing, initialization_fragment};
+use super::segments::{Addressing, SegmentTimes, SegmentUrls, Timing, initialization_location};
 use crate::error::Error;
-use crate::fragment::{Fragment, parse_byte_range};
+use crate::segment::{SegmentLocation, parse_byte_range};
 
 /// `SegmentList` elements a representation inherits from, most specific first
 /// (Representation, AdaptationSet, Period).
@@ -42,14 +42,14 @@ impl<'a> ListChain<'a> {
     ///
     /// The list length bounds the timing, so `@duration` lists need no Period
     /// duration. Segments past the end of the Period are dropped.
-    pub fn segments(self, period_duration: Option<Duration>) -> Result<Segments, Error> {
+    pub fn segment_times(self, period_duration: Option<Duration>) -> Result<SegmentTimes, Error> {
         let count = self.segment_urls().len() as u64;
         if count == 0 {
             return Err(Error::DashManifestInvalidSegments(
                 "SegmentList has no SegmentURL elements".to_owned(),
             ));
         }
-        let segments = Timing {
+        let times = Timing {
             timescale: self.get(|list| list.timescale),
             start_number: None,
             end_number: Some(count),
@@ -64,32 +64,32 @@ impl<'a> ListChain<'a> {
                         .map(|duration| Addressing::Duration(duration as f64)))
             }),
         }
-        .segments(period_duration)?;
+        .segment_times(period_duration)?;
 
         #[cfg(feature = "log")]
-        if (segments.segments.len() as u64) < count {
+        if (times.segments.len() as u64) < count {
             log::warn!(
                 "SegmentList timing covers {} of {count} SegmentURL elements; ignoring the rest",
-                segments.segments.len()
+                times.segments.len()
             );
         }
-        Ok(segments)
+        Ok(times)
     }
 
-    /// Initialization fragment and one media fragment per timed segment, with
-    /// unresolved URLs. A missing `@media` means the BaseURL itself.
-    pub fn fragments(self, segments: &Segments) -> Result<SegmentUrls, Error> {
+    /// The initialization segment's location and one media segment location per
+    /// timed segment, with unresolved URLs. A missing `@media` means the BaseURL itself.
+    pub fn urls(self, times: &SegmentTimes) -> Result<SegmentUrls, Error> {
         let initialization = self
             .get(|list| list.Initialization.as_ref())
             .ok_or(Error::DashManifestMissingUrls)?;
-        let init = initialization_fragment(initialization)?;
+        let init = initialization_location(initialization)?;
 
         let media = self
             .segment_urls()
             .iter()
-            .take(segments.segments.len())
+            .take(times.segments.len())
             .map(|segment_url| {
-                Ok(Fragment {
+                Ok(SegmentLocation {
                     url: segment_url.media.clone().unwrap_or_default(),
                     range: segment_url
                         .mediaRange

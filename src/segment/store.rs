@@ -1,10 +1,10 @@
-//! The fragment store shared by the blocking and async caches: what is known about each
-//! fragment, and what a fetched body goes through before readers see it. Nothing here does
+//! The segment store shared by the blocking and async caches: what is known about each
+//! segment, and what a fetched body goes through before readers see it. Nothing here does
 //! I/O.
 
-use super::Fragment;
+use super::SegmentLocation;
 #[cfg(feature = "encryption")]
-use crate::cenc::{self, ContentKeys, FragmentRole};
+use crate::cenc::{self, ContentKeys, SegmentRole};
 use crate::error::Error;
 use bytes::Bytes;
 #[cfg(feature = "encryption")]
@@ -14,10 +14,10 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
-/// Fragment data after it's been fetched, shared between streams.
+/// A segment's data after it's been fetched, shared between streams.
 #[derive(Debug)]
-pub(crate) struct FragmentData {
-    pub(crate) fragment: Fragment,
+pub(crate) struct SegmentData {
+    pub(crate) location: SegmentLocation,
     held: Mutex<Held>,
     /// Length of the fetched body, kept after the body is forgotten.
     fetched_size: OnceLock<u64>,
@@ -36,25 +36,25 @@ pub(crate) struct FragmentData {
     /// Held across an async HEAD.
     #[cfg(feature = "async")]
     pub(crate) async_probe: futures_util::lock::Mutex<()>,
-    /// This fragment's role in decryption, which tells a keyed cache how to
-    /// turn its fetched bytes into plaintext. A stream sets it before the first GET of the fragment.
+    /// This segment's role in decryption, which tells a keyed cache how to
+    /// turn its fetched bytes into plaintext. A stream sets it before the first GET of the segment.
     #[cfg(feature = "encryption")]
-    pub(crate) role: OnceLock<FragmentRole>,
+    pub(crate) role: OnceLock<SegmentRole>,
 }
 
-/// A fragment's body and the streams that want it kept, changed together so
+/// A segment's body and the streams that want it kept, changed together so
 /// a release cannot race a download.
 #[derive(Debug, Default)]
 struct Held {
     body: Option<Bytes>,
-    /// Number of streams that have this fragment in their retention window.
+    /// Number of streams that have this segment in their retention window.
     holds: usize,
 }
 
-impl FragmentData {
-    pub(crate) fn new(fragment: Fragment) -> Self {
+impl SegmentData {
+    pub(crate) fn new(location: SegmentLocation) -> Self {
         Self {
-            fragment,
+            location,
             held: Mutex::default(),
             fetched_size: OnceLock::new(),
             probed_size: OnceLock::new(),
@@ -89,7 +89,7 @@ impl FragmentData {
         body
     }
 
-    /// Counts one more stream that wants this fragment kept.
+    /// Counts one more stream that wants this segment kept.
     fn acquire(&self) {
         self.lock_held().holds += 1;
     }
@@ -115,7 +115,7 @@ impl FragmentData {
 
     /// Byte length from the range, else the fetched body, else a probe.
     pub(crate) fn size(&self) -> Option<u64> {
-        self.fragment
+        self.location
             .known_size()
             .or_else(|| self.fetched_size.get().copied())
             .or_else(|| self.probed_size.get().copied())
@@ -134,17 +134,17 @@ impl FragmentData {
 /// Subscriber to a [`Store`]; see [`Store::subscribe`].
 pub(crate) trait CacheListener: Send + Sync {
     /// `data`'s body or size has just changed.
-    fn fragment_changed(&self, data: &FragmentData);
+    fn segment_changed(&self, data: &SegmentData);
 }
 
-/// The fragments a cache knows about, and the content keys it decrypts with.
+/// The segments a cache knows about, and the content keys it decrypts with.
 #[derive(Default)]
 pub(crate) struct Store {
-    fragments: Mutex<HashMap<Fragment, Arc<FragmentData>>>,
-    /// Called after a fragment's body or size changes. Held weakly, so a
+    segments: Mutex<HashMap<SegmentLocation, Arc<SegmentData>>>,
+    /// Called after a segment's body or size changes. Held weakly, so a
     /// listener lives as long as its subscriber keeps it.
     listeners: Mutex<Vec<Weak<dyn CacheListener>>>,
-    /// Set once, before any fragment is known; later only merged into. Replaced as a whole,
+    /// Set once, before any segment is known; later only merged into. Replaced as a whole,
     /// so a reader's clone stays consistent.
     #[cfg(feature = "encryption")]
     keys: RwLock<Option<Arc<ContentKeys>>>,
@@ -160,11 +160,11 @@ impl Store {
     }
 
     /// Merges `keys` into the store's keys. A store without keys takes them only if it
-    /// knows no fragments yet: one that does may hold bodies it kept undecrypted.
+    /// knows no segments yet: one that does may hold bodies it kept undecrypted.
     #[cfg(feature = "encryption")]
     pub(crate) fn add_keys(&self, keys: ContentKeys) -> Result<(), Error> {
         // Held throughout, so no stream can start using the store meanwhile.
-        let fragments = self.lock();
+        let segments = self.lock();
         let mut current = self.keys.write().unwrap_or_else(|error| error.into_inner());
         match current.as_deref() {
             Some(existing) => {
@@ -172,11 +172,11 @@ impl Store {
                 merged.merge(keys);
                 *current = Some(Arc::new(merged));
             }
-            None if fragments.is_empty() => *current = Some(Arc::new(keys)),
+            None if segments.is_empty() => *current = Some(Arc::new(keys)),
             None => {
                 return Err(Error::Initialization(
                     "content keys cannot be added to a cache that has been used without \
-                     them; give it the keys with FragmentCache::with_keys when creating it"
+                     them; give it the keys with SegmentCache::with_keys when creating it"
                         .to_owned(),
                 ));
             }
@@ -201,33 +201,33 @@ impl Store {
         false
     }
 
-    /// The body of `fragment`, if it is held.
-    pub(crate) fn cached(&self, fragment: &Fragment) -> Option<Bytes> {
-        self.lock().get(fragment)?.body()
+    /// The body of the segment at `location`, if it is held.
+    pub(crate) fn cached(&self, location: &SegmentLocation) -> Option<Bytes> {
+        self.lock().get(location)?.body()
     }
 
-    /// The byte length of `fragment`, if its range, a HEAD or a GET has
-    /// established it.
-    pub(crate) fn known_size(&self, fragment: &Fragment) -> Option<u64> {
-        fragment
+    /// The byte length of the segment at `location`, if its range, a HEAD or
+    /// a GET has established it.
+    pub(crate) fn known_size(&self, location: &SegmentLocation) -> Option<u64> {
+        location
             .known_size()
-            .or_else(|| self.lock().get(fragment)?.size())
+            .or_else(|| self.lock().get(location)?.size())
     }
 
-    /// Number of fragments the store knows about.
+    /// Number of segments the store knows about.
     pub(crate) fn len(&self) -> usize {
         self.lock().len()
     }
 
-    /// The shared entry for `fragment`, created empty if new.
-    pub(crate) fn data(&self, fragment: Fragment) -> Arc<FragmentData> {
+    /// The shared entry for the segment at `location`, created empty if new.
+    pub(crate) fn data(&self, location: SegmentLocation) -> Arc<SegmentData> {
         self.lock()
-            .entry(fragment)
-            .or_insert_with_key(|fragment| Arc::new(FragmentData::new(fragment.clone())))
+            .entry(location)
+            .or_insert_with_key(|location| Arc::new(SegmentData::new(location.clone())))
             .clone()
     }
 
-    /// Tells `listener` after any fragment's body or size changes, on the
+    /// Tells `listener` after any segment's body or size changes, on the
     /// thread that changed it, until `listener` is dropped.
     pub(crate) fn subscribe(&self, listener: Weak<dyn CacheListener>) {
         self.listeners
@@ -239,13 +239,13 @@ impl Store {
     /// Checks a freshly fetched `body` of `data`, decrypts it if the store
     /// has keys, and keeps it. A ranged body of the wrong length is an error
     /// and is not kept.
-    pub(crate) fn accept(&self, data: &FragmentData, body: Bytes) -> Result<Bytes, Error> {
-        let fragment = &data.fragment;
-        if let Some(expected) = fragment.known_size()
+    pub(crate) fn accept(&self, data: &SegmentData, body: Bytes) -> Result<Bytes, Error> {
+        let location = &data.location;
+        if let Some(expected) = location.known_size()
             && body.len() as u64 != expected
         {
-            return Err(Error::FragmentLength {
-                fragment: fragment.to_string(),
+            return Err(Error::SegmentLength {
+                segment: location.to_string(),
                 expected,
                 actual: body.len() as u64,
             });
@@ -258,22 +258,22 @@ impl Store {
     }
 
     /// Records a HEAD length for `data`, unless its size is already known.
-    pub(crate) fn accept_probe(&self, data: &FragmentData, size: u64) {
+    pub(crate) fn accept_probe(&self, data: &SegmentData, size: u64) {
         data.probed_size.get_or_init(|| size);
         self.notify(data);
     }
 
-    /// Records that a stream wants each of `fragments` kept.
-    pub(crate) fn acquire(&self, fragments: &[Arc<FragmentData>]) {
-        for data in fragments {
+    /// Records that a stream wants each of `segments` kept.
+    pub(crate) fn acquire(&self, segments: &[Arc<SegmentData>]) {
+        for data in segments {
             data.acquire();
         }
     }
 
-    /// Records that a stream no longer wants each of `fragments` kept, and
+    /// Records that a stream no longer wants each of `segments` kept, and
     /// with `forget` drops the bodies no stream wants any more.
-    pub(crate) fn release(&self, fragments: &[Arc<FragmentData>], forget: bool) {
-        for data in fragments {
+    pub(crate) fn release(&self, segments: &[Arc<SegmentData>], forget: bool) {
+        for data in segments {
             if data.release(forget) {
                 self.notify(data);
             }
@@ -282,17 +282,17 @@ impl Store {
 
     /// Drops `data`'s body if no stream wants it, as after a download that
     /// landed outside every window.
-    pub(crate) fn forget_if_unheld(&self, data: &FragmentData) {
+    pub(crate) fn forget_if_unheld(&self, data: &SegmentData) {
         if data.forget_if_unheld() {
             self.notify(data);
         }
     }
 
-    /// Marks `init` as an initialization fragment, so a keyed store clears
+    /// Marks `init` as an initialization segment, so a keyed store clears
     /// its protected sample entries when it is fetched.
     #[cfg(feature = "encryption")]
-    pub(crate) fn assign_init_role(&self, init: &FragmentData) {
-        let _ = init.role.set(FragmentRole::Init);
+    pub(crate) fn assign_init_role(&self, init: &SegmentData) {
+        let _ = init.role.set(SegmentRole::Init);
     }
 
     /// Tags `media` with the protection parsed from the already fetched and
@@ -301,14 +301,14 @@ impl Store {
     #[cfg(feature = "encryption")]
     pub(crate) fn assign_media_roles<'a>(
         &self,
-        init: &FragmentData,
-        media: impl IntoIterator<Item = &'a FragmentData>,
+        init: &SegmentData,
+        media: impl IntoIterator<Item = &'a SegmentData>,
     ) -> Result<(), Error> {
         let Some(keys) = self.keys() else {
             return Ok(());
         };
         let body = init.body().expect("init fetched before media roles");
-        let protection = cenc::protection(&body).map_err(|problem| problem.at(&init.fragment))?;
+        let protection = cenc::protection(&body).map_err(|problem| problem.at(&init.location))?;
         if let Some(track) = protection
             .tracks
             .iter()
@@ -319,7 +319,7 @@ impl Store {
         let protection = Arc::new(protection);
         for data in media {
             // Already set if another stream of this store got here first.
-            let _ = data.role.set(FragmentRole::Media(protection.clone()));
+            let _ = data.role.set(SegmentRole::Media(protection.clone()));
         }
         Ok(())
     }
@@ -327,12 +327,12 @@ impl Store {
     /// Decrypts `body` according to `data`'s role. Same length out as in, so
     /// ranges, HEAD sizes and byte seeks are unaffected.
     #[cfg(feature = "encryption")]
-    fn decrypt(&self, data: &FragmentData, body: Bytes) -> Result<Bytes, Error> {
+    fn decrypt(&self, data: &SegmentData, body: Bytes) -> Result<Bytes, Error> {
         let Some(keys) = self.keys() else {
             return Ok(body);
         };
         let role = match data.role.get() {
-            Some(FragmentRole::Media(protection)) if protection.tracks.is_empty() => {
+            Some(SegmentRole::Media(protection)) if protection.tracks.is_empty() => {
                 return Ok(body);
             }
             Some(role) => role,
@@ -340,7 +340,7 @@ impl Store {
                 debug_assert!(
                     false,
                     "keyed cache fetched {} before a stream set its role",
-                    data.fragment
+                    data.location
                 );
                 return Ok(body);
             }
@@ -348,21 +348,21 @@ impl Store {
         // A unique body, as transports hand over, converts without a copy.
         let mut bytes = BytesMut::from(body);
         match role {
-            FragmentRole::Init => cenc::clear_sample_entries(&mut bytes),
-            FragmentRole::Media(protection) => {
+            SegmentRole::Init => cenc::clear_sample_entries(&mut bytes),
+            SegmentRole::Media(protection) => {
                 let body_start = data
-                    .fragment
+                    .location
                     .range
                     .as_ref()
                     .map_or(0, |range| *range.start());
-                cenc::decrypt_fragment(&mut bytes, body_start, protection, &keys)
+                cenc::decrypt_segment(&mut bytes, body_start, protection, &keys)
             }
         }
-        .map_err(|problem| problem.at(&data.fragment))?;
+        .map_err(|problem| problem.at(&data.location))?;
         Ok(bytes.freeze())
     }
 
-    fn notify(&self, data: &FragmentData) {
+    fn notify(&self, data: &SegmentData) {
         let listeners: Vec<_> = {
             let mut listeners = self
                 .listeners
@@ -372,12 +372,12 @@ impl Store {
             listeners.iter().filter_map(Weak::upgrade).collect()
         };
         for listener in listeners {
-            listener.fragment_changed(data);
+            listener.segment_changed(data);
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<Fragment, Arc<FragmentData>>> {
-        self.fragments
+    fn lock(&self) -> MutexGuard<'_, HashMap<SegmentLocation, Arc<SegmentData>>> {
+        self.segments
             .lock()
             .unwrap_or_else(|error| error.into_inner())
     }

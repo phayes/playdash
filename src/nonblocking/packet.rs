@@ -1,21 +1,21 @@
 //! Async, lower-level access to packets stored in fragmented MP4.
 
 use super::MediaStream;
-use super::fragment::FragmentStream;
+use super::segment::SegmentStream;
 use crate::decoder::{Choice, DecoderFormat, DecoderStyle};
 use crate::error::Error;
-use crate::fragment::buffer::BufferHandle;
-use crate::fragment::schedule::{Part, PartBody};
 use crate::mp4::codec::Codec;
 use crate::mp4::demux::{Demuxer, Landing, Loaded, Split};
 use crate::packet::{Packet, PacketSeeked};
+use crate::segment::buffer::BufferHandle;
+use crate::segment::schedule::{Part, PartBody};
 use futures_util::Stream;
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-/// Demultiplexes one track from a [`FragmentStream`] into MP4 [`Packet`] values.
+/// Demultiplexes one track from a [`SegmentStream`] into MP4 [`Packet`] values.
 ///
 /// This is a lower-level API. Packets retain the byte layout used inside MP4, which is
 /// not accepted directly by every decoder. Use [`MediaStream`] for
@@ -35,7 +35,7 @@ use std::time::Duration;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/stream.mpd").await?;
-/// let mut packets = PacketStream::new(manifest.fragment_stream("audio").await?).await?;
+/// let mut packets = PacketStream::new(manifest.segment_stream("audio").await?).await?;
 ///
 /// let seeked = packets.seek_time(Duration::from_secs(30)).await?;
 /// # let _ = seeked;
@@ -48,7 +48,7 @@ use std::time::Duration;
 /// ```
 #[derive(Debug)]
 pub struct PacketStream {
-    fragments: FragmentStream,
+    segments: SegmentStream,
     demuxer: Demuxer,
     /// Set once the stream has yielded an error, so it ends rather than
     /// yielding the same error forever.
@@ -56,45 +56,45 @@ pub struct PacketStream {
 }
 
 impl PacketStream {
-    /// Reads the packets of `fragments`, a representation of one track, which must not
-    /// have been read from yet. Reads its initialization fragment before returning.
+    /// Reads the packets of `segments`, a representation of one track, which must not
+    /// have been read from yet. Reads its initialization segment before returning.
     ///
     /// Fails with [`Error::UnsupportedMedia`] if the representation has more or fewer
     /// than one track, for which see [`Self::with_track`], or its samples are still
     /// encrypted. Fails with [`Error::MalformedMedia`] for a damaged initialization
-    /// fragment, and with [`Error::Initialization`] if `fragments` has been read from.
-    pub async fn new(fragments: FragmentStream) -> Result<Self, Error> {
-        Self::open(fragments, None).await
+    /// segment, and with [`Error::Initialization`] if `segments` has been read from.
+    pub async fn new(segments: SegmentStream) -> Result<Self, Error> {
+        Self::open(segments, None).await
     }
 
-    /// Reads the packets of track `track_id` of `fragments`, one of its
-    /// [`FragmentStream::tracks`]. Otherwise like [`Self::new`].
+    /// Reads the packets of track `track_id` of `segments`, one of its
+    /// [`SegmentStream::tracks`]. Otherwise like [`Self::new`].
     ///
     /// Fails with [`Error::Initialization`] if the representation has no such track.
-    pub async fn with_track(fragments: FragmentStream, track_id: u32) -> Result<Self, Error> {
-        Self::open(fragments, Some(track_id)).await
+    pub async fn with_track(segments: SegmentStream, track_id: u32) -> Result<Self, Error> {
+        Self::open(segments, Some(track_id)).await
     }
 
-    /// A stream of `fragments`' track `track_id`, or of its only track without one.
-    async fn open(mut fragments: FragmentStream, track_id: Option<u32>) -> Result<Self, Error> {
-        if !fragments.at_start() {
+    /// A stream of `segments`' track `track_id`, or of its only track without one.
+    async fn open(mut segments: SegmentStream, track_id: Option<u32>) -> Result<Self, Error> {
+        if !segments.at_start() {
             return Err(Error::Initialization(
-                "PacketStream needs a FragmentStream that has not been read from".to_owned(),
+                "PacketStream needs a SegmentStream that has not been read from".to_owned(),
             ));
         }
-        let init = match poll_fn(|cx| fragments.poll_next_part(cx)).await {
+        let init = match poll_fn(|cx| segments.poll_next_part(cx)).await {
             Some(Ok(init)) if init.part == Part::Init => init,
             Some(Err(error)) => return Err(error),
             _ => {
                 return Err(Error::Initialization(
-                    "MPEG stream ended before its initialization fragment".to_owned(),
+                    "MPEG stream ended before its initialization segment".to_owned(),
                 ));
             }
         };
-        let representation = fragments.representation_fragments().clone();
-        let demuxer = Demuxer::new(init.body, &init.fragment, Some(representation), track_id)?;
+        let representation = segments.representation_segments().clone();
+        let demuxer = Demuxer::new(init.body, &init.location, Some(representation), track_id)?;
         Ok(Self {
-            fragments,
+            segments,
             demuxer,
             failed: false,
         })
@@ -123,17 +123,17 @@ impl PacketStream {
     }
 
     /// Media decoded before a seek target: the one [`Self::with_preroll`] set,
-    /// else the `roll` or `prol` sample group of the initialization fragment,
-    /// else [`Codec::default_preroll`]. A media fragment's own roll group can
+    /// else the `roll` or `prol` sample group of the initialization segment,
+    /// else [`Codec::default_preroll`]. A media segment's own roll group can
     /// change it for seeks landing there.
     pub fn preroll(&self) -> Duration {
         self.demuxer.preroll()
     }
 
     /// A handle reporting how much of the representation the cache holds; see
-    /// [`FragmentStream::buffer`].
+    /// [`SegmentStream::buffer`].
     pub fn buffer(&self) -> Option<BufferHandle> {
-        self.fragments.buffer()
+        self.segments.buffer()
     }
 
     /// Seeks to `time` on the representation's media timeline, and returns the
@@ -141,11 +141,11 @@ impl PacketStream {
     ///
     /// The stream's next packet is the first one in decode order that presents at or
     /// after `time`. The pre-roll runs from the keyframe decoding starts at, which may be
-    /// in earlier fragments; those are fetched without moving the underlying stream's
+    /// in earlier segments; those are fetched without moving the underlying stream's
     /// retention window.
     ///
-    /// Fails like [`FragmentStream::seek_time`], and with the errors of fetching
-    /// and parsing the fragments it reads.
+    /// Fails like [`SegmentStream::seek_time`], and with the errors of fetching
+    /// and parsing the segments it reads.
     pub async fn seek_time(&mut self, time: Duration) -> Result<PacketSeeked, Error> {
         self.seek(time, Landing::Exact).await
     }
@@ -168,11 +168,11 @@ impl PacketStream {
     /// Seeks to `time`, landing as `landing` says.
     async fn seek(&mut self, time: Duration, landing: Landing) -> Result<PacketSeeked, Error> {
         let range = self.demuxer.seek_range(time)?;
-        let first = self.fragments.first_number();
+        let first = self.segments.first_number();
 
-        // The fragment containing `time`, where the stream then carries on.
-        self.fragments.seek_time(time).await?;
-        let target = match poll_fn(|cx| self.fragments.poll_next_part(cx)).await {
+        // The segment containing `time`, where the stream then carries on.
+        self.segments.seek_time(time).await?;
+        let target = match poll_fn(|cx| self.segments.poll_next_part(cx)).await {
             Some(Ok(target)) => target,
             Some(Err(error)) => return Err(error),
             None => {
@@ -182,11 +182,11 @@ impl PacketStream {
             }
         };
 
-        // Earlier fragments, fetched without moving the stream.
+        // Earlier segments, fetched without moving the stream.
         let mut loaded = Vec::new();
         let mut number = (*range.start()).max(first);
         while number < *range.end() {
-            let earlier = self.fragments.media_part_body(number).await?;
+            let earlier = self.segments.media_part_body(number).await?;
             loaded.push(self.load(earlier)?);
             number = number.next();
         }
@@ -205,14 +205,14 @@ impl PacketStream {
                 Split::Earlier => {
                     let before = earliest.checked_prev().ok_or_else(|| {
                         Error::Initialization(format!(
-                            "MPEG stream has no media fragment before {earliest}"
+                            "MPEG stream has no media segment before {earliest}"
                         ))
                     })?;
-                    let earlier = self.fragments.media_part_body(before).await?;
+                    let earlier = self.segments.media_part_body(before).await?;
                     loaded.insert(0, self.load(earlier)?);
                 }
-                // The stream's next fragment, where it then carries on.
-                Split::Later => match poll_fn(|cx| self.fragments.poll_next_part(cx)).await {
+                // The stream's next segment, where it then carries on.
+                Split::Later => match poll_fn(|cx| self.segments.poll_next_part(cx)).await {
                     Some(Ok(later)) => loaded.push(self.load(later)?),
                     Some(Err(error)) => return Err(error),
                     None => at_last = true,
@@ -249,10 +249,10 @@ impl PacketStream {
         MediaStream::new(self, Choice::Format(format))
     }
 
-    /// The packets of a media fragment `part`.
+    /// The packets of a media segment `part`.
     fn load(&mut self, part: PartBody) -> Result<Loaded, Error> {
-        let number = part.number.expect("a media fragment");
-        self.demuxer.load(number, &part.body, &part.fragment)
+        let number = part.number.expect("a media segment");
+        self.demuxer.load(number, &part.body, &part.location)
     }
 }
 
@@ -269,7 +269,7 @@ impl Stream for PacketStream {
             if let Some(packet) = this.demuxer.pop() {
                 return Poll::Ready(Some(Ok(packet)));
             }
-            let loaded = match ready!(this.fragments.poll_next_part(cx)) {
+            let loaded = match ready!(this.segments.poll_next_part(cx)) {
                 Some(Ok(part)) => this.load(part),
                 Some(Err(error)) => Err(error),
                 None => return Poll::Ready(None),

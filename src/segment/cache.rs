@@ -1,7 +1,7 @@
-//! The blocking API's fragment cache: downloaded fragment data shared between streams.
+//! The blocking API's segment cache: downloaded segment data shared between streams.
 
-use super::Fragment;
-use super::store::{FragmentData, Store};
+use super::SegmentLocation;
+use super::store::{SegmentData, Store};
 use super::transport::{Transport, ureq_agent};
 #[cfg(feature = "encryption")]
 use crate::cenc::ContentKeys;
@@ -10,35 +10,35 @@ use bytes::Bytes;
 use std::fmt;
 use std::sync::Arc;
 
-/// Downloaded fragment data that can be shared by multiple readers.
+/// Downloaded segment data that can be shared by multiple readers.
 ///
 /// With the `encryption` feature, `with_keys` makes the cache decrypt
-/// Common Encryption before making fragment data available.
+/// Common Encryption before making segment data available.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use std::sync::Arc;
-/// use playdash::{DashManifest, FragmentCache};
+/// use playdash::{DashManifest, SegmentCache};
 ///
 /// # fn example(manifest: &DashManifest) -> Result<(), playdash::Error> {
-/// let cache = Arc::new(FragmentCache::default());
-/// let first = manifest.fragment_stream_with_cache("audio", cache.clone())?;
-/// let second = manifest.fragment_stream_with_cache("audio", cache)?;
-/// // Both streams reuse fragment bodies that either one downloads.
+/// let cache = Arc::new(SegmentCache::default());
+/// let first = manifest.segment_stream_with_cache("audio", cache.clone())?;
+/// let second = manifest.segment_stream_with_cache("audio", cache)?;
+/// // Both streams reuse segment bodies that either one downloads.
 /// # drop((first, second));
 /// # Ok(())
 /// # }
 /// ```
-pub struct FragmentCache {
+pub struct SegmentCache {
     transport: Arc<dyn Transport>,
     pub(crate) store: Store,
 }
 
-impl FragmentCache {
-    /// Creates an empty shared cache that fetches missing fragments through `transport`.
+impl SegmentCache {
+    /// Creates an empty shared cache that fetches missing segments through `transport`.
     ///
-    /// Wrap the result in an [`Arc`] to give several streams the same cache. A fragment
+    /// Wrap the result in an [`Arc`] to give several streams the same cache. A segment
     /// downloaded by any of those streams is then reused by the others.
     pub fn new(transport: Arc<dyn Transport>) -> Self {
         Self {
@@ -78,32 +78,32 @@ impl FragmentCache {
         self.store.decrypts()
     }
 
-    /// Returns the cached body of `fragment` without downloading it.
+    /// Returns the cached body of `segment` without downloading it.
     ///
-    /// Returns `None` when the fragment has not been downloaded or has been released by
+    /// Returns `None` when the segment has not been downloaded or has been released by
     /// every stream retaining it. On a cache with content keys, the returned bytes are
     /// plaintext.
-    pub fn cached(&self, fragment: &Fragment) -> Option<Bytes> {
-        self.store.cached(fragment)
+    pub fn cached(&self, segment: &SegmentLocation) -> Option<Bytes> {
+        self.store.cached(segment)
     }
 
-    /// Returns the byte length of `fragment` when it is already known.
+    /// Returns the byte length of `segment` when it is already known.
     ///
     /// A byte range in the manifest, a completed HEAD request, or a completed download
     /// can establish the size. This method does not perform network I/O.
-    pub fn known_size(&self, fragment: &Fragment) -> Option<u64> {
-        self.store.known_size(fragment)
+    pub fn known_size(&self, segment: &SegmentLocation) -> Option<u64> {
+        self.store.known_size(segment)
     }
 
-    /// The shared entry for `fragment`, created empty if new.
-    pub(crate) fn data(&self, fragment: Fragment) -> Arc<FragmentData> {
-        self.store.data(fragment)
+    /// The shared entry for `segment`, created empty if new.
+    pub(crate) fn data(&self, segment: SegmentLocation) -> Arc<SegmentData> {
+        self.store.data(segment)
     }
 
     /// The body of `data`, fetching it unless it is held or another stream
     /// is already fetching it. A ranged body of the wrong length is an error
     /// and is not kept.
-    pub(crate) fn get(&self, data: &FragmentData) -> Result<Bytes, Error> {
+    pub(crate) fn get(&self, data: &SegmentData) -> Result<Bytes, Error> {
         if let Some(body) = data.body() {
             return Ok(body);
         }
@@ -114,13 +114,13 @@ impl FragmentCache {
         if let Some(body) = data.body() {
             return Ok(body);
         }
-        let body = self.transport.get(&data.fragment, data.size())?;
+        let body = self.transport.get(&data.location, data.size())?;
         self.store.accept(data, body)
     }
 
     /// HEADs `data` unless its size is already known or another stream is
     /// already probing it.
-    pub(crate) fn probe(&self, data: &FragmentData) -> Result<(), Error> {
+    pub(crate) fn probe(&self, data: &SegmentData) -> Result<(), Error> {
         if data.size().is_some() {
             return Ok(());
         }
@@ -129,24 +129,24 @@ impl FragmentCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if data.size().is_none() {
-            let size = self.transport.head(&data.fragment)?;
+            let size = self.transport.head(&data.location)?;
             self.store.accept_probe(data, size);
         }
         Ok(())
     }
 }
 
-impl Default for FragmentCache {
+impl Default for SegmentCache {
     /// Fetches through a ureq agent with this crate's connection-pool settings.
     fn default() -> Self {
         Self::new(Arc::new(ureq_agent()))
     }
 }
 
-impl fmt::Debug for FragmentCache {
+impl fmt::Debug for SegmentCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FragmentCache")
-            .field("fragments", &self.store.len())
+        f.debug_struct("SegmentCache")
+            .field("segments", &self.store.len())
             .field("decrypts", &self.decrypts())
             .finish_non_exhaustive()
     }

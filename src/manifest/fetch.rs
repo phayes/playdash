@@ -5,8 +5,8 @@ use ureq::ResponseExt;
 use super::DashManifest;
 use crate::decoder::MediaStreamBuilder;
 use crate::error::Error;
-use crate::fragment::Transport;
-use crate::fragment::transport::ureq_agent;
+use crate::segment::Transport;
+use crate::segment::transport::ureq_agent;
 
 impl DashManifest {
     /// Downloads a manifest and prepares it for representation selection and streaming.
@@ -43,8 +43,8 @@ impl DashManifest {
     /// resolve against.
     pub fn load_segment_indexes(&mut self, transport: &dyn Transport) {
         for request in self.index_requests() {
-            let fragment = request.fragment();
-            match transport.get(fragment, fragment.known_size()) {
+            let location = request.location();
+            match transport.get(location, location.known_size()) {
                 Ok(body) => self.apply_index(&request, &body),
                 Err(error) => self.fail_index(&request, error),
             }

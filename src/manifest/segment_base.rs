@@ -18,9 +18,9 @@ use crate::vendor::dash_mpd_core::{
 
 use super::{DashManifest, Selected};
 use crate::error::Error;
-use crate::fragment::{Fragment, parse_byte_range};
 use crate::mp4::reader::ParseError;
 use crate::mp4::sidx;
+use crate::segment::{SegmentLocation, parse_byte_range};
 
 /// A `SegmentBase` index a [`DashManifest`] needs before one of its
 /// representations can stream: the `sidx` byte range of that
@@ -30,13 +30,13 @@ pub(crate) struct IndexRequest {
     /// The representation's position in document order.
     position: usize,
     representation: String,
-    fragment: Fragment,
+    location: SegmentLocation,
 }
 
 impl IndexRequest {
-    /// The bytes to fetch: a ranged [`Fragment`] of the media file.
-    pub(crate) fn fragment(&self) -> &Fragment {
-        &self.fragment
+    /// The bytes to fetch: a ranged [`SegmentLocation`] of the media file.
+    pub(crate) fn location(&self) -> &SegmentLocation {
+        &self.location
     }
 }
 
@@ -53,11 +53,11 @@ impl DashManifest {
         let mut requests = Vec::new();
         let mut failures = Vec::new();
         for (position, selected) in self.selections().enumerate() {
-            match selected.index_fragment(self.base_url.as_ref()) {
-                Ok(Some(fragment)) => requests.push(IndexRequest {
+            match selected.index_location(self.base_url.as_ref()) {
+                Ok(Some(location)) => requests.push(IndexRequest {
                     position,
                     representation: selected.id().to_owned(),
-                    fragment,
+                    location,
                 }),
                 Ok(None) => {}
                 Err(error) => failures.push((selected.id().to_owned(), error)),
@@ -78,7 +78,7 @@ impl DashManifest {
             .nth(request.position)
             .expect("an index request names a representation of this manifest")
             .bases()
-            .segment_list(&request.fragment, body);
+            .segment_list(&request.location, body);
         match list {
             Ok(list) => {
                 // `selections` yields representations in this same document order.
@@ -128,7 +128,7 @@ impl<'a> Selected<'a> {
     /// The location of this representation's `SegmentBase` index, or `None` if it
     /// does not need one or its URL is relative and there is no manifest URL
     /// yet.
-    fn index_fragment(self, manifest_url: Option<&Url>) -> Result<Option<Fragment>, Error> {
+    fn index_location(self, manifest_url: Option<&Url>) -> Result<Option<SegmentLocation>, Error> {
         if !self.needs_segment_index() {
             return Ok(None);
         }
@@ -142,7 +142,7 @@ impl<'a> Selected<'a> {
             Ok(None) => return Err(Error::DashManifestMissingUrls),
             Err(error) => return Err(error),
         };
-        self.bases().index_fragment(url.as_str()).map(Some)
+        self.bases().index_location(url.as_str()).map(Some)
     }
 }
 
@@ -165,24 +165,24 @@ impl<'a> BaseChain<'a> {
 
     /// The `sidx` bytes at `@indexRange` of the resource at `url`, to fetch
     /// and hand to [`Self::segment_list`].
-    fn index_fragment(self, url: &str) -> Result<Fragment, Error> {
+    fn index_location(self, url: &str) -> Result<SegmentLocation, Error> {
         let index_range = self
             .get(|base| base.indexRange.as_deref())
             .ok_or_else(|| invalid("SegmentBase has no @indexRange".to_owned()))
             .and_then(parse_byte_range)?;
-        Ok(Fragment::with_range(url, index_range))
+        Ok(SegmentLocation::with_range(url, index_range))
     }
 
-    /// Rewrites the fetched `body` of `index`, from [`Self::index_fragment`],
+    /// Rewrites the fetched `body` of `index`, from [`Self::index_location`],
     /// as a `SegmentList`.
     ///
     /// Without an `Initialization` element, the initialization is taken to be
     /// every byte before the index, where `ftyp` and `moov` normally sit.
-    fn segment_list(self, index: &Fragment, body: &[u8]) -> Result<SegmentList, Error> {
+    fn segment_list(self, index: &SegmentLocation, body: &[u8]) -> Result<SegmentList, Error> {
         let index_range = index
             .range
             .clone()
-            .ok_or_else(|| invalid("index fragment has no byte range".to_owned()))?;
+            .ok_or_else(|| invalid("index segment has no byte range".to_owned()))?;
         let index = SegmentIndex::parse(body, *index_range.start())?;
 
         let initialization = match self.get(|base| base.Initialization.as_ref()) {
@@ -378,14 +378,18 @@ pub(crate) mod tests {
     #[cfg(feature = "sync")]
     struct OneFile {
         body: Vec<u8>,
-        requests: std::sync::Mutex<Vec<Fragment>>,
+        requests: std::sync::Mutex<Vec<SegmentLocation>>,
     }
 
     #[cfg(feature = "sync")]
     impl crate::Transport for OneFile {
-        fn get(&self, fragment: &Fragment, _size_hint: Option<u64>) -> Result<crate::Bytes, Error> {
-            self.requests.lock().unwrap().push(fragment.clone());
-            let range = fragment
+        fn get(
+            &self,
+            segment: &SegmentLocation,
+            _size_hint: Option<u64>,
+        ) -> Result<crate::Bytes, Error> {
+            self.requests.lock().unwrap().push(segment.clone());
+            let range = segment
                 .range
                 .clone()
                 .unwrap_or(0..=self.body.len() as u64 - 1);
@@ -415,7 +419,7 @@ pub(crate) mod tests {
         .unwrap();
         // Parsing never fetches the index.
         assert!(matches!(
-            manifest.fragments("FLAC"),
+            manifest.segments("FLAC"),
             Err(Error::DashManifestInvalidSegments(reason)) if reason.contains("not loaded")
         ));
         manifest
@@ -423,8 +427,8 @@ pub(crate) mod tests {
 
     #[test]
     #[cfg(feature = "sync")]
-    fn segment_base_index_becomes_ranged_fragments() {
-        use crate::fragment::FragmentCache;
+    fn segment_base_index_becomes_ranged_segments() {
+        use crate::segment::SegmentCache;
         use std::io::Read;
         use std::sync::Arc;
         use std::time::Duration;
@@ -447,10 +451,10 @@ pub(crate) mod tests {
             [ranged(url, index_start, index_end)]
         );
         // Without an Initialization element, everything before the index is the init.
-        let fragments = manifest.fragments("FLAC").unwrap();
-        assert_eq!(fragments.init(), &ranged(url, 0, 837));
+        let segments = manifest.segments("FLAC").unwrap();
+        assert_eq!(segments.init(), &ranged(url, 0, 837));
         assert_eq!(
-            fragments.media().cloned().collect::<Vec<_>>(),
+            segments.media().cloned().collect::<Vec<_>>(),
             [
                 ranged(url, index_end + 1, index_end + 100),
                 ranged(url, index_end + 101, index_end + 150),
@@ -458,22 +462,22 @@ pub(crate) mod tests {
         );
 
         // Subsegments follow the index's earliest presentation time.
-        let timing = fragments.timing().unwrap();
+        let timing = segments.timing().unwrap();
         assert_eq!(timing.timescale.get(), 44_100);
         assert_eq!(timing.presentation_time_offset, 0);
-        let segments: Vec<(u64, u64)> = fragments
-            .segments()
+        let times: Vec<(u64, u64)> = segments
+            .timed_media()
             .unwrap()
             .iter()
             .map(|segment| (segment.start, segment.duration))
             .collect();
-        assert_eq!(segments, [(2048, 4096), (6144, 1024)]);
+        assert_eq!(times, [(2048, 4096), (6144, 1024)]);
         let ticks = |ticks: u64| Duration::from_secs_f64(ticks as f64 / 44_100.0);
-        let start = fragments.span(0).unwrap().start;
+        let start = segments.span(0).unwrap().start;
         assert!(start.abs_diff(ticks(2048)) < Duration::from_micros(1));
 
         let mut reader = manifest
-            .fragment_stream_with_cache("FLAC", Arc::new(FragmentCache::new(transport)))
+            .segment_stream_with_cache("FLAC", Arc::new(SegmentCache::new(transport)))
             .unwrap();
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();
@@ -492,14 +496,14 @@ pub(crate) mod tests {
         let requests = manifest.index_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].representation, "FLAC");
-        let index = requests[0].fragment().range.clone().unwrap();
+        let index = requests[0].location().range.clone().unwrap();
         manifest.apply_index(
             &requests[0],
             &body[*index.start() as usize..=*index.end() as usize],
         );
         assert!(manifest.index_requests().is_empty());
         assert_eq!(
-            manifest.fragments("FLAC").unwrap().init(),
+            manifest.segments("FLAC").unwrap().init(),
             &ranged("https://cdn.example/track.mp4", 0, 99)
         );
     }
@@ -517,16 +521,16 @@ pub(crate) mod tests {
             ));
             manifest.base_url = Some(Url::parse("https://cdn.example/").unwrap());
             let request = manifest.index_requests()[0].clone();
-            let index = request.fragment().range.clone().unwrap();
+            let index = request.location().range.clone().unwrap();
             manifest.apply_index(
                 &request,
                 &body[*index.start() as usize..=*index.end() as usize],
             );
 
-            let fragments = manifest.fragments("FLAC").unwrap();
-            let timing = fragments.timing().unwrap();
+            let segments = manifest.segments("FLAC").unwrap();
+            let timing = segments.timing().unwrap();
             assert_eq!(timing.presentation_time_offset, 2048, "{attributes}");
-            let span = fragments.span(0).unwrap();
+            let span = segments.span(0).unwrap();
             assert_eq!(span.start, std::time::Duration::ZERO, "{attributes}");
         }
     }
@@ -554,14 +558,14 @@ pub(crate) mod tests {
         };
         manifest.load_segment_indexes(&transport);
 
-        let error = manifest.fragments("FLAC").unwrap_err();
+        let error = manifest.segments("FLAC").unwrap_err();
         assert!(matches!(
             &error,
             Error::DashManifestSegmentIndex { representation, reason }
                 if representation == "FLAC" && reason.contains("no sidx box")
         ));
         assert_eq!(manifest.mime_type("FLAC").unwrap(), Some("audio/mp4"));
-        assert_eq!(manifest.fragments("AACLC").unwrap().media_len(), 1);
+        assert_eq!(manifest.segments("AACLC").unwrap().media_len(), 1);
 
         // A later successful load clears the failure.
         let (body, index_range) = segment_base_file();
@@ -574,11 +578,11 @@ pub(crate) mod tests {
             body,
             requests: Default::default(),
         });
-        assert_eq!(manifest.fragments("FLAC").unwrap().media_len(), 2);
+        assert_eq!(manifest.segments("FLAC").unwrap().media_len(), 2);
     }
 
     #[cfg(feature = "sync")]
     fn parse_range(value: &str) -> std::ops::RangeInclusive<u64> {
-        crate::fragment::parse_byte_range(value).unwrap()
+        crate::segment::parse_byte_range(value).unwrap()
     }
 }

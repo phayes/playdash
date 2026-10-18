@@ -32,10 +32,10 @@ use std::thread;
 use std::time::Duration;
 
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
-use playdash::fragment::FragmentStream;
+use playdash::segment::SegmentStream;
 use playdash::{
-    BufferHandle, BufferStatus, ContentKind, DashManifest, DashSource, FragmentCache,
-    Representation, Retention,
+    BufferHandle, BufferStatus, ContentKind, DashManifest, DashSource, Representation, Retention,
+    SegmentCache,
 };
 use rodio::{DeviceSinkBuilder, Player};
 
@@ -61,7 +61,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let video = select(&manifest, args.id.as_deref(), ContentKind::Video)?;
     let audio = select(&manifest, args.audio_id.as_deref(), ContentKind::Audio)?;
     let id = video.id;
-    let total = manifest.fragments(id)?.end();
+    let total = manifest.segments(id)?.end();
     for representation in [&video, &audio] {
         let size = match (representation.width, representation.height) {
             (Some(width), Some(height)) => format!(", {width}x{height}"),
@@ -83,7 +83,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     player.append(audio_source);
 
     // Every video decoder, including those started by a seek, shares one cache.
-    let cache = Arc::new(FragmentCache::default());
+    let cache = Arc::new(SegmentCache::default());
     let mut decoder = Decoder::start(&manifest, id, &cache, Duration::ZERO)?;
 
     let mut window = Window::new("playdash", WIDTH, HEIGHT, WindowOptions::default())?;
@@ -127,7 +127,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         mouse_was_down = mouse_down;
 
         // A seek moves the audio exactly, and replaces the video decoder with
-        // one starting at the fragment containing the target.
+        // one starting at the segment containing the target.
         if let Some(target) = seek_to {
             let target = total.map_or(target, |total| target.min(total));
             let result = player
@@ -186,7 +186,7 @@ fn select<'a>(
 struct Decoder {
     child: Child,
     frames: Receiver<Vec<u32>>,
-    /// Media time of the first frame: the start of the fragment seeked to.
+    /// Media time of the first frame: the start of the segment seeked to.
     start: Duration,
     /// Frames taken from `frames` so far.
     taken: u32,
@@ -198,13 +198,12 @@ impl Decoder {
     fn start(
         manifest: &DashManifest,
         id: &str,
-        cache: &Arc<FragmentCache>,
+        cache: &Arc<SegmentCache>,
         time: Duration,
     ) -> Result<Self, Box<dyn Error>> {
         // A stream from `time`: the init segment, then the media from the
-        // fragment containing `time`, as ffmpeg needs.
-        let (stream, start) =
-            manifest.fragment_stream_at_with_cache(id, time, Arc::clone(cache))?;
+        // segment containing `time`, as ffmpeg needs.
+        let (stream, start) = manifest.segment_stream_at_with_cache(id, time, Arc::clone(cache))?;
         let stream = stream.with_retention(Retention {
             behind: Some(Duration::from_secs(30)),
             ahead: Some(Duration::from_secs(60)),
@@ -254,7 +253,7 @@ impl Drop for Decoder {
     }
 }
 
-fn feed(mut stdin: impl Write, mut stream: FragmentStream) {
+fn feed(mut stdin: impl Write, mut stream: SegmentStream) {
     if let Err(error) = io::copy(&mut stream, &mut stdin)
         && error.kind() != io::ErrorKind::BrokenPipe
     {

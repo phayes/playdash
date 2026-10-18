@@ -502,7 +502,7 @@ pub(crate) fn unsupported_format(
 pub(crate) enum TrackChoice {
     /// The track with this MP4 track ID.
     Id(u32),
-    /// The first track of this kind, in the initialization fragment's order.
+    /// The first track of this kind, in the initialization segment's order.
     Kind(ContentKind),
 }
 

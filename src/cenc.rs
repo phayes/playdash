@@ -2,20 +2,20 @@
 //!
 //! Decrypts `cenc` (AES-128-CTR) and `cbcs` (AES-128-CBC with a crypt/skip
 //! pattern) samples in place. Decryption never changes a body's length, so
-//! fragment sizes from ranges and HEAD stay valid. The protection boxes
+//! segment sizes from ranges and HEAD stay valid. The protection boxes
 //! (`sinf`, `senc`, `saiz`, `saio`, `pssh`) stay where they are; only each
 //! protected sample entry's type is restored from `enca` to its `frma`
 //! original, so Symphonia recognizes the codec.
 
-// Decryption runs where fragments are fetched, so without `sync` or `async`
+// Decryption runs where segments are fetched, so without `sync` or `async`
 // only `ContentKeys` is reachable.
 #![cfg_attr(not(any(feature = "sync", feature = "async")), allow(dead_code))]
 
 use crate::error::Error;
-use crate::fragment::Fragment;
 use crate::mp4::init::TrackDefaults;
 use crate::mp4::reader::{ParseError, atoms, find, fourcc};
 use crate::mp4::{self, fragment, protection};
+use crate::segment::SegmentLocation;
 use aes::Aes128;
 use aes::cipher::{BlockCipherDecrypt, KeyInit, KeyIvInit, StreamCipher};
 use std::collections::HashMap;
@@ -145,7 +145,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Why a body could not be decrypted, before the fragment is attached.
+/// Why a body could not be decrypted, before the segment is attached.
 #[derive(Debug)]
 pub(crate) enum Problem {
     Malformed(String),
@@ -154,11 +154,11 @@ pub(crate) enum Problem {
 }
 
 impl Problem {
-    pub(crate) fn at(self, fragment: &Fragment) -> Error {
-        let fragment = fragment.to_string();
+    pub(crate) fn at(self, location: &SegmentLocation) -> Error {
+        let segment = location.to_string();
         match self {
-            Self::Malformed(reason) => Error::MalformedProtection { fragment, reason },
-            Self::Unsupported(reason) => Error::UnsupportedProtection { fragment, reason },
+            Self::Malformed(reason) => Error::MalformedProtection { segment, reason },
+            Self::Unsupported(reason) => Error::UnsupportedProtection { segment, reason },
             Self::MissingKey(kid) => Error::MissingContentKey(hex(&kid)),
         }
     }
@@ -203,23 +203,23 @@ pub(crate) struct TrackProtection {
     skip_blocks: u8,
 }
 
-/// How a representation's media fragments are protected, read from its init.
+/// How a representation's media segments are protected, read from its init.
 #[derive(Debug, Default)]
 pub(crate) struct Protection {
     /// The protected tracks; empty when nothing needs decrypting.
     pub(crate) tracks: Vec<TrackProtection>,
-    /// Every track's `trex` defaults, which lay out the samples of fragments.
+    /// Every track's `trex` defaults, which lay out the samples of movie fragments.
     defaults: Vec<(u32, TrackDefaults)>,
 }
 
-/// A fragment's role in decryption, set by the stream that requests it.
+/// A segment's role in decryption, set by the stream that requests it.
 #[cfg(any(feature = "sync", feature = "async"))]
 #[derive(Debug)]
-pub(crate) enum FragmentRole {
+pub(crate) enum SegmentRole {
     /// The initialization segment: protected sample entries get their
     /// original types back.
     Init,
-    /// A media fragment of a representation whose init declared `protection`.
+    /// A media segment of a representation whose init declared `protection`.
     Media(Arc<Protection>),
 }
 
@@ -332,7 +332,7 @@ fn track_protection_from(
 /// One protected sample's bytes in a media body and how to decrypt them.
 struct Sample {
     range: Range<usize>,
-    /// Index into the fragment's track list.
+    /// Index into [`Protection::tracks`].
     track: usize,
     iv: [u8; 16],
     /// `(clear, protected)` byte counts; empty when the whole sample is protected.
@@ -341,8 +341,8 @@ struct Sample {
 
 /// Decrypts every protected sample in each `moof`/`mdat` of `body`, in place.
 /// `body_start` is the offset of `body` in its resource, such as the start of a
-/// fragment's byte range.
-pub(crate) fn decrypt_fragment(
+/// segment's byte range.
+pub(crate) fn decrypt_segment(
     body: &mut [u8],
     body_start: u64,
     protection: &Protection,
@@ -568,7 +568,7 @@ mod tests {
         sizes_in_trun: bool,
         /// Split samples across two `trun`s, the second without a data offset.
         two_truns: bool,
-        /// Where the fragment sits in its file, when `tfhd` names an explicit
+        /// Where the movie fragment sits in its file, when `tfhd` names an explicit
         /// base data offset instead of using default-base-is-moof.
         file_offset: Option<u64>,
     }
@@ -579,8 +579,8 @@ mod tests {
         file_offset: None,
     };
 
-    /// A `moof` + `mdat` media fragment holding `samples`.
-    fn fragment(samples: &[EncryptedSample], layout: &Layout) -> Vec<u8> {
+    /// A `moof` + `mdat` movie fragment holding `samples`.
+    fn movie_fragment(samples: &[EncryptedSample], layout: &Layout) -> Vec<u8> {
         let moof = |data_offset: i32| {
             let split = if layout.two_truns {
                 samples.len() / 2
@@ -748,7 +748,7 @@ mod tests {
     /// Clears `init`, then decrypts `media` with the protection it declares.
     fn decrypt(init: &mut [u8], media: &mut [u8]) -> Result<(), Problem> {
         clear_sample_entries(init)?;
-        decrypt_fragment(media, 0, &protection(init)?, &keys())
+        decrypt_segment(media, 0, &protection(init)?, &keys())
     }
 
     fn mdat(media: &[u8]) -> &[u8] {
@@ -766,7 +766,7 @@ mod tests {
         layout: &Layout,
     ) {
         let mut init = init(tenc, 0);
-        let mut media = fragment(samples, layout);
+        let mut media = movie_fragment(samples, layout);
         let encrypted_len = media.len();
         assert_ne!(mdat(&media), plain.concat(), "fixture is not encrypted");
         decrypt(&mut init, &mut media).unwrap();
@@ -851,7 +851,7 @@ mod tests {
             two_truns: true,
             file_offset: None,
         };
-        let mut media = fragment(&samples, &layout);
+        let mut media = movie_fragment(&samples, &layout);
         decrypt(&mut init, &mut media).unwrap();
         assert_eq!(mdat(&media), plain.concat());
     }
@@ -873,14 +873,14 @@ mod tests {
         clear_sample_entries(&mut init).unwrap();
         let protection = protection(&init).unwrap();
 
-        let mut media = fragment(&samples, &layout);
-        decrypt_fragment(&mut media, 5000, &protection, &keys()).unwrap();
+        let mut media = movie_fragment(&samples, &layout);
+        decrypt_segment(&mut media, 5000, &protection, &keys()).unwrap();
         assert_eq!(mdat(&media), plain.concat());
 
         // Read as if the body started the file, the offset points past it.
-        let mut media = fragment(&samples, &layout);
+        let mut media = movie_fragment(&samples, &layout);
         assert!(matches!(
-            decrypt_fragment(&mut media, 0, &protection, &keys()),
+            decrypt_segment(&mut media, 0, &protection, &keys()),
             Err(Problem::Malformed(_))
         ));
     }
@@ -914,8 +914,8 @@ mod tests {
         let mut init = init(&CENC, 0);
         clear_sample_entries(&mut init).unwrap();
         let samples = [cenc_reference(&plaintext(32, 1), [1; 8], &[])];
-        let mut media = fragment(&samples, &SIZED);
-        let problem = decrypt_fragment(
+        let mut media = movie_fragment(&samples, &SIZED);
+        let problem = decrypt_segment(
             &mut media,
             0,
             &protection(&init).unwrap(),
@@ -931,7 +931,7 @@ mod tests {
             cenc_reference(&plaintext(32, 1), [1; 8], &[]),
             cenc_reference(&plaintext(32, 2), [2; 8], &[]),
         ];
-        let mut media = fragment(&samples, &SIZED);
+        let mut media = movie_fragment(&samples, &SIZED);
         // Rewrite senc's sample_count from 2 to 1.
         let at = media
             .windows(4)
@@ -950,7 +950,7 @@ mod tests {
         let mut init = init(&CENC, 0);
         let mut sample = cenc_reference(&plaintext(32, 1), [1; 8], &[(16, 16)]);
         sample.subsamples = vec![(16, 17)];
-        let mut media = fragment(&[sample], &SIZED);
+        let mut media = movie_fragment(&[sample], &SIZED);
         assert!(matches!(
             decrypt(&mut init, &mut media),
             Err(Problem::Malformed(_))
@@ -989,20 +989,20 @@ mod tests {
         let mut cleared = full_init.clone();
         clear_sample_entries(&mut cleared).unwrap();
         let protection = protection(&cleared).unwrap();
-        let media = fragment(
+        let media = movie_fragment(
             &[cenc_reference(&plaintext(40, 1), [1; 8], &[(3, 30)])],
             &SIZED,
         );
         for len in 0..media.len() {
             let mut prefix = media[..len].to_vec();
-            let _ = decrypt_fragment(&mut prefix, 0, &protection, &keys());
+            let _ = decrypt_segment(&mut prefix, 0, &protection, &keys());
         }
     }
 
     #[test]
     fn unprotected_tracks_pass_through() {
         let plain = plaintext(64, 3);
-        let mut media = fragment(
+        let mut media = movie_fragment(
             &[EncryptedSample {
                 data: plain.clone(),
                 iv: Vec::new(),
@@ -1011,7 +1011,7 @@ mod tests {
             &SIZED,
         );
         let before = media.clone();
-        decrypt_fragment(&mut media, 0, &Protection::default(), &keys()).unwrap();
+        decrypt_segment(&mut media, 0, &Protection::default(), &keys()).unwrap();
         assert_eq!(media, before);
     }
 }

@@ -1,14 +1,14 @@
-//! A representation's tracks, as its initialization fragment lists them.
+//! A representation's tracks, as its initialization segment lists them.
 
 use super::codec::{self, Codec};
 use super::demux::{default_description_index, description, media_error};
 use super::init;
 use crate::error::Error;
-use crate::fragment::Fragment;
 use crate::manifest::ContentKind;
+use crate::segment::SegmentLocation;
 use bytes::Bytes;
 
-/// One track of a representation's initialization fragment.
+/// One track of a representation's initialization segment.
 ///
 /// # Examples
 ///
@@ -18,7 +18,7 @@ use bytes::Bytes;
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let manifest = DashManifest::new_from_url("https://media.example/muxed.mpd")?;
-/// let stream = manifest.fragment_stream("muxed")?;
+/// let stream = manifest.segment_stream("muxed")?;
 /// let audio = stream
 ///     .tracks()?
 ///     .into_iter()
@@ -45,9 +45,9 @@ pub struct Track {
     pub timescale: u32,
 }
 
-/// The tracks of `init`, the body of `init_fragment`.
-pub(crate) fn tracks(init: &Bytes, init_fragment: &Fragment) -> Result<Vec<Track>, Error> {
-    let error = |error| media_error(init_fragment, error);
+/// The tracks of `init`, the body of `init_location`.
+pub(crate) fn tracks(init: &Bytes, init_location: &SegmentLocation) -> Result<Vec<Track>, Error> {
+    let error = |error| media_error(init_location, error);
     init::parse(init)
         .map_err(error)?
         .tracks
@@ -105,7 +105,7 @@ mod tests {
             },
         ]));
 
-        let tracks = tracks(&body, &Fragment::new("init")).unwrap();
+        let tracks = tracks(&body, &SegmentLocation::new("init")).unwrap();
         let listed: Vec<_> = tracks
             .iter()
             .map(|track| (track.id, track.kind, track.timescale))
@@ -122,7 +122,10 @@ mod tests {
         assert!(matches!(tracks[1].codec, Codec::H264(_)));
 
         assert!(matches!(
-            super::tracks(&Bytes::from_static(b"not mp4"), &Fragment::new("init")),
+            super::tracks(
+                &Bytes::from_static(b"not mp4"),
+                &SegmentLocation::new("init")
+            ),
             Err(Error::MalformedMedia { .. })
         ));
     }

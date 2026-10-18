@@ -8,7 +8,6 @@ pub mod codec;
 #[cfg(any(feature = "sync", feature = "async"))]
 pub mod decoder;
 mod error;
-pub mod fragment;
 mod manifest;
 mod mp4;
 #[cfg(feature = "async")]
@@ -17,6 +16,7 @@ pub mod nonblocking;
 pub mod packet;
 #[cfg(feature = "rodio")]
 mod rodio;
+pub mod segment;
 mod vendor;
 
 #[cfg(feature = "encryption")]
@@ -32,15 +32,6 @@ pub use decoder::{
 pub use decoder::{MediaStream, MediaStreamBuilder};
 #[doc(inline)]
 pub use error::Error;
-#[cfg(any(feature = "sync", feature = "async"))]
-#[doc(inline)]
-pub use fragment::buffer::{BufferAmount, BufferHandle, BufferStatus, BufferTotal};
-#[cfg(any(feature = "sync", feature = "async"))]
-#[doc(inline)]
-pub use fragment::schedule::{Retention, TimeAccuracy};
-#[cfg(feature = "sync")]
-#[doc(inline)]
-pub use fragment::{FragmentCache, Transport};
 #[doc(inline)]
 pub use manifest::{ContentKind, DashManifest, FrameRate, Representation};
 #[cfg(any(feature = "sync", feature = "async"))]
@@ -49,8 +40,17 @@ pub use mp4::codec::Codec;
 #[cfg(feature = "rodio")]
 #[doc(inline)]
 pub use rodio::DashSource;
+#[cfg(any(feature = "sync", feature = "async"))]
+#[doc(inline)]
+pub use segment::buffer::{BufferAmount, BufferHandle, BufferStatus, BufferTotal};
+#[cfg(any(feature = "sync", feature = "async"))]
+#[doc(inline)]
+pub use segment::schedule::{Retention, TimeAccuracy};
+#[cfg(feature = "sync")]
+#[doc(inline)]
+pub use segment::{SegmentCache, Transport};
 
-/// The byte buffer used by lower-level fragment transports.
+/// The byte buffer used by lower-level segment transports.
 ///
 /// This is re-exported so custom [`Transport`] implementations do not need a direct
 /// dependency on the `bytes` crate.

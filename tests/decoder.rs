@@ -5,12 +5,12 @@
 
 mod common;
 
-use common::{Fixtures, fragment_stream, fragment_stream_through, muxed};
-use playdash::fragment::{Fragment, FragmentStream};
+use common::{Fixtures, muxed, segment_stream, segment_stream_through};
 use playdash::packet::{Packet, PacketSeeked, PacketStream};
+use playdash::segment::{SegmentLocation, SegmentStream};
 use playdash::{
-    Bytes, Codec, ContentKind, DecoderFormat, DecoderParameters, DecoderStyle, Error,
-    FragmentCache, MediaPacket, MediaStream, MediaStreamBuilder, Seeked, Transport,
+    Bytes, Codec, ContentKind, DecoderFormat, DecoderParameters, DecoderStyle, Error, MediaPacket,
+    MediaStream, MediaStreamBuilder, Seeked, SegmentCache, Transport,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +22,7 @@ const START_CODE: [u8; 4] = [0, 0, 0, 1];
 const TEMPORAL_DELIMITER: [u8; 2] = [0x12, 0x00];
 
 fn packets(name: &str) -> PacketStream {
-    PacketStream::new(fragment_stream(name, Arc::default())).unwrap()
+    PacketStream::new(segment_stream(name, Arc::default())).unwrap()
 }
 
 fn media_stream(name: &str) -> MediaStream {
@@ -393,8 +393,8 @@ fn adts_puts_a_header_on_every_aac_access_unit() {
 
 #[test]
 fn both_tracks_of_a_muxed_representation_convert() {
-    let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures::default())));
-    let stream = || FragmentStream::new_with_cache(muxed(), cache.clone()).unwrap();
+    let cache = Arc::new(SegmentCache::new(Arc::new(Fixtures::default())));
+    let stream = || SegmentStream::new_with_cache(muxed(), cache.clone()).unwrap();
     for (track, format) in [(1, DecoderFormat::H264AnnexB), (2, DecoderFormat::AacRaw)] {
         let converted = PacketStream::with_track(stream(), track)
             .unwrap()
@@ -455,9 +455,9 @@ fn mismatched_formats_are_refused() {
 struct CorruptH264(Fixtures);
 
 impl Transport for CorruptH264 {
-    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error> {
-        let body = self.0.get(fragment, size_hint)?;
-        if !fragment.url.ends_with("h264_2.m4s") {
+    fn get(&self, segment: &SegmentLocation, size_hint: Option<u64>) -> Result<Bytes, Error> {
+        let body = self.0.get(segment, size_hint)?;
+        if !segment.url.ends_with("h264_2.m4s") {
             return Ok(body);
         }
         // The first sample starts the mdat's payload, with its first NAL unit's length.
@@ -473,8 +473,8 @@ impl Transport for CorruptH264 {
 
 #[test]
 fn a_malformed_packet_ends_iteration_until_a_seek() {
-    let fragments = fragment_stream_through("h264", Arc::new(CorruptH264::default()));
-    let mut stream = PacketStream::new(fragments)
+    let segments = segment_stream_through("h264", Arc::new(CorruptH264::default()));
+    let mut stream = PacketStream::new(segments)
         .unwrap()
         .into_media_stream()
         .unwrap();
@@ -485,8 +485,8 @@ fn a_malformed_packet_ends_iteration_until_a_seek() {
     assert!(stream.next().is_none(), "iteration ended after the error");
 
     // The error itself, from a fresh stream.
-    let fragments = fragment_stream_through("h264", Arc::new(CorruptH264::default()));
-    let mut fresh = PacketStream::new(fragments)
+    let segments = segment_stream_through("h264", Arc::new(CorruptH264::default()));
+    let mut fresh = PacketStream::new(segments)
         .unwrap()
         .into_media_stream()
         .unwrap();
@@ -508,8 +508,8 @@ fn a_malformed_packet_ends_iteration_until_a_seek() {
 }
 
 /// A cache that fetches through fresh [`Fixtures`].
-fn fixtures_cache() -> Arc<FragmentCache> {
-    Arc::new(FragmentCache::new(Arc::new(Fixtures::default())))
+fn fixtures_cache() -> Arc<SegmentCache> {
+    Arc::new(SegmentCache::new(Arc::new(Fixtures::default())))
 }
 
 /// `open` applied to a builder of fixture `name`'s representation that fetches through
@@ -604,8 +604,8 @@ fn open_at_seeks_as_open_then_a_seek_does() {
 }
 
 #[test]
-fn open_at_takes_preroll_from_an_earlier_fragment() {
-    // Opus's second fragment spans ticks 23688 to 47688 at 48 kHz, and its third holds
+fn open_at_takes_preroll_from_an_earlier_segment() {
+    // Opus's second segment spans ticks 23688 to 47688 at 48 kHz, and its third holds
     // 1.01s; the 80ms of pre-roll before 1.01s starts in the second.
     let (stream, seeked) = built("opus", |builder| {
         builder.open_at(Duration::from_millis(1_010)).unwrap()
@@ -639,8 +639,8 @@ fn the_manifest_builder_sets_the_preroll() {
 fn the_manifest_builder_reads_a_muxed_track_by_kind_or_id() {
     let cache = fixtures_cache();
     let track_stream = |track| {
-        let fragments = FragmentStream::new_with_cache(muxed(), cache.clone()).unwrap();
-        PacketStream::with_track(fragments, track)
+        let segments = SegmentStream::new_with_cache(muxed(), cache.clone()).unwrap();
+        PacketStream::with_track(segments, track)
             .unwrap()
             .into_media_stream()
             .unwrap()
@@ -678,12 +678,12 @@ fn the_manifest_builder_reads_a_muxed_track_by_kind_or_id() {
 #[cfg(feature = "async")]
 mod nonblocking {
     use super::*;
-    use common::async_fragment_stream;
+    use common::async_segment_stream;
     use futures_util::StreamExt;
     use playdash::nonblocking;
 
     async fn media_stream(name: &str) -> nonblocking::MediaStream {
-        nonblocking::packet::PacketStream::new(async_fragment_stream(name).await)
+        nonblocking::packet::PacketStream::new(async_segment_stream(name).await)
             .await
             .unwrap()
             .into_media_stream()
@@ -732,7 +732,7 @@ mod nonblocking {
     #[tokio::test]
     async fn config_record_style_matches_the_blocking_stream() {
         for name in AUDIO.iter().chain(&VIDEO) {
-            let stream = nonblocking::packet::PacketStream::new(async_fragment_stream(name).await)
+            let stream = nonblocking::packet::PacketStream::new(async_segment_stream(name).await)
                 .await
                 .unwrap()
                 .into_media_stream_for(DecoderStyle::ConfigRecord)
@@ -753,8 +753,8 @@ mod nonblocking {
     }
 
     /// A cache that fetches through fresh [`Fixtures`], for the async API.
-    fn fixtures_cache() -> Arc<nonblocking::fragment::FragmentCache> {
-        Arc::new(nonblocking::fragment::FragmentCache::new(Arc::new(
+    fn fixtures_cache() -> Arc<nonblocking::segment::SegmentCache> {
+        Arc::new(nonblocking::segment::SegmentCache::new(Arc::new(
             Fixtures::default(),
         )))
     }
@@ -842,7 +842,7 @@ mod nonblocking {
 
     #[tokio::test]
     async fn mismatched_formats_are_refused() {
-        let packets = nonblocking::packet::PacketStream::new(async_fragment_stream("h264").await)
+        let packets = nonblocking::packet::PacketStream::new(async_segment_stream("h264").await)
             .await
             .unwrap();
         assert!(matches!(

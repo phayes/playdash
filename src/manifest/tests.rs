@@ -2,26 +2,23 @@ use super::*;
 
 /// The init URL and the media URLs of a representation without byte ranges.
 fn urls(manifest: &DashManifest, id: &str) -> (String, Vec<String>) {
-    let url = |fragment: &Fragment| {
-        assert_eq!(fragment.range, None);
-        fragment.url.clone()
+    let url = |location: &SegmentLocation| {
+        assert_eq!(location.range, None);
+        location.url.clone()
     };
-    let fragments = manifest.fragments(id).unwrap();
-    (url(fragments.init()), fragments.media().map(url).collect())
+    let segments = manifest.segments(id).unwrap();
+    (url(segments.init()), segments.media().map(url).collect())
 }
 
-/// The init fragment and the media fragments of `fragments`.
-fn parts(fragments: &Fragments) -> (Fragment, Vec<Fragment>) {
-    (
-        fragments.init().clone(),
-        fragments.media().cloned().collect(),
-    )
+/// The locations of the init segment and the media segments of `segments`.
+fn parts(segments: &Segments) -> (SegmentLocation, Vec<SegmentLocation>) {
+    (segments.init().clone(), segments.media().cloned().collect())
 }
 
 /// The timescale of a representation's media segments.
 fn timescale(manifest: &DashManifest, id: &str) -> u32 {
     manifest
-        .fragments(id)
+        .segments(id)
         .unwrap()
         .timing()
         .unwrap()
@@ -31,9 +28,9 @@ fn timescale(manifest: &DashManifest, id: &str) -> u32 {
 
 /// The duration of each of a representation's media segments, in its ticks.
 fn durations(manifest: &DashManifest, id: &str) -> Vec<u64> {
-    let fragments = manifest.fragments(id).unwrap();
-    let segments = fragments.segments().unwrap();
-    segments.iter().map(|segment| segment.duration).collect()
+    let segments = manifest.segments(id).unwrap();
+    let media = segments.timed_media().unwrap();
+    media.iter().map(|segment| segment.duration).collect()
 }
 
 #[test]
@@ -87,11 +84,11 @@ fn parses_dash_manifest_fields() {
     assert_eq!(aac.codecs, Some("mp4a.40.2"));
     assert_eq!(aac.bandwidth, Some(320_000));
     assert!(matches!(
-        manifest.fragments("FLAC"),
+        manifest.segments("FLAC"),
         Err(Error::DashManifestMissingDuration)
     ));
     assert!(matches!(
-        manifest.fragments("AACLC"),
+        manifest.segments("AACLC"),
         Err(Error::DashManifestMissingTimeline)
     ));
 }
@@ -138,7 +135,7 @@ fn parses_segment_timeline_and_unescapes_urls() {
         [176_128, 176_128, 176_128, 108_735]
     );
     assert_eq!(
-        manifest.fragments("AACLC").unwrap().span(0).unwrap().start,
+        manifest.segments("AACLC").unwrap().span(0).unwrap().start,
         Duration::ZERO
     );
 }
@@ -179,7 +176,7 @@ fn inherits_segment_template_from_adaptation_set() {
 
 #[test]
 fn segments_keep_their_media_time_and_present_from_the_offset() {
-    let fragments = |timing: &str| {
+    let segments = |timing: &str| {
         DashManifest::new(format!(
             r#"<MPD mediaPresentationDuration="PT4S"><Period><AdaptationSet mimeType="audio/mp4">
                 <Representation id="FLAC">
@@ -190,17 +187,17 @@ fn segments_keep_their_media_time_and_present_from_the_offset() {
         .unwrap()
         .with_base_url("https://cdn.example/manifest.mpd")
         .unwrap()
-        .fragments("FLAC")
+        .segments("FLAC")
         .unwrap()
     };
-    let starts = |fragments: &Fragments| -> Vec<u64> {
-        let segments = fragments.segments().unwrap();
-        segments.iter().map(|segment| segment.start).collect()
+    let starts = |segments: &Segments| -> Vec<u64> {
+        let media = segments.timed_media().unwrap();
+        media.iter().map(|segment| segment.start).collect()
     };
     let millis = Duration::from_millis;
 
     // A timeline starting after the presentation time offset presents late.
-    let late = fragments(
+    let late = segments(
         r#"timescale="1000" presentationTimeOffset="500">
             <SegmentTimeline><S t="700" d="2000" r="1"/></SegmentTimeline>
         </SegmentTemplate>"#,
@@ -212,12 +209,12 @@ fn segments_keep_their_media_time_and_present_from_the_offset() {
     assert_eq!(late.span(1), Some(millis(2_200)..millis(4_000)));
 
     // Fixed-duration segments start at the offset, so present from zero.
-    let fixed = fragments(r#"timescale="1000" presentationTimeOffset="500" duration="2000"/>"#);
+    let fixed = segments(r#"timescale="1000" presentationTimeOffset="500" duration="2000"/>"#);
     assert_eq!(starts(&fixed), [500, 2500]);
     assert_eq!(fixed.span(0), Some(Duration::ZERO..millis(2_000)));
 
     // Without either, media time starts at zero.
-    let plain = fragments(
+    let plain = segments(
         r#"timescale="1000"><SegmentTimeline><S d="2000"/></SegmentTimeline></SegmentTemplate>"#,
     );
     assert_eq!(starts(&plain), [0]);
@@ -274,7 +271,7 @@ fn stream_rejects_unknown_format() {
         </MPD>
     "#;
     let manifest = DashManifest::new(xml).unwrap();
-    let error = manifest.fragment_stream("FLAC").unwrap_err();
+    let error = manifest.segment_stream("FLAC").unwrap_err();
     assert!(matches!(
         error,
         Error::DashManifestMissingRepresentation(id) if id == "FLAC"
@@ -538,7 +535,7 @@ fn relative_urls_need_a_base_url() {
     "#;
     let manifest = DashManifest::new(xml).unwrap();
     assert!(matches!(
-        manifest.fragments("FLAC"),
+        manifest.segments("FLAC"),
         Err(Error::DashManifestUrl(url, url::ParseError::RelativeUrlWithoutBase)) if url == "init.mp4"
     ));
     assert!(matches!(
@@ -580,10 +577,10 @@ fn period_duration_runs_to_next_period_start() {
 
     // Each period's media presents from its start.
     let secs = Duration::from_secs;
-    let first = manifest.fragments("FIRST").unwrap();
+    let first = manifest.segments("FIRST").unwrap();
     assert_eq!(first.span(0), Some(secs(2)..secs(4)));
     assert_eq!(first.end(), Some(secs(7)));
-    let second = manifest.fragments("SECOND").unwrap();
+    let second = manifest.segments("SECOND").unwrap();
     assert_eq!(second.span(0), Some(secs(7)..secs(17)));
     assert_eq!(second.end(), Some(secs(20)));
 }
@@ -654,8 +651,8 @@ fn new_from_url_accepts_data_urls() {
     assert_eq!(manifest.base_url(), None);
 }
 
-pub(crate) fn ranged(url: &str, start: u64, end: u64) -> Fragment {
-    Fragment::with_range(url, start..=end)
+pub(crate) fn ranged(url: &str, start: u64, end: u64) -> SegmentLocation {
+    SegmentLocation::with_range(url, start..=end)
 }
 
 #[test]
@@ -681,7 +678,7 @@ fn segment_list_media_ranges_address_one_file() {
         .with_base_url("https://cdn.example/audio/manifest.mpd")
         .unwrap();
     assert_eq!(
-        parts(&manifest.fragments("FLAC").unwrap()),
+        parts(&manifest.segments("FLAC").unwrap()),
         (
             ranged("https://cdn.example/audio/track.mp4", 0, 837),
             vec![
@@ -713,11 +710,11 @@ fn segment_list_presents_from_its_inherited_offset() {
             </Period>
         </MPD>
     "#;
-    let fragments = DashManifest::new(xml).unwrap().fragments("FLAC").unwrap();
-    assert_eq!(fragments.timing().unwrap().presentation_time_offset, 500);
+    let segments = DashManifest::new(xml).unwrap().segments("FLAC").unwrap();
+    assert_eq!(segments.timing().unwrap().presentation_time_offset, 500);
     let secs = Duration::from_secs;
-    assert_eq!(fragments.span(0), Some(secs(1)..secs(3)));
-    assert_eq!(fragments.span(1), Some(secs(3)..secs(5)));
+    assert_eq!(segments.span(0), Some(secs(1)..secs(3)));
+    assert_eq!(segments.span(1), Some(secs(3)..secs(5)));
 }
 
 #[test]
@@ -802,19 +799,19 @@ fn rejects_invalid_segment_list() {
         .unwrap()
     };
     assert!(matches!(
-        manifest(r#"<SegmentList duration="1"><Initialization/></SegmentList>"#).fragments("FLAC"),
+        manifest(r#"<SegmentList duration="1"><Initialization/></SegmentList>"#).segments("FLAC"),
         Err(Error::DashManifestInvalidSegments(_))
     ));
     assert!(matches!(
         manifest(r#"<SegmentList duration="1"><SegmentURL media="a.m4s"/></SegmentList>"#)
-            .fragments("FLAC"),
+            .segments("FLAC"),
         Err(Error::DashManifestMissingUrls)
     ));
     assert!(matches!(
         manifest(
             r#"<SegmentList duration="1"><Initialization/><SegmentURL mediaRange="9-1"/></SegmentList>"#
         )
-        .fragments("FLAC"),
+        .segments("FLAC"),
         Err(Error::InvalidByteRange(range)) if range == "9-1"
     ));
 }
@@ -838,18 +835,18 @@ fn segment_template_falls_back_to_initialization_element() {
     "#;
     let manifest = DashManifest::new(xml).unwrap();
     assert_eq!(
-        parts(&manifest.fragments("FLAC").unwrap()),
+        parts(&manifest.segments("FLAC").unwrap()),
         (
             ranged("https://cdn.example/track.mp4", 0, 99),
-            vec![Fragment::new("https://cdn.example/1.m4s")]
+            vec![SegmentLocation::new("https://cdn.example/1.m4s")]
         )
     );
 }
 
 #[test]
 #[cfg(feature = "sync")]
-fn fragment_stream_with_cache_shares_cached_fragments() {
-    use crate::fragment::{FragmentCache, Transport};
+fn segment_stream_with_cache_shares_cached_segments() {
+    use crate::segment::{SegmentCache, Transport};
     use std::io::Read;
     use std::sync::{Arc, Mutex};
 
@@ -858,9 +855,13 @@ fn fragment_stream_with_cache_shares_cached_fragments() {
     struct Recording(Mutex<Vec<String>>);
 
     impl Transport for Recording {
-        fn get(&self, fragment: &Fragment, _size_hint: Option<u64>) -> Result<crate::Bytes, Error> {
-            self.0.lock().unwrap().push(fragment.url.clone());
-            let name = fragment.url.rsplit('/').next().unwrap();
+        fn get(
+            &self,
+            segment: &SegmentLocation,
+            _size_hint: Option<u64>,
+        ) -> Result<crate::Bytes, Error> {
+            self.0.lock().unwrap().push(segment.url.clone());
+            let name = segment.url.rsplit('/').next().unwrap();
             Ok(crate::Bytes::copy_from_slice(name.as_bytes()))
         }
     }
@@ -883,10 +884,10 @@ fn fragment_stream_with_cache_shares_cached_fragments() {
         .with_base_url("https://cdn.example/")
         .unwrap();
     let transport = Arc::new(Recording::default());
-    let cache = Arc::new(FragmentCache::new(transport.clone()));
+    let cache = Arc::new(SegmentCache::new(transport.clone()));
     for _ in 0..2 {
         let mut reader = manifest
-            .fragment_stream_with_cache("FLAC", cache.clone())
+            .segment_stream_with_cache("FLAC", cache.clone())
             .unwrap();
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();

@@ -2,9 +2,9 @@
 //! ffprobe's, shared by the integration tests.
 #![allow(dead_code)]
 
-use playdash::fragment::{Fragment, FragmentStream, Fragments};
 use playdash::packet::Packet;
-use playdash::{Bytes, DashManifest, Error, FragmentCache, Transport};
+use playdash::segment::{SegmentLocation, SegmentStream, Segments};
+use playdash::{Bytes, DashManifest, Error, SegmentCache, Transport};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -24,7 +24,7 @@ pub fn fixture(path: &str) -> Vec<u8> {
 /// each GET.
 #[derive(Default)]
 pub struct Fixtures {
-    pub gets: Mutex<Vec<Fragment>>,
+    pub gets: Mutex<Vec<SegmentLocation>>,
 }
 
 impl Fixtures {
@@ -35,17 +35,17 @@ impl Fixtures {
             .lock()
             .unwrap()
             .iter()
-            .filter(|fragment| fragment.url == url)
+            .filter(|segment| segment.url == url)
             .count()
     }
 }
 
 impl Transport for Fixtures {
-    fn get(&self, fragment: &Fragment, _size_hint: Option<u64>) -> Result<Bytes, Error> {
-        self.gets.lock().unwrap().push(fragment.clone());
-        let path = fragment.url.strip_prefix(BASE).expect("fixture URL");
+    fn get(&self, segment: &SegmentLocation, _size_hint: Option<u64>) -> Result<Bytes, Error> {
+        self.gets.lock().unwrap().push(segment.clone());
+        let path = segment.url.strip_prefix(BASE).expect("fixture URL");
         let body = Bytes::from(fixture(path));
-        Ok(match &fragment.range {
+        Ok(match &segment.range {
             Some(range) => body.slice(*range.start() as usize..=*range.end() as usize),
             None => body,
         })
@@ -53,8 +53,8 @@ impl Transport for Fixtures {
 }
 
 /// The representation in `tests/files/packets/<name>.mpd`, read through `transport`.
-pub fn fragment_stream(name: &str, transport: Arc<Fixtures>) -> FragmentStream {
-    fragment_stream_through(name, transport)
+pub fn segment_stream(name: &str, transport: Arc<Fixtures>) -> SegmentStream {
+    segment_stream_through(name, transport)
 }
 
 /// The manifest `tests/files/packets/<name>.mpd`, at the URL [`Fixtures`] serves it from.
@@ -67,44 +67,41 @@ pub fn manifest(name: &str) -> DashManifest {
 }
 
 /// The representation in `tests/files/packets/<name>.mpd`, read through any `transport`.
-pub fn fragment_stream_through(name: &str, transport: Arc<dyn Transport>) -> FragmentStream {
+pub fn segment_stream_through(name: &str, transport: Arc<dyn Transport>) -> SegmentStream {
     let manifest = manifest(name);
     let id = manifest.representations().next().unwrap().id.to_owned();
     manifest
-        .fragment_stream_with_cache(id, Arc::new(FragmentCache::new(transport)))
+        .segment_stream_with_cache(id, Arc::new(SegmentCache::new(transport)))
         .unwrap()
 }
 
 #[cfg(feature = "async")]
-impl playdash::nonblocking::fragment::Transport for Fixtures {
+impl playdash::nonblocking::segment::Transport for Fixtures {
     fn get<'a>(
         &'a self,
-        fragment: &'a Fragment,
+        segment: &'a SegmentLocation,
         size_hint: Option<u64>,
     ) -> futures_util::future::BoxFuture<'a, Result<Bytes, Error>> {
-        Box::pin(async move { Transport::get(self, fragment, size_hint) })
+        Box::pin(async move { Transport::get(self, segment, size_hint) })
     }
 }
 
 /// The representation in `tests/files/packets/<name>.mpd`, read by the async API through
 /// fresh [`Fixtures`].
 #[cfg(feature = "async")]
-pub async fn async_fragment_stream(name: &str) -> playdash::nonblocking::fragment::FragmentStream {
+pub async fn async_segment_stream(name: &str) -> playdash::nonblocking::segment::SegmentStream {
     use playdash::nonblocking::DashManifest;
-    use playdash::nonblocking::fragment::FragmentCache;
+    use playdash::nonblocking::segment::SegmentCache;
 
     let manifest = DashManifest::from(manifest(name));
     let id = manifest.representations().next().unwrap().id.to_owned();
-    let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures::default())));
-    manifest
-        .fragment_stream_with_cache(id, cache)
-        .await
-        .unwrap()
+    let cache = Arc::new(SegmentCache::new(Arc::new(Fixtures::default())));
+    manifest.segment_stream_with_cache(id, cache).await.unwrap()
 }
 
-/// The fragments of `file`, a single fragmented MP4 file at `url`: the `ftyp`+`moov`
-/// byte range, then each `moof`+`mdat`.
-pub fn split_fragments(url: &str, file: &[u8]) -> Fragments {
+/// The segments of `file`, a single fragmented MP4 file at `url`: the `ftyp`+`moov`
+/// byte range, then one media segment per `moof`+`mdat`.
+pub fn split_segments(url: &str, file: &[u8]) -> Segments {
     let mut ranges = Vec::new();
     let (mut start, mut pos) = (0, 0);
     while pos < file.len() {
@@ -117,17 +114,17 @@ pub fn split_fragments(url: &str, file: &[u8]) -> Fragments {
         }
         pos = end;
     }
-    let mut fragments = ranges
+    let mut segments = ranges
         .into_iter()
-        .map(|range| Fragment::with_range(url, range));
-    let init = fragments.next().expect("a moov");
-    Fragments::new(init, fragments)
+        .map(|range| SegmentLocation::with_range(url, range));
+    let init = segments.next().expect("a moov");
+    Segments::new(init, segments)
 }
 
-/// The fragments of `tests/files/packets/muxed.mp4`: H.264 and AAC in one representation.
-pub fn muxed() -> Fragments {
+/// The segments of `tests/files/packets/muxed.mp4`: H.264 and AAC in one representation.
+pub fn muxed() -> Segments {
     let url = format!("{BASE}packets/muxed.mp4");
-    split_fragments(&url, &fixture("packets/muxed.mp4"))
+    split_segments(&url, &fixture("packets/muxed.mp4"))
 }
 
 /// One packet as ffprobe lists it.

@@ -51,11 +51,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The tracks of representation `id`, from its initialization fragment.
+/// The tracks of representation `id`, from its initialization segment.
 fn tracks(manifest: &DashManifest, id: &str) -> Result<Vec<Track>, Box<dyn Error>> {
-    // Opening a stream fetches the initialization fragment. Keep its download of
-    // media to the first fragment, which dropping the stream then abandons.
-    let stream = manifest.fragment_stream(id)?.with_retention(Retention {
+    // Opening a stream fetches the initialization segment. Keep its download of
+    // media to the first segment, which dropping the stream then abandons.
+    let stream = manifest.segment_stream(id)?.with_retention(Retention {
         behind: Some(Duration::ZERO),
         ahead: Some(Duration::ZERO),
     });

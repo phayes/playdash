@@ -4,15 +4,15 @@
 
 mod common;
 
-use common::{BASE, Fixtures, Probe, Probed, assert_matches, fixture, fragment_stream, muxed};
-use playdash::fragment::FragmentStream;
+use common::{BASE, Fixtures, Probe, Probed, assert_matches, fixture, muxed, segment_stream};
 use playdash::packet::{Packet, PacketSeeked, PacketStream};
-use playdash::{Codec, ContentKind, DashManifest, Error, FragmentCache, Retention};
+use playdash::segment::SegmentStream;
+use playdash::{Codec, ContentKind, DashManifest, Error, Retention, SegmentCache};
 use std::sync::Arc;
 use std::time::Duration;
 
 fn packets(name: &str) -> PacketStream {
-    PacketStream::new(fragment_stream(name, Arc::default())).unwrap()
+    PacketStream::new(segment_stream(name, Arc::default())).unwrap()
 }
 
 fn probed(name: &str) -> Vec<Probed> {
@@ -324,9 +324,9 @@ fn video_keyframe_seeks_land_on_the_keyframe_before_the_time() {
 }
 
 #[test]
-fn seeks_land_on_the_next_packet_even_past_the_timelines_fragment() {
-    // The single-file fixtures' SegmentList @duration only approximates their fragments, so
-    // some times fall after the last packet of the fragment the timeline names.
+fn seeks_land_on_the_next_packet_even_past_the_timelines_segment() {
+    // The single-file fixtures' SegmentList @duration only approximates their segments, so
+    // some times fall after the last packet of the segment the timeline names.
     for name in AUDIO.iter().chain(&VIDEO) {
         let first_pts = packets(name).next().unwrap().unwrap().pts;
         for millis in (0..1_500).step_by(20) {
@@ -357,7 +357,7 @@ fn seeks_land_on_the_next_packet_even_past_the_timelines_fragment() {
 #[test]
 fn keyframe_seeks_land_before_the_time_and_exact_seeks_reach_back() {
     let transport = Arc::new(Fixtures::default());
-    let stream = fragment_stream("aac", transport.clone()).with_retention(Retention {
+    let stream = segment_stream("aac", transport.clone()).with_retention(Retention {
         behind: Some(Duration::ZERO),
         ahead: Some(Duration::ZERO),
     });
@@ -404,7 +404,7 @@ fn keyframe_seeks_land_before_the_time_and_exact_seeks_reach_back() {
 
 #[test]
 fn a_read_stream_or_encrypted_samples_are_refused() {
-    let mut stream = fragment_stream("aac", Arc::default());
+    let mut stream = segment_stream("aac", Arc::default());
     stream.next().unwrap().unwrap();
     assert!(matches!(
         PacketStream::new(stream),
@@ -418,9 +418,9 @@ fn a_read_stream_or_encrypted_samples_are_refused() {
         .with_base_url(&format!("{BASE}encryption/shaka_cenc.mpd"))
         .unwrap();
     let stream = manifest
-        .fragment_stream_with_cache(
+        .segment_stream_with_cache(
             "0",
-            Arc::new(FragmentCache::new(Arc::new(Fixtures::default()))),
+            Arc::new(SegmentCache::new(Arc::new(Fixtures::default()))),
         )
         .unwrap();
     assert!(matches!(
@@ -432,12 +432,12 @@ fn a_read_stream_or_encrypted_samples_are_refused() {
 #[test]
 fn muxed_tracks_are_listed_and_read_one_stream_each() {
     let transport = Arc::new(Fixtures::default());
-    let cache = Arc::new(FragmentCache::new(transport.clone()));
-    let fragments = muxed();
-    let media = fragments.media_len();
-    let stream = || FragmentStream::new_with_cache(fragments.clone(), cache.clone()).unwrap();
+    let cache = Arc::new(SegmentCache::new(transport.clone()));
+    let segments = muxed();
+    let media = segments.media_len();
+    let stream = || SegmentStream::new_with_cache(segments.clone(), cache.clone()).unwrap();
 
-    // The tracks, read from the initialization fragment the stream already holds.
+    // The tracks, read from the initialization segment the stream already holds.
     let video_stream = stream();
     let tracks = video_stream.tracks().unwrap();
     let listed: Vec<_> = tracks.iter().map(|track| (track.id, track.kind)).collect();
@@ -471,14 +471,14 @@ fn muxed_tracks_are_listed_and_read_one_stream_each() {
         true,
     );
 
-    // Sharing a cache, every fragment downloaded once.
+    // Sharing a cache, every segment downloaded once.
     assert_eq!(transport.gets.lock().unwrap().len(), 1 + media);
 }
 
 #[test]
 #[cfg(feature = "encryption")]
 fn decrypted_packets_are_the_plain_packets() {
-    use common::split_fragments;
+    use common::split_segments;
     use playdash::{Bytes, ContentKeys};
 
     let mut keys = ContentKeys::new();
@@ -488,8 +488,8 @@ fn decrypted_packets_are_the_plain_packets() {
     )
     .unwrap();
     let cache =
-        || Arc::new(FragmentCache::new(Arc::new(Fixtures::default())).with_keys(keys.clone()));
-    let data = |stream: FragmentStream| -> Vec<Bytes> {
+        || Arc::new(SegmentCache::new(Arc::new(Fixtures::default())).with_keys(keys.clone()));
+    let data = |stream: SegmentStream| -> Vec<Bytes> {
         PacketStream::new(stream)
             .unwrap()
             .map(|packet| packet.unwrap().data)
@@ -497,8 +497,8 @@ fn decrypted_packets_are_the_plain_packets() {
     };
 
     let url = format!("{BASE}encryption/plain.mp4");
-    let fragments = split_fragments(&url, &fixture("encryption/plain.mp4"));
-    let plain = data(FragmentStream::new_with_cache(fragments, cache()).unwrap());
+    let segments = split_segments(&url, &fixture("encryption/plain.mp4"));
+    let plain = data(SegmentStream::new_with_cache(segments, cache()).unwrap());
     assert!(plain.len() > 10);
 
     for name in ["shaka_cenc", "shaka_cbcs"] {
@@ -508,15 +508,15 @@ fn decrypted_packets_are_the_plain_packets() {
             .with_base_url(&format!("{BASE}encryption/{name}.mpd"))
             .unwrap();
         assert_eq!(
-            data(manifest.fragment_stream_with_cache("0", cache()).unwrap()),
+            data(manifest.segment_stream_with_cache("0", cache()).unwrap()),
             plain,
             "{name}"
         );
     }
     let url = format!("{BASE}encryption/ffmpeg_cenc.mp4");
-    let fragments = split_fragments(&url, &fixture("encryption/ffmpeg_cenc.mp4"));
+    let segments = split_segments(&url, &fixture("encryption/ffmpeg_cenc.mp4"));
     assert_eq!(
-        data(FragmentStream::new_with_cache(fragments, cache()).unwrap()),
+        data(SegmentStream::new_with_cache(segments, cache()).unwrap()),
         plain,
         "ffmpeg_cenc"
     );
@@ -526,12 +526,12 @@ fn decrypted_packets_are_the_plain_packets() {
 #[cfg(feature = "async")]
 mod nonblocking {
     use super::*;
-    use common::async_fragment_stream;
+    use common::async_segment_stream;
     use futures_util::StreamExt;
     use playdash::nonblocking;
 
     async fn packets(name: &str) -> nonblocking::packet::PacketStream {
-        nonblocking::packet::PacketStream::new(async_fragment_stream(name).await)
+        nonblocking::packet::PacketStream::new(async_segment_stream(name).await)
             .await
             .unwrap()
     }
@@ -576,14 +576,13 @@ mod nonblocking {
 
     #[tokio::test]
     async fn muxed_tracks_match_blocking_ones() {
-        let cache = Arc::new(nonblocking::fragment::FragmentCache::new(Arc::new(
+        let cache = Arc::new(nonblocking::segment::SegmentCache::new(Arc::new(
             Fixtures::default(),
         )));
-        let stream =
-            || nonblocking::fragment::FragmentStream::new_with_cache(muxed(), cache.clone());
-        let blocking = FragmentStream::new_with_cache(
+        let stream = || nonblocking::segment::SegmentStream::new_with_cache(muxed(), cache.clone());
+        let blocking = SegmentStream::new_with_cache(
             muxed(),
-            Arc::new(FragmentCache::new(Arc::new(Fixtures::default()))),
+            Arc::new(SegmentCache::new(Arc::new(Fixtures::default()))),
         )
         .unwrap();
 

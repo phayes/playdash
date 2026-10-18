@@ -14,14 +14,14 @@ pub(crate) mod tests;
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::fragment::{Fragment, Fragments, MediaSegment, MediaTiming};
+use crate::segment::{MediaSegment, MediaTiming, SegmentLocation, Segments};
 use crate::vendor::dash_mpd_core::{
     AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation as CoreRepresentation,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 pub use representation::{ContentKind, FrameRate, Representation};
 use segment_list::ListChain;
-use segments::Segments;
+use segments::SegmentTimes;
 use std::collections::HashMap;
 use template::{TemplateChain, TemplateValues};
 use url::Url;
@@ -60,7 +60,7 @@ use url::Url;
 ///     .with_base_url("https://media.example/stream.mpd")?;
 /// let audio = manifest.representation("audio").unwrap();
 /// assert_eq!(audio.bandwidth, Some(128_000));
-/// assert_eq!(manifest.fragments("audio")?.media_len(), 2);
+/// assert_eq!(manifest.segments("audio")?.media_len(), 2);
 /// # Ok::<(), playdash::Error>(())
 /// ```
 #[derive(Clone, Default, Debug, PartialEq)]
@@ -197,65 +197,61 @@ impl<'a> Selected<'a> {
         end.checked_sub(self.period.start.unwrap_or_default())
     }
 
-    fn segments(self) -> Result<Segments, Error> {
+    fn segment_times(self) -> Result<SegmentTimes, Error> {
         if self.needs_segment_index() {
             return Err(Error::DashManifestInvalidSegments(
                 "SegmentBase index not loaded; load it with load_segment_indexes".to_owned(),
             ));
         }
         if self.uses_segment_list() {
-            self.lists().segments(self.period_duration())
+            self.lists().segment_times(self.period_duration())
         } else {
-            self.templates().segments(self.period_duration())
+            self.templates().segment_times(self.period_duration())
         }
     }
 
-    fn fragments(
-        self,
-        manifest_url: Option<&Url>,
-        segments: &Segments,
-    ) -> Result<Fragments, Error> {
+    fn segments(self, manifest_url: Option<&Url>, times: &SegmentTimes) -> Result<Segments, Error> {
         let urls = if self.uses_segment_list() {
-            self.lists().fragments(segments)?
+            self.lists().urls(times)?
         } else {
             let values = TemplateValues {
                 representation_id: self.id(),
                 bandwidth: self.representation.bandwidth,
                 ..TemplateValues::default()
             };
-            self.templates().fragments(values, segments)?
+            self.templates().urls(values, times)?
         };
 
         // Resolve every URL against the BaseURL chain.
         let base = self.base_url(manifest_url)?;
-        let resolve = |fragment: Fragment| -> Result<Fragment, Error> {
-            Ok(Fragment {
-                url: resolve_url(base.as_ref(), &fragment.url)?.into(),
-                ..fragment
+        let resolve = |location: SegmentLocation| -> Result<SegmentLocation, Error> {
+            Ok(SegmentLocation {
+                url: resolve_url(base.as_ref(), &location.url)?.into(),
+                ..location
             })
         };
 
         let init = resolve(urls.init)?;
 
-        // Time each media fragment by its segment, on the Period's clock.
+        // Time each media segment, on the Period's clock.
         let timing = MediaTiming {
-            timescale: segments.timescale,
-            presentation_time_offset: segments.presentation_time_offset,
+            timescale: times.timescale,
+            presentation_time_offset: times.presentation_time_offset,
             period_start: self.period.start.unwrap_or_default(),
         };
         let media = urls
             .media
             .into_iter()
-            .zip(&segments.segments)
-            .map(|(fragment, segment)| {
+            .zip(&times.segments)
+            .map(|(location, time)| {
                 Ok(MediaSegment {
-                    fragment: resolve(fragment)?,
-                    start: segment.time,
-                    duration: segment.duration,
+                    location: resolve(location)?,
+                    start: time.time,
+                    duration: time.duration,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        Fragments::timed(init, timing, media)
+        Segments::timed(init, timing, media)
     }
 
     /// Resolves the first `BaseURL` of each level (MPD, Period, AdaptationSet,
@@ -403,13 +399,13 @@ impl DashManifest {
     ///
     /// This is a lower-level query; use `media_stream` for decoder-ready playback.
     ///
-    /// Fragments come from the representation's `SegmentTemplate` or
+    /// Segments come from the representation's `SegmentTemplate` or
     /// `SegmentList` (whose entries may carry byte ranges), with URLs resolved
     /// against the `BaseURL` chain and [`DashManifest::base_url`]. Their spans
     /// are presentation time, shared by every representation of the manifest.
-    pub fn fragments(&self, representation_id: impl AsRef<str>) -> Result<Fragments, Error> {
-        let (selected, segments) = self.select_segments(representation_id.as_ref())?;
-        selected.fragments(self.base_url.as_ref(), &segments)
+    pub fn segments(&self, representation_id: impl AsRef<str>) -> Result<Segments, Error> {
+        let (selected, times) = self.select_segment_times(representation_id.as_ref())?;
+        selected.segments(self.base_url.as_ref(), &times)
     }
 
     /// Returns a representation's MIME type, inherited from its adaptation set.
@@ -468,9 +464,9 @@ impl DashManifest {
             })
     }
 
-    /// A representation and its media segments, or the error that kept its
+    /// A representation and its media segments' times, or the error that kept its
     /// `SegmentBase` index from loading.
-    fn select_segments(&self, id: &str) -> Result<(Selected<'_>, Segments), Error> {
+    fn select_segment_times(&self, id: &str) -> Result<(Selected<'_>, SegmentTimes), Error> {
         let selected = self.select(id)?;
         if selected.needs_segment_index()
             && let Some(reason) = self.segment_index_errors.get(selected.id())
@@ -480,7 +476,7 @@ impl DashManifest {
                 reason: reason.clone(),
             });
         }
-        Ok((selected, selected.segments()?))
+        Ok((selected, selected.segment_times()?))
     }
 
     fn select(&self, id: &str) -> Result<Selected<'_>, Error> {

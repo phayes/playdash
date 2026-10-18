@@ -4,7 +4,7 @@
 //! A media stream implements [`futures_util::Stream`] and yields compressed packets ready
 //! for a decoder. Manifest and segment HTTP requests use [`reqwest`].
 //!
-//! The [`fragment`] and [`packet`] modules provide lower-level access to downloaded
+//! The [`segment`] and [`packet`] modules provide lower-level access to downloaded
 //! segments and MP4 packets. Most applications do not need them.
 //!
 //! # Examples
@@ -27,16 +27,16 @@
 //! ```
 
 mod decoder;
-pub mod fragment;
 pub mod packet;
+pub mod segment;
 
 pub use decoder::{MediaStream, MediaStreamBuilder};
 
 use crate::error::Error;
-use crate::fragment::Fragments;
 use crate::manifest::{ContentKind, Representation};
-use fragment::Transport;
+use crate::segment::Segments;
 use reqwest::{Client, Response};
+use segment::Transport;
 use std::sync::OnceLock;
 
 /// A parsed MPEG-DASH manifest whose representations stream asynchronously:
@@ -140,8 +140,8 @@ impl DashManifest {
     pub async fn load_segment_indexes(&mut self) {
         let client = self.client().clone();
         for request in self.manifest.index_requests() {
-            let fragment = request.fragment();
-            match Transport::get(&client, fragment, fragment.known_size()).await {
+            let location = request.location();
+            match Transport::get(&client, location, location.known_size()).await {
                 Ok(body) => self.manifest.apply_index(&request, &body),
                 Err(error) => self.manifest.fail_index(&request, error),
             }
@@ -213,8 +213,8 @@ impl DashManifest {
 
     /// Resolves a representation's initialization segment and ordered media segments.
     /// This is a lower-level query; use [`Self::media_stream`] for decoder-ready playback.
-    pub fn fragments(&self, representation_id: impl AsRef<str>) -> Result<Fragments, Error> {
-        self.manifest.fragments(representation_id)
+    pub fn segments(&self, representation_id: impl AsRef<str>) -> Result<Segments, Error> {
+        self.manifest.segments(representation_id)
     }
 
     /// Returns the representation's inherited MIME type, or `Ok(None)` if undeclared.
@@ -262,10 +262,10 @@ impl From<crate::DashManifest> for DashManifest {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::fragment::{Fragment, parse_byte_range};
+    use crate::segment::{SegmentLocation, parse_byte_range};
     use bytes::Bytes;
-    use fragment::FragmentStream;
     use futures_util::StreamExt;
+    use segment::SegmentStream;
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -336,7 +336,7 @@ pub(crate) mod tests {
     }
 
     /// Every item of `stream`, as text.
-    pub(crate) async fn texts(stream: &mut FragmentStream) -> Vec<String> {
+    pub(crate) async fn texts(stream: &mut SegmentStream) -> Vec<String> {
         stream
             .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
             .collect()
@@ -374,14 +374,14 @@ pub(crate) mod tests {
             manifest.base_url(),
             Some(format!("{base}/audio/manifest.mpd").as_str())
         );
-        let fragments = manifest.fragments("FLAC").unwrap();
-        assert_eq!(fragments.media_len(), 2);
+        let segments = manifest.segments("FLAC").unwrap();
+        assert_eq!(segments.media_len(), 2);
         assert_eq!(
-            fragments.init(),
-            &Fragment::with_range(format!("{base}/audio/track.mp4"), 0..=837)
+            segments.init(),
+            &SegmentLocation::with_range(format!("{base}/audio/track.mp4"), 0..=837)
         );
-        let durations: Vec<u64> = fragments
-            .segments()
+        let durations: Vec<u64> = segments
+            .timed_media()
             .unwrap()
             .iter()
             .map(|segment| segment.duration)
@@ -391,7 +391,7 @@ pub(crate) mod tests {
         // The stream reads the init, then the media past the index.
         let (init, media) = (&file[..838], &file[838 + index_len(&index_range)..]);
         let items: Vec<Bytes> = manifest
-            .fragment_stream("FLAC")
+            .segment_stream("FLAC")
             .await
             .unwrap()
             .map(Result::unwrap)
@@ -401,7 +401,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn fragment_stream_opens_a_representation_through_the_given_client() {
+    async fn segment_stream_opens_a_representation_through_the_given_client() {
         let (base, _) = serve(named());
         let xml = r#"<MPD><Period><AdaptationSet mimeType="audio/mp4">
             <Representation id="FLAC,24bit">
@@ -416,17 +416,17 @@ pub(crate) mod tests {
             .with_base_url(&format!("{base}/manifest.mpd"))
             .unwrap();
 
-        let mut stream = manifest.fragment_stream("FLAC").await.unwrap();
+        let mut stream = manifest.segment_stream("FLAC").await.unwrap();
         assert_eq!(texts(&mut stream).await, ["init", "1", "2", "3"]);
 
         let (mut stream, start) = manifest
-            .fragment_stream_at("FLAC", Duration::from_millis(1_500))
+            .segment_stream_at("FLAC", Duration::from_millis(1_500))
             .await
             .unwrap();
         assert_eq!(start, Duration::from_secs(1));
         assert_eq!(texts(&mut stream).await, ["init", "2", "3"]);
         assert!(matches!(
-            manifest.fragment_stream("AAC").await,
+            manifest.segment_stream("AAC").await,
             Err(Error::DashManifestMissingRepresentation(id)) if id == "AAC"
         ));
     }

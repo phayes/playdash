@@ -2,10 +2,10 @@
 //! and checks they decode to the same samples as the unencrypted source.
 #![cfg(all(feature = "encryption", feature = "rodio"))]
 
-use playdash::fragment::{Fragment, FragmentStream, Fragments};
+use playdash::segment::{SegmentLocation, SegmentStream, Segments};
 use playdash::{
-    BufferStatus, Bytes, ContentKeys, DashManifest, DashSource, Error, FragmentCache, MediaPacket,
-    MediaStream, Transport,
+    BufferStatus, Bytes, ContentKeys, DashManifest, DashSource, Error, MediaPacket, MediaStream,
+    SegmentCache, Transport,
 };
 use rodio::{Decoder, Source};
 use std::io::{BufRead, BufReader, Cursor, Write};
@@ -27,17 +27,17 @@ fn fixture(name: &str) -> Vec<u8> {
 struct Fixtures;
 
 impl Transport for Fixtures {
-    fn get(&self, fragment: &Fragment, _size_hint: Option<u64>) -> Result<Bytes, Error> {
-        let name = fragment.url.strip_prefix(BASE).expect("fixture URL");
+    fn get(&self, segment: &SegmentLocation, _size_hint: Option<u64>) -> Result<Bytes, Error> {
+        let name = segment.url.strip_prefix(BASE).expect("fixture URL");
         let body = Bytes::from(fixture(name));
-        Ok(match &fragment.range {
+        Ok(match &segment.range {
             Some(range) => body.slice(*range.start() as usize..=*range.end() as usize),
             None => body,
         })
     }
 }
 
-/// Serves fixtures like [`Fixtures`], but holds back the last media fragment
+/// Serves fixtures like [`Fixtures`], but holds back the last media segment
 /// until opened.
 #[derive(Default)]
 struct Gated {
@@ -53,12 +53,12 @@ impl Gated {
 }
 
 impl Transport for Gated {
-    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error> {
-        if fragment.url.ends_with("_3.m4s") {
+    fn get(&self, segment: &SegmentLocation, size_hint: Option<u64>) -> Result<Bytes, Error> {
+        if segment.url.ends_with("_3.m4s") {
             let open = self.open.lock().unwrap();
             drop(self.opened.wait_while(open, |open| !*open).unwrap());
         }
-        Fixtures.get(fragment, size_hint)
+        Fixtures.get(segment, size_hint)
     }
 }
 
@@ -98,8 +98,8 @@ fn keys() -> ContentKeys {
     keys
 }
 
-fn keyed_cache() -> Arc<FragmentCache> {
-    Arc::new(FragmentCache::new(Arc::new(Fixtures)).with_keys(keys()))
+fn keyed_cache() -> Arc<SegmentCache> {
+    Arc::new(SegmentCache::new(Arc::new(Fixtures)).with_keys(keys()))
 }
 
 fn manifest(name: &str) -> DashManifest {
@@ -183,9 +183,9 @@ fn plain_samples() -> Vec<f32> {
     samples
 }
 
-/// The fragments of `file`, a single fragmented MP4 file at `url`: the
-/// `ftyp`+`moov` byte range, then each `moof`+`mdat`.
-fn split_fragments(url: &str, file: &[u8]) -> Fragments {
+/// The segments of `file`, a single fragmented MP4 file at `url`: the
+/// `ftyp`+`moov` byte range, then one media segment per `moof`+`mdat`.
+fn split_segments(url: &str, file: &[u8]) -> Segments {
     let mut ranges = Vec::new();
     let (mut start, mut pos) = (0, 0);
     while pos < file.len() {
@@ -201,16 +201,16 @@ fn split_fragments(url: &str, file: &[u8]) -> Fragments {
         }
         pos = end;
     }
-    let mut fragments = ranges
+    let mut segments = ranges
         .into_iter()
-        .map(|range| Fragment::with_range(url, range));
-    let init = fragments.next().expect("a moov");
-    Fragments::new(init, fragments)
+        .map(|range| SegmentLocation::with_range(url, range));
+    let init = segments.next().expect("a moov");
+    Segments::new(init, segments)
 }
 
-fn ranged_reader(name: &str, cache: Arc<FragmentCache>) -> FragmentStream {
-    let fragments = split_fragments(&format!("{BASE}{name}"), &fixture(name));
-    FragmentStream::new_with_cache(fragments, cache).unwrap()
+fn ranged_reader(name: &str, cache: Arc<SegmentCache>) -> SegmentStream {
+    let segments = split_segments(&format!("{BASE}{name}"), &fixture(name));
+    SegmentStream::new_with_cache(segments, cache).unwrap()
 }
 
 #[test]
@@ -234,18 +234,18 @@ fn decrypts_ffmpeg_cenc_byte_ranges() {
 }
 
 #[test]
-fn iterates_decrypted_fragments() {
+fn iterates_decrypted_segments() {
     let manifest = manifest("shaka_cbcs.mpd");
-    let fragments: Vec<_> = manifest
-        .fragment_stream_with_cache("0", keyed_cache())
+    let segments: Vec<_> = manifest
+        .segment_stream_with_cache("0", keyed_cache())
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(
-        fragments.len(),
-        1 + manifest.fragments("0").unwrap().media_len()
+        segments.len(),
+        1 + manifest.segments("0").unwrap().media_len()
     );
-    let joined: Vec<u8> = fragments.iter().flatten().copied().collect();
+    let joined: Vec<u8> = segments.iter().flatten().copied().collect();
     assert_eq!(decode(Cursor::new(joined)), plain_samples());
 }
 
@@ -259,7 +259,7 @@ fn keyed_cache_passes_unprotected_media_through() {
 fn seeks_within_decrypted_stream() {
     let manifest = manifest("shaka_cbcs.mpd");
     let mut source = DashSource::new_with_cache(&manifest, "0", keyed_cache()).unwrap();
-    // Past the first fragment, so the decoder is rebuilt from the cache.
+    // Past the first segment, so the decoder is rebuilt from the cache.
     source.try_seek(Duration::from_millis(700)).unwrap();
     let tail: Vec<f32> = source.collect();
 
@@ -272,7 +272,7 @@ fn seeks_within_decrypted_stream() {
 #[test]
 fn buffer_reports_downloads() {
     let gated = Arc::new(Gated::default());
-    let cache = Arc::new(FragmentCache::new(gated.clone()).with_keys(keys()));
+    let cache = Arc::new(SegmentCache::new(gated.clone()).with_keys(keys()));
     let source = DashSource::new_with_cache(&manifest("shaka_cbcs.mpd"), "0", cache).unwrap();
     let buffer = source.buffer();
     let reports = Arc::new(Reports::default());
@@ -281,9 +281,9 @@ fn buffer_reports_downloads() {
         move |status| reports.push(status)
     });
 
-    // The last of three half-second fragments is held back.
+    // The last of three half-second segments is held back.
     let status = buffer.status();
-    assert_eq!(status.total.fragments, 3);
+    assert_eq!(status.total.segments, 3);
     assert_eq!(status.total.end, Duration::from_millis(1500));
     assert!(!status.is_complete());
 
@@ -307,14 +307,14 @@ fn cache_holds_same_length_plaintext() {
     let source = DashSource::new_with_cache(&manifest, "0", cache.clone()).unwrap();
     assert!(source.count() > 0);
 
-    let fragments = manifest.fragments("0").unwrap();
-    for fragment in std::iter::once(fragments.init()).chain(fragments.media()) {
-        let raw = Fixtures.get(fragment, None).unwrap();
-        let cached = cache.cached(fragment).expect("fetched during playback");
-        assert_eq!(cached.len(), raw.len(), "{fragment}");
-        assert_ne!(cached, raw, "{fragment} was not decrypted");
+    let segments = manifest.segments("0").unwrap();
+    for segment in std::iter::once(segments.init()).chain(segments.media()) {
+        let raw = Fixtures.get(segment, None).unwrap();
+        let cached = cache.cached(segment).expect("fetched during playback");
+        assert_eq!(cached.len(), raw.len(), "{segment}");
+        assert_ne!(cached, raw, "{segment} was not decrypted");
     }
-    let init = cache.cached(fragments.init()).unwrap();
+    let init = cache.cached(segments.init()).unwrap();
     assert!(!init.windows(4).any(|window| window == b"enca"));
 }
 
@@ -323,7 +323,7 @@ fn missing_key_fails_before_playback() {
     let mut keys = ContentKeys::new();
     keys.insert_hex("ffffffffffffffffffffffffffffffff", KEY)
         .unwrap();
-    let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures)).with_keys(keys));
+    let cache = Arc::new(SegmentCache::new(Arc::new(Fixtures)).with_keys(keys));
     match DashSource::new_with_cache(&manifest("shaka_cbcs.mpd"), "0", cache) {
         Err(Error::MissingContentKey(kid)) => assert_eq!(kid, KID),
         Err(error) => panic!("unexpected error: {error}"),
@@ -360,7 +360,7 @@ fn other_keys() -> ContentKeys {
 
 #[test]
 fn media_stream_adds_keys_to_an_unused_cache() {
-    let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures)));
+    let cache = Arc::new(SegmentCache::new(Arc::new(Fixtures)));
     let keyed = manifest("shaka_cenc.mpd")
         .media_stream("0")
         .cache(cache.clone())
@@ -387,7 +387,7 @@ fn media_stream_merges_keys_into_a_keyed_cache() {
     );
 
     // The builder's keys are added to the cache's own.
-    let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures)).with_keys(other_keys()));
+    let cache = Arc::new(SegmentCache::new(Arc::new(Fixtures)).with_keys(other_keys()));
     let added = manifest("shaka_cenc.mpd")
         .media_stream("0")
         .cache(cache)
@@ -409,9 +409,9 @@ fn media_stream_merges_keys_into_a_keyed_cache() {
 #[test]
 fn media_stream_refuses_keys_for_a_cache_used_without_them() {
     let manifest = manifest("shaka_cenc.mpd");
-    let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures)));
+    let cache = Arc::new(SegmentCache::new(Arc::new(Fixtures)));
     let unkeyed = manifest
-        .fragment_stream_with_cache("0", cache.clone())
+        .segment_stream_with_cache("0", cache.clone())
         .unwrap();
     let opened = manifest
         .media_stream("0")
@@ -425,19 +425,19 @@ fn media_stream_refuses_keys_for_a_cache_used_without_them() {
 
 #[test]
 fn protected_dash_without_keys_is_rejected() {
-    let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures)));
+    let cache = Arc::new(SegmentCache::new(Arc::new(Fixtures)));
     assert!(matches!(
         DashSource::new_with_cache(&manifest("shaka_cbcs.mpd"), "0", cache),
         Err(Error::RodioProtectedContent(scheme)) if scheme == "cbcs"
     ));
 }
 
-/// The same fixtures through the async `FragmentStream`, served over HTTP.
+/// The same fixtures through the async `SegmentStream`, served over HTTP.
 #[cfg(feature = "async")]
 mod nonblocking {
     use super::*;
     use futures_util::StreamExt;
-    use playdash::nonblocking::fragment::{FragmentCache, FragmentStream};
+    use playdash::nonblocking::segment::{SegmentCache, SegmentStream};
 
     /// The DASH fixture `name`, served from `base`.
     fn async_manifest(base: &str, name: &str) -> playdash::nonblocking::DashManifest {
@@ -449,13 +449,13 @@ mod nonblocking {
     }
 
     /// Every item of `stream`, joined into one file.
-    async fn joined(stream: FragmentStream) -> Vec<u8> {
+    async fn joined(stream: SegmentStream) -> Vec<u8> {
         let items: Vec<_> = stream.collect().await;
         items.into_iter().flat_map(|item| item.unwrap()).collect()
     }
 
-    fn keyed_cache(keys: ContentKeys) -> Arc<FragmentCache> {
-        Arc::new(FragmentCache::default().with_keys(keys))
+    fn keyed_cache(keys: ContentKeys) -> Arc<SegmentCache> {
+        Arc::new(SegmentCache::default().with_keys(keys))
     }
 
     #[tokio::test]
@@ -463,7 +463,7 @@ mod nonblocking {
         let base = serve_fixtures();
         for name in ["shaka_cbcs.mpd", "shaka_cenc.mpd"] {
             let stream = async_manifest(&base, name)
-                .fragment_stream_with_cache("0", keyed_cache(keys()))
+                .segment_stream_with_cache("0", keyed_cache(keys()))
                 .await
                 .unwrap();
             assert_eq!(
@@ -478,8 +478,8 @@ mod nonblocking {
     async fn stream_decrypts_ffmpeg_cenc_byte_ranges() {
         let base = serve_fixtures();
         for name in ["ffmpeg_cenc.mp4", "plain.mp4"] {
-            let fragments = split_fragments(&format!("{base}/{name}"), &fixture(name));
-            let stream = FragmentStream::new_with_cache(fragments, keyed_cache(keys()))
+            let segments = split_segments(&format!("{base}/{name}"), &fixture(name));
+            let stream = SegmentStream::new_with_cache(segments, keyed_cache(keys()))
                 .await
                 .unwrap();
             assert_eq!(
@@ -497,7 +497,7 @@ mod nonblocking {
         keys.insert_hex("ffffffffffffffffffffffffffffffff", KEY)
             .unwrap();
         let opened = async_manifest(&base, "shaka_cbcs.mpd")
-            .fragment_stream_with_cache("0", keyed_cache(keys))
+            .segment_stream_with_cache("0", keyed_cache(keys))
             .await;
         assert!(matches!(opened, Err(Error::MissingContentKey(kid)) if kid == KID));
     }
@@ -548,9 +548,9 @@ mod nonblocking {
     #[tokio::test]
     async fn media_stream_refuses_keys_for_a_cache_used_without_them() {
         let manifest = async_manifest(&serve_fixtures(), "shaka_cenc.mpd");
-        let cache = Arc::new(FragmentCache::default());
+        let cache = Arc::new(SegmentCache::default());
         let unkeyed = manifest
-            .fragment_stream_with_cache("0", cache.clone())
+            .segment_stream_with_cache("0", cache.clone())
             .await
             .unwrap();
         let opened = manifest

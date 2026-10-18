@@ -7,7 +7,7 @@ use std::time::Duration;
 /// One coded frame of a track, with its timing.
 ///
 /// Timestamps count `timescale` ticks of presentation time, the clock of
-/// [`Fragments::span`](crate::fragment::Fragments::span) and `seek_time`, shared by every
+/// [`Segments::span`](crate::segment::Segments::span) and `seek_time`, shared by every
 /// representation of a manifest. Packets come in decode order.
 ///
 /// `duration` is the packet's duration as the container records it. Of that, the first
@@ -18,7 +18,7 @@ use std::time::Duration;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packet {
     /// Compressed sample exactly as MP4 stores it.
-    /// It shares memory with its source fragment, which remains allocated with the packet.
+    /// It shares memory with its source segment, which remains allocated with the packet.
     pub data: Bytes,
     /// When decoded output should be presented, in [`Self::timescale`] ticks.
     /// This can be negative for codec priming before presentation time zero.

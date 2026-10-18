@@ -1,6 +1,6 @@
 //! Real-world DASH content from GPAC's Telecom ParisTech conformance set: every manifest
 //! under `tests/files/conformance/pass` parses, and, to the level its `test_type` says,
-//! lists its fragments and streams each representation, with `PacketStream` reading every
+//! lists its segments and streams each representation, with `PacketStream` reading every
 //! track. Streaming needs the `conformance` feature. See `tests/files/conformance/README.md`.
 #![cfg(feature = "sync")]
 
@@ -24,7 +24,7 @@ type Checked = Result<(), Box<dyn std::error::Error>>;
 enum TestType {
     /// It parses. Offline.
     Parse,
-    /// Each representation's ID also reaches it, and it lists its fragments, one per
+    /// Each representation's ID also reaches it, and it lists its segments, one per
     /// media segment of its timeline. Offline.
     Manifest,
     /// Each representation also streams from GPAC's server. Needs the `conformance`
@@ -127,7 +127,7 @@ fn offline_manifests_check() {
         let checked = parse(path, entry).and_then(|manifest| {
             if entry.test_type >= TestType::Manifest {
                 check_ids(&manifest)?;
-                check_fragments(&manifest)?;
+                check_segments(&manifest)?;
             }
             Ok(())
         });
@@ -166,18 +166,18 @@ fn check_ids(manifest: &DashManifest) -> Checked {
     Ok(())
 }
 
-/// Checks each representation of `manifest` lists at least one timed media fragment.
-fn check_fragments(manifest: &DashManifest) -> Checked {
+/// Checks each representation of `manifest` lists at least one timed media segment.
+fn check_segments(manifest: &DashManifest) -> Checked {
     for representation in manifest.representations() {
         let id = representation.id;
-        let fragments = manifest
-            .fragments(id)
+        let segments = manifest
+            .segments(id)
             .map_err(|error| format!("representation {id}: {error}"))?;
-        if fragments.media_len() == 0 {
-            return Err(format!("representation {id} has no media fragments").into());
+        if segments.media_len() == 0 {
+            return Err(format!("representation {id} has no media segments").into());
         }
-        if fragments.timing().is_none() {
-            return Err(format!("representation {id} has untimed media fragments").into());
+        if segments.timing().is_none() {
+            return Err(format!("representation {id} has untimed media segments").into());
         }
     }
     Ok(())
@@ -186,13 +186,12 @@ fn check_fragments(manifest: &DashManifest) -> Checked {
 /// Streaming each `full` manifest under `pass/` from GPAC's server.
 #[cfg(feature = "conformance")]
 mod stream {
-    use super::{Checked, Entry, TestType, check_fragments, check_ids, index, manifests, parse};
+    use super::{Checked, Entry, TestType, check_ids, check_segments, index, manifests, parse};
     use crate::common::{self, Probe};
-    use playdash::fragment::{Fragment, FragmentStream, MediaTiming};
     use playdash::packet::{Packet, PacketStream, Track};
+    use playdash::segment::{MediaTiming, SegmentLocation, SegmentStream};
     use playdash::{
-        Bytes, ContentKind, DashManifest, Error, FragmentCache, Representation, Retention,
-        Transport,
+        Bytes, ContentKind, DashManifest, Error, Representation, Retention, SegmentCache, Transport,
     };
     use std::panic::{self, AssertUnwindSafe};
     use std::path::{Path, PathBuf};
@@ -202,7 +201,7 @@ mod stream {
     use std::time::Duration;
     use std::{env, fs, thread};
 
-    /// Media fragments read from the start of each track.
+    /// Media segments read from the start of each track.
     const FRAGMENTS: usize = 2;
 
     /// Manifests checked at once.
@@ -277,9 +276,9 @@ mod stream {
         let mut manifest = parse(path, entry)?;
         manifest.load_segment_indexes(transport.as_ref());
         check_ids(&manifest)?;
-        check_fragments(&manifest)?;
+        check_segments(&manifest)?;
 
-        let cache = Arc::new(FragmentCache::new(transport.clone()));
+        let cache = Arc::new(SegmentCache::new(transport.clone()));
         for representation in manifest.representations() {
             let id = representation.id;
             check_representation(&manifest, &representation, &cache, ffprobe)
@@ -293,13 +292,13 @@ mod stream {
     fn check_representation(
         manifest: &DashManifest,
         representation: &Representation,
-        cache: &Arc<FragmentCache>,
+        cache: &Arc<SegmentCache>,
         ffprobe: bool,
     ) -> Checked {
         let id = representation.id;
-        let open = || -> Result<FragmentStream, Error> {
+        let open = || -> Result<SegmentStream, Error> {
             Ok(manifest
-                .fragment_stream_with_cache(id, cache.clone())?
+                .segment_stream_with_cache(id, cache.clone())?
                 .with_retention(Retention {
                     behind: Some(Duration::ZERO),
                     ahead: Some(Duration::ZERO),
@@ -321,12 +320,12 @@ mod stream {
         );
 
         // Where reading stops, and where to seek: the middle of the representation.
-        let fragments = manifest.fragments(id)?;
-        let span = |index| fragments.span(index).expect("timed fragments");
-        let count = fragments.media_len();
+        let segments = manifest.segments(id)?;
+        let span = |index| segments.span(index).expect("timed segments");
+        let count = segments.media_len();
         let read = span(FRAGMENTS.min(count) - 1).end - span(0).start;
         let middle = (span(0).start + span(count - 1).end) / 2;
-        let timing = *fragments.timing().expect("timed fragments");
+        let timing = *segments.timing().expect("timed segments");
         for track in &tracks {
             if track.kind == ContentKind::Text {
                 continue;
@@ -358,7 +357,7 @@ mod stream {
     /// `times.read` of media, then a packet-accurate seek to `times.seek`.
     fn check_track(
         context: &str,
-        open: &dyn Fn() -> Result<FragmentStream, Error>,
+        open: &dyn Fn() -> Result<SegmentStream, Error>,
         track: &Track,
         times: Times,
         ffprobe: bool,
@@ -445,16 +444,16 @@ mod stream {
     }
 
     /// Checks the first of `packets` are ffprobe's packets of `track` in the first media
-    /// fragment of `stream`, whose media times start `origin` ticks before the packets'.
+    /// segment of `stream`, whose media times start `origin` ticks before the packets'.
     fn check_probed(
         context: &str,
-        mut stream: FragmentStream,
+        mut stream: SegmentStream,
         track: &Track,
         origin: i64,
         packets: &[Packet],
     ) -> Checked {
-        let init = stream.next().ok_or("no initialization fragment")??;
-        let media = stream.next().ok_or("no media fragment")??;
+        let init = stream.next().ok_or("no initialization segment")??;
+        let media = stream.next().ok_or("no media segment")??;
         let mut expected = ffprobe(&[&init[..], &without_sidx(&media)].concat(), track.id)?;
         for packet in &mut expected {
             packet.pts -= origin;
@@ -462,7 +461,7 @@ mod stream {
         }
         assert!(
             packets.len() >= expected.len(),
-            "{context} read {} packets, fewer than the {} of its first fragment",
+            "{context} read {} packets, fewer than the {} of its first segment",
             packets.len(),
             expected.len()
         );
@@ -472,7 +471,7 @@ mod stream {
     }
 
     /// `media` with its top-level `sidx` boxes renamed `free`. Their offsets no longer
-    /// hold once it follows the initialization fragment, and ffmpeg refuses an `sidx`
+    /// hold once it follows the initialization segment, and ffmpeg refuses an `sidx`
     /// that references another.
     fn without_sidx(media: &[u8]) -> Vec<u8> {
         let mut media = media.to_vec();
@@ -540,18 +539,18 @@ mod stream {
             }
         }
 
-        /// Where `fragment` is kept under `cache`: its URL's host and path, and its range.
-        fn cached_path(cache: &Path, fragment: &Fragment) -> PathBuf {
-            let url = fragment
+        /// Where `segment` is kept under `cache`: its URL's host and path, and its range.
+        fn cached_path(cache: &Path, segment: &SegmentLocation) -> PathBuf {
+            let url = segment
                 .url
                 .split_once("://")
-                .map_or(&*fragment.url, |(_, rest)| rest);
+                .map_or(&*segment.url, |(_, rest)| rest);
             let mut path = cache.to_owned();
             path.extend(
                 url.split(['/', '?', '#'])
                     .filter(|part| !part.is_empty() && *part != "." && *part != ".."),
             );
-            if let Some(range) = &fragment.range {
+            if let Some(range) = &segment.range {
                 path.as_mut_os_string()
                     .push(format!("@{}-{}", range.start(), range.end()));
             }
@@ -560,17 +559,17 @@ mod stream {
     }
 
     impl Transport for Network {
-        fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error> {
+        fn get(&self, segment: &SegmentLocation, size_hint: Option<u64>) -> Result<Bytes, Error> {
             let Some(cache) = &self.cache else {
-                return Transport::get(&self.agent, fragment, size_hint);
+                return Transport::get(&self.agent, segment, size_hint);
             };
-            let path = Self::cached_path(cache, fragment);
+            let path = Self::cached_path(cache, segment);
             if let Ok(body) = fs::read(&path) {
                 return Ok(Bytes::from(body));
             }
 
             // Write through a temporary file, as another worker may fetch the same one.
-            let body = Transport::get(&self.agent, fragment, size_hint)?;
+            let body = Transport::get(&self.agent, segment, size_hint)?;
             let mut partial = path.clone();
             partial
                 .as_mut_os_string()
@@ -581,8 +580,8 @@ mod stream {
             Ok(body)
         }
 
-        fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
-            Transport::head(&self.agent, fragment)
+        fn head(&self, segment: &SegmentLocation) -> Result<u64, Error> {
+            Transport::head(&self.agent, segment)
         }
     }
 }

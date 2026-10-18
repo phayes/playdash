@@ -1,20 +1,20 @@
 TODO
 ====
 
-1. Dynamic fragment production for live streams
------------------------------------------------
+1. Dynamic segment production for live streams
+----------------------------------------------
 
 Goal: play `MPD@type="dynamic"` manifests, where segments appear over time and
 old ones fall out of the time-shift window, without changing how static
-manifests behave. The list of media fragments stops being a fixed `Vec` that
-`DashManifest::fragments` builds once; `Fragments` produces media fragments on
+manifests behave. The list of media segments stops being a fixed `Vec` that
+`DashManifest::segments` builds once; `Segments` produces media segments on
 demand instead.
 
 Decisions (settled)
 
-- `Fragments` wraps a closed `SegmentIndex` enum (`List`, `Template`,
+- `Segments` wraps a closed `MediaIndex` enum (`List`, `Template`,
   `Timeline`), not a trait object: callers don't supply their own sources.
-- `Fragments` no longer needs to be serialisable; drop `Serialize` /
+- `Segments` no longer needs to be serialisable; drop `Serialize` /
   `Deserialize`.
 - Walking the index (a cursor whose step yields a segment, "not before
   <time>", or the end) is internal to the schedule, not public API.
@@ -76,16 +76,16 @@ lists and positional segment identity)
 Plan, in phases that each ship on their own
 
 Phase 1 (done): one list for media and timing
-- `Fragments` holds a private `SegmentIndex` (`Untimed(Vec<Fragment>)`, or
-  `List` of `MediaSegment { fragment, start, duration }` on a `MediaTiming`
-  clock) with accessors; `MediaTimeline` is gone, and `FragmentStream::new*`
-  take only `Fragments`. Every reported time is presentation time (entry 2,
+- `Segments` holds a private `MediaIndex` (`Untimed(Vec<SegmentLocation>)`, or
+  `List` of `MediaSegment { location, start, duration }` on a `MediaTiming`
+  clock) with accessors; `MediaTimeline` is gone, and `SegmentStream::new*`
+  take only `Segments`. Every reported time is presentation time (entry 2,
   folded in). `SegmentList` and `SegmentBase` honour
   `@presentationTimeOffset`.
 
 Phase 2 (done): stable segment identity
 - `SegmentNumber`, a crate-internal sequential number per representation (the
-  position, for static fragments), identifies media everywhere in a stream:
+  position, for static segments), identifies media everywhere in a stream:
   `Part::Media(SegmentNumber)`, the retention window, `PartBody`, the
   demuxer's `Loaded` and `PacketStream` seeks.
 - The schedule keeps its media in a `VecDeque<Scheduled { data, span }>`
@@ -94,19 +94,19 @@ Phase 2 (done): stable segment identity
   is gone; the cursor carries `first` to step from the init to the first
   media segment.
 
-Phase 3: a segment index behind `Fragments`
-- `Fragments` already wraps a crate-internal `SegmentIndex` (`Untimed`,
+Phase 3: a segment index behind `Segments`
+- `Segments` already wraps a crate-internal `MediaIndex` (`Untimed`,
   `List`) behind accessors. Add the live variants:
-      enum SegmentIndex { Untimed(..), List { .. }, Template(..), Timeline(..) }
-  each defining segment numbers, and share it as `Arc<SegmentIndex>`.
-  `Fragments::new(init, media)` and manifests' static fragments behave
+      enum MediaIndex { Untimed(..), List { .. }, Template(..), Timeline(..) }
+  each defining segment numbers, and share it as `Arc<MediaIndex>`.
+  `Segments::new(init, media)` and manifests' static segments behave
   exactly as today.
 - Index queries are pure and take `now`, modelled on ExoPlayer's
   `DashSegmentIndex`: the segment at a media time, the segment after a given
   start, the first available segment and the live edge at `now`, the end
   (`None` while live), and when the next segment becomes available.
 - The schedule materialises segments from the index around the cursor as the
-  window moves, through the internal cursor. It holds an `Arc<SegmentIndex>`
+  window moves, through the internal cursor. It holds an `Arc<MediaIndex>`
   snapshot and swaps it when a refresh lands (Phase 4). The streams run all
   I/O; the index and `Schedule` stay free of it.
 - Segments the schedule adds after it opens need their decryption roles set
@@ -132,9 +132,9 @@ Phase 4: the live index and the shared refresh
   `Arc`, so every stream opened from it (audio and video) shares one refresh:
       struct Live {
           url: Url,
-          state: RwLock<LiveState>,  // parsed MPD, a SegmentIndex per representation, fetched_at, publish_time
+          state: RwLock<LiveState>,  // parsed MPD, a MediaIndex per representation, fetched_at, publish_time
           generation: AtomicU64,
-          refreshing: ..,            // one fetch at a time: blocking and async locks, as FragmentData has
+          refreshing: ..,            // one fetch at a time: blocking and async locks, as SegmentData has
       }
   `DashManifest` loses its derived `PartialEq` and `Default`.
 - Refreshes run on demand, with no timer thread. When a stream's GET worker
@@ -175,7 +175,7 @@ Phase 5: stream semantics at the live edge
 - Behind-window policy, chosen per stream on the builder:
       pub enum Jump { WindowStart, LiveEdge }
       MediaStreamBuilder::behind_window(self, jump: Jump) -> Self   // blocking and async
-      FragmentStream::with_behind_window(self, jump: Jump) -> Self
+      SegmentStream::with_behind_window(self, jump: Jump) -> Self
   Stored as `Option<Jump>`. Unset, reading fails with a recoverable
   `Error::BehindLiveWindow { available: Range<Duration> }`; the stream stays
   usable and the caller seeks back into the window. `Jump::WindowStart`
@@ -203,13 +203,15 @@ Out of scope for this entry (note, don't solve)
   accept by starting again.
 - Low-latency DASH (chunked transfer, `availabilityTimeComplete=false`); it
   ties into the existing TODO in schedule.rs about publishing a `moof` before
-  its `mdat` arrives.
+  its `mdat` arrives. A low-latency media segment arrives as several CMAF
+  chunks, each a `moof`+`mdat` movie fragment, so this is where "fragment"
+  (or "chunk") names a part of a segment.
 - Adaptive bitrate switching.
 - Refreshes signalled in-band by `emsg` (ExoPlayer's `PlayerEmsgHandler`), and
   MPD patches.
 
 Open questions
-- `Fragments` accessors for a live index: what does a caller see in place of
+- `Segments` accessors for a live index: what does a caller see in place of
   today's `media` list (the segments available now, or nothing)?
 - `behind_window(Jump)` with the recoverable error as the unset default, or a
   three-variant enum (`WindowStart`, `LiveEdge`, `RecoverableError`) that can
@@ -223,12 +225,12 @@ Open questions
 Done with entry 1's Phase 1: every reported time is presentation time,
 `Period@start + (media time - @presentationTimeOffset) / timescale`, and
 `MediaTiming::presentation_time` maps a decoder's media timestamps onto it.
-A time before the first fragment lands on the first. `MediaTimeline` is gone.
+A time before the first segment lands on the first. `MediaTimeline` is gone.
 
 Left to do
 - Change the video_player example to time frames by decoder timestamps
   (ffmpeg can print them with `-vf showinfo` or `-copyts`) instead of
-  counting frames from the fragment start.
+  counting frames from the segment start.
 
 
 3. Container wrapping for raw-demuxer decoders

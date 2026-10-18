@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use crate::vendor::dash_mpd_core::SegmentTemplate;
 
-use super::segments::{Addressing, SegmentUrls, Segments, Timing, initialization_fragment};
+use super::segments::{Addressing, SegmentTimes, SegmentUrls, Timing, initialization_location};
 use crate::error::Error;
-use crate::fragment::Fragment;
+use crate::segment::SegmentLocation;
 
 /// Values substituted for the `$...$` identifiers of a URL template.
 #[derive(Clone, Copy, Debug, Default)]
@@ -112,18 +112,14 @@ impl<'a> TemplateChain<'a> {
         self.templates().find_map(field)
     }
 
-    /// Initialization and media segment fragments, with unresolved URLs.
+    /// The initialization and media segments' locations, with unresolved URLs.
     ///
     /// The initialization comes from `@initialization`, or else an inherited
     /// `Initialization` element.
-    pub fn fragments(
-        self,
-        values: TemplateValues,
-        segments: &Segments,
-    ) -> Result<SegmentUrls, Error> {
+    pub fn urls(self, values: TemplateValues, times: &SegmentTimes) -> Result<SegmentUrls, Error> {
         let initialization = match self.get(|template| template.initialization.as_deref()) {
-            Some(initialization) => Fragment::new(fill(initialization, &values)?),
-            None => initialization_fragment(
+            Some(initialization) => SegmentLocation::new(fill(initialization, &values)?),
+            None => initialization_location(
                 self.get(|template| template.Initialization.as_ref())
                     .ok_or(Error::DashManifestMissingUrls)?,
             )?,
@@ -132,7 +128,7 @@ impl<'a> TemplateChain<'a> {
             .get(|template| template.media.as_deref())
             .ok_or(Error::DashManifestMissingMediaTemplate)?;
 
-        let media = segments
+        let media = times
             .segments
             .iter()
             .map(|segment| {
@@ -141,7 +137,7 @@ impl<'a> TemplateChain<'a> {
                     time: Some(segment.time),
                     ..values
                 };
-                Ok(Fragment::new(fill(media, &values)?))
+                Ok(SegmentLocation::new(fill(media, &values)?))
             })
             .collect::<Result<_, Error>>()?;
         Ok(SegmentUrls {
@@ -150,8 +146,8 @@ impl<'a> TemplateChain<'a> {
         })
     }
 
-    /// Lists media segments; see [`Timing::segments`].
-    pub fn segments(self, period_duration: Option<Duration>) -> Result<Segments, Error> {
+    /// Lists the media segments' times; see [`Timing::segment_times`].
+    pub fn segment_times(self, period_duration: Option<Duration>) -> Result<SegmentTimes, Error> {
         Timing {
             timescale: self.get(|template| template.timescale),
             start_number: self.get(|template| template.startNumber),
@@ -166,7 +162,7 @@ impl<'a> TemplateChain<'a> {
                     .or(template.duration.map(Addressing::Duration))
             }),
         }
-        .segments(period_duration)
+        .segment_times(period_duration)
     }
 }
 
@@ -261,7 +257,7 @@ mod tests {
         }
     }
 
-    fn summarize(segments: &Segments) -> Vec<(u64, u64, u64)> {
+    fn summarize(segments: &SegmentTimes) -> Vec<(u64, u64, u64)> {
         segments
             .segments
             .iter()
@@ -276,7 +272,7 @@ mod tests {
             entry(Some(3000), 400, None),
         ]));
         let segments = TemplateChain::new([Some(&template), None, None])
-            .segments(None)
+            .segment_times(None)
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -291,7 +287,7 @@ mod tests {
             entry(Some(2500), 500, None),
         ]));
         let segments = TemplateChain::new([Some(&template), None, None])
-            .segments(None)
+            .segment_times(None)
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -310,7 +306,7 @@ mod tests {
         template.presentationTimeOffset = Some(10_000);
         template.SegmentTimeline.as_mut().unwrap().segments[0].t = Some(10_000);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .segments(Some(Duration::from_millis(2500)))
+            .segment_times(Some(Duration::from_millis(2500)))
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -323,7 +319,7 @@ mod tests {
         let mut template = template(Some(vec![entry(Some(10_000), 1000, Some(49))]));
         template.presentationTimeOffset = Some(10_000);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .segments(Some(Duration::from_millis(2500)))
+            .segment_times(Some(Duration::from_millis(2500)))
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -335,7 +331,7 @@ mod tests {
     fn open_ended_repeat_needs_a_bound() {
         let template = template(Some(vec![entry(None, 1000, Some(-1))]));
         assert!(matches!(
-            TemplateChain::new([Some(&template), None, None]).segments(None),
+            TemplateChain::new([Some(&template), None, None]).segment_times(None),
             Err(Error::DashManifestMissingDuration)
         ));
     }
@@ -346,7 +342,7 @@ mod tests {
         template.startNumber = Some(5);
         template.endNumber = Some(7);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .segments(None)
+            .segment_times(None)
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -360,7 +356,7 @@ mod tests {
         template.duration = Some(4000.0);
         template.startNumber = Some(0);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .segments(Some(Duration::from_millis(10_500)))
+            .segment_times(Some(Duration::from_millis(10_500)))
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -373,7 +369,7 @@ mod tests {
         let mut template = template(None);
         template.duration = Some(1001.5);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .segments(Some(Duration::from_millis(3004)))
+            .segment_times(Some(Duration::from_millis(3004)))
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -388,7 +384,7 @@ mod tests {
         template.startNumber = Some(3);
         template.endNumber = Some(4);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .segments(None)
+            .segment_times(None)
             .unwrap();
         assert_eq!(summarize(&segments), [(3, 0, 2000), (4, 2000, 2000)]);
     }
@@ -398,7 +394,7 @@ mod tests {
         let mut template = template(None);
         template.duration = Some(2000.0);
         assert!(matches!(
-            TemplateChain::new([Some(&template), None, None]).segments(None),
+            TemplateChain::new([Some(&template), None, None]).segment_times(None),
             Err(Error::DashManifestMissingDuration)
         ));
     }
@@ -410,7 +406,7 @@ mod tests {
         representation.endNumber = Some(2);
         let adaptation = template(Some(vec![entry(None, 1000, Some(3))]));
         let segments = TemplateChain::new([Some(&representation), Some(&adaptation), None])
-            .segments(None)
+            .segment_times(None)
             .unwrap();
         assert_eq!(summarize(&segments), [(1, 0, 500), (2, 500, 500)]);
     }
@@ -420,7 +416,7 @@ mod tests {
         let mut template = template(Some(vec![entry(None, 1000, None)]));
         template.timescale = Some(0);
         assert!(matches!(
-            TemplateChain::new([Some(&template), None, None]).segments(None),
+            TemplateChain::new([Some(&template), None, None]).segment_times(None),
             Err(Error::DashManifestMissingTimescale)
         ));
     }

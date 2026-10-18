@@ -1,6 +1,6 @@
-//! Download progress of a DASH stream, by fragment, byte and media time.
+//! Download progress of a DASH stream, by segment, byte and media time.
 
-use super::store::{CacheListener, FragmentData, Store};
+use super::store::{CacheListener, SegmentData, Store};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::Range;
@@ -23,11 +23,11 @@ use std::time::Duration;
 /// // A player's own position, such as rodio's `Player::get_pos`.
 /// let position = Duration::from_secs(30);
 /// println!(
-///     "buffered to {:?} ({:.0}%), {} of {} fragments downloaded",
+///     "buffered to {:?} ({:.0}%), {} of {} segments downloaded",
 ///     status.buffered_until(position),
 ///     status.buffered_percent(position),
-///     status.downloaded.fragments,
-///     status.total.fragments,
+///     status.downloaded.segments,
+///     status.total.segments,
 /// );
 /// # Ok(())
 /// # }
@@ -47,7 +47,7 @@ pub struct BufferStatus {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferAmount {
     /// Number of media segments represented by this amount.
-    pub fragments: usize,
+    pub segments: usize,
     /// Bytes in those media-segment bodies. The initialization segment is not counted.
     pub bytes: u64,
     /// Sum of the media durations covered by those segments.
@@ -58,7 +58,7 @@ pub struct BufferAmount {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferTotal {
     /// Total number of media segments in the representation.
-    pub fragments: usize,
+    pub segments: usize,
     /// Combined byte length of all media segments, excluding initialization.
     /// `None` until every segment's size is known from a byte range, HEAD, or download.
     pub bytes: Option<u64>,
@@ -94,7 +94,7 @@ impl BufferStatus {
     /// let secs = Duration::from_secs;
     /// // Ten-second streams buffered from the start to `buffered` seconds.
     /// let buffered_to = |buffered| BufferStatus {
-    ///     total: BufferTotal { fragments: 5, bytes: None, start: secs(0), end: secs(10) },
+    ///     total: BufferTotal { segments: 5, bytes: None, start: secs(0), end: secs(10) },
     ///     downloaded: BufferAmount::default(),
     ///     ranges: vec![secs(0)..secs(buffered)],
     /// };
@@ -149,7 +149,7 @@ impl BufferStatus {
 
     /// Returns whether every media segment is currently present in the cache.
     pub fn is_complete(&self) -> bool {
-        self.downloaded.fragments == self.total.fragments
+        self.downloaded.segments == self.total.segments
     }
 
     /// The duration of the representation's media, from its start to its end.
@@ -157,11 +157,11 @@ impl BufferStatus {
         self.total.end.saturating_sub(self.total.start)
     }
 
-    /// Measures media fragments, each with the presentation time it spans.
-    fn measure(media: &[(Arc<FragmentData>, Range<Duration>)]) -> Self {
+    /// Measures media segments, each with the presentation time it spans.
+    fn measure(media: &[(Arc<SegmentData>, Range<Duration>)]) -> Self {
         let mut status = Self {
             total: BufferTotal {
-                fragments: media.len(),
+                segments: media.len(),
                 bytes: Some(0),
                 start: media.first().map_or(Duration::ZERO, |(_, span)| span.start),
                 end: media.last().map_or(Duration::ZERO, |(_, span)| span.end),
@@ -182,7 +182,7 @@ impl BufferStatus {
                 continue;
             };
             // Held now; a body a stream has forgotten no longer counts.
-            status.downloaded.fragments += 1;
+            status.downloaded.segments += 1;
             status.downloaded.bytes += body.len() as u64;
             status.downloaded.time += span.end - span.start;
             match status.ranges.last_mut() {
@@ -204,8 +204,8 @@ fn percent(part: f64, whole: f64) -> f64 {
 
 /// Live report of how much of a stream's representation its cache holds.
 ///
-/// Get one from [`FragmentStream::buffer`](crate::fragment::FragmentStream::buffer),
-/// its [async counterpart](crate::nonblocking::fragment::FragmentStream::buffer), or from
+/// Get one from [`SegmentStream::buffer`](crate::segment::SegmentStream::buffer),
+/// its [async counterpart](crate::nonblocking::segment::SegmentStream::buffer), or from
 /// [`DashSource::buffer`](crate::DashSource::buffer). It reads only the cache,
 /// so it plays no part in playback and stays usable from any thread.
 #[derive(Clone)]
@@ -214,15 +214,15 @@ pub struct BufferHandle(Arc<BufferShared>);
 type ChangeCallback = dyn Fn(&BufferStatus) + Send + Sync;
 
 struct BufferShared {
-    /// Media fragments, each with the presentation time it spans.
-    media: Vec<(Arc<FragmentData>, Range<Duration>)>,
+    /// Media segments, each with the presentation time it spans.
+    media: Vec<(Arc<SegmentData>, Range<Duration>)>,
     callbacks: Mutex<Vec<Arc<ChangeCallback>>>,
 }
 
 impl BufferHandle {
-    /// Tracks media fragments of `cache`, each with the presentation time it
+    /// Tracks media segments of `cache`, each with the presentation time it
     /// spans.
-    pub(crate) fn new(cache: &Store, media: Vec<(Arc<FragmentData>, Range<Duration>)>) -> Self {
+    pub(crate) fn new(cache: &Store, media: Vec<(Arc<SegmentData>, Range<Duration>)>) -> Self {
         let shared = Arc::new(BufferShared {
             media,
             callbacks: Mutex::default(),
@@ -281,7 +281,7 @@ impl BufferShared {
 }
 
 impl CacheListener for BufferShared {
-    fn fragment_changed(&self, data: &FragmentData) {
+    fn segment_changed(&self, data: &SegmentData) {
         if self
             .media
             .iter()
@@ -301,22 +301,22 @@ impl fmt::Debug for BufferHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fragment::Fragment;
+    use crate::segment::SegmentLocation;
 
-    type Media = Vec<(Arc<FragmentData>, Range<Duration>)>;
+    type Media = Vec<(Arc<SegmentData>, Range<Duration>)>;
 
-    /// Two-second fragments from `start` seconds, with bodies of `bodies` bytes.
+    /// Two-second segments from `start` seconds, with bodies of `bodies` bytes.
     fn media_from<const N: usize>(
         start: u64,
-        fragments: [Fragment; N],
+        locations: [SegmentLocation; N],
         bodies: [Option<usize>; N],
     ) -> Media {
-        fragments
+        locations
             .into_iter()
             .zip(bodies)
             .enumerate()
-            .map(|(index, (fragment, body))| {
-                let data = FragmentData::new(fragment);
+            .map(|(index, (location, body))| {
+                let data = SegmentData::new(location);
                 if let Some(len) = body {
                     data.set_body(&vec![0; len]);
                 }
@@ -326,9 +326,9 @@ mod tests {
             .collect()
     }
 
-    /// Three two-second fragments from time zero.
-    fn media(fragments: [Fragment; 3], bodies: [Option<usize>; 3]) -> Media {
-        media_from(0, fragments, bodies)
+    /// Three two-second segments from time zero.
+    fn media(locations: [SegmentLocation; 3], bodies: [Option<usize>; 3]) -> Media {
+        media_from(0, locations, bodies)
     }
 
     fn unranged(bodies: [Option<usize>; 3]) -> Media {
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn nothing_downloaded_buffers_nothing() {
         let status = BufferStatus::measure(&unranged([None; 3]));
-        assert_eq!(status.total.fragments, 3);
+        assert_eq!(status.total.segments, 3);
         assert_eq!(status.total.bytes, None);
         assert_eq!(status.total.start, secs(0.0));
         assert_eq!(status.total.end, secs(6.0));
@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(
             status.downloaded,
             BufferAmount {
-                fragments: 2,
+                segments: 2,
                 bytes: 400,
                 time: secs(4.0)
             }
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_fragments_merge_into_one_range() {
+    fn adjacent_segments_merge_into_one_range() {
         let status = BufferStatus::measure(&unranged([Some(10), Some(10), Some(10)]));
         assert_eq!(status.ranges, [secs(0.0)..secs(6.0)]);
         assert_eq!(status.buffered_until(Duration::ZERO), secs(6.0));
@@ -392,9 +392,9 @@ mod tests {
     fn byte_ranges_give_total_bytes_before_download() {
         let media = media(
             [
-                Fragment::with_range("f", 0..=99),
-                Fragment::with_range("f", 100..=199),
-                Fragment::with_range("f", 200..=499),
+                SegmentLocation::with_range("f", 0..=99),
+                SegmentLocation::with_range("f", 100..=199),
+                SegmentLocation::with_range("f", 200..=499),
             ],
             [Some(100), None, None],
         );
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn media_starting_after_zero_measures_from_its_start() {
-        // Three two-second fragments from 10 seconds, the first downloaded.
+        // Three two-second segments from 10 seconds, the first downloaded.
         let media = media_from(
             10,
             ["a".into(), "b".into(), "c".into()],

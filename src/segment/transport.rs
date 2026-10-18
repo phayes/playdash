@@ -1,15 +1,15 @@
-//! The blocking API's fragment transport: the source of fragment bodies and sizes.
+//! The blocking API's segment transport: the source of segment bodies and sizes.
 
-use super::{Fragment, slice_range};
+use super::{SegmentLocation, slice_range};
 use crate::error::Error;
 use bytes::Bytes;
 use std::io::Read;
 use std::time::Duration;
 
-/// Fetches fragment bodies and sizes for a [`FragmentCache`](super::FragmentCache).
+/// Fetches segment bodies and sizes for a [`SegmentCache`](super::SegmentCache).
 ///
 /// [`ureq::Agent`] implements this with its connection pool.
-/// Implement this trait to load fragments from another HTTP client, local
+/// Implement this trait to load segments from another HTTP client, local
 /// storage, or an application-specific source.
 ///
 /// # Examples
@@ -18,13 +18,13 @@ use std::time::Duration;
 /// use std::sync::Arc;
 /// use bytes::Bytes;
 /// use playdash::Error;
-/// use playdash::fragment::{Fragment, FragmentCache, Transport};
+/// use playdash::segment::{SegmentCache, SegmentLocation, Transport};
 ///
 /// struct MemoryTransport;
 ///
 /// impl Transport for MemoryTransport {
-///     fn get(&self, fragment: &Fragment, _: Option<u64>) -> Result<Bytes, Error> {
-///         let bytes: &'static [u8] = match fragment.url.as_str() {
+///     fn get(&self, segment: &SegmentLocation, _: Option<u64>) -> Result<Bytes, Error> {
+///         let bytes: &'static [u8] = match segment.url.as_str() {
 ///             "memory://init" => b"initialization data",
 ///             _ => b"media data",
 ///         };
@@ -32,34 +32,34 @@ use std::time::Duration;
 ///     }
 /// }
 ///
-/// let cache = FragmentCache::new(Arc::new(MemoryTransport));
-/// assert!(cache.cached(&Fragment::new("memory://init")).is_none());
+/// let cache = SegmentCache::new(Arc::new(MemoryTransport));
+/// assert!(cache.cached(&SegmentLocation::new("memory://init")).is_none());
 /// ```
 pub trait Transport: Send + Sync {
-    /// Body of `fragment`.
+    /// Body of `segment`.
     ///
-    /// Must honor [`Fragment::range`] and return exactly those bytes; a ranged
+    /// Must honor [`SegmentLocation::range`] and return exactly those bytes; a ranged
     /// body of any other length fails the stream. `size_hint` is the length
     /// when already known, for preallocating the body.
-    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error>;
+    fn get(&self, segment: &SegmentLocation, size_hint: Option<u64>) -> Result<Bytes, Error>;
 
-    /// Byte length of `fragment`, typically from a HEAD `Content-Length`.
+    /// Byte length of `segment`, typically from a HEAD `Content-Length`.
     ///
-    /// Never called for ranged fragments, whose sizes are already known. An
+    /// Never called for ranged segments, whose sizes are already known. An
     /// error disables HEAD probing for the stream; the default always errors.
-    fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
+    fn head(&self, segment: &SegmentLocation) -> Result<u64, Error> {
         Err(Error::Initialization(format!(
-            "transport cannot HEAD {fragment}"
+            "transport cannot HEAD {segment}"
         )))
     }
 }
 
 impl Transport for ureq::Agent {
-    /// Sends a `Range` header for ranged fragments; if a server ignores it and
+    /// Sends a `Range` header for ranged segments; if a server ignores it and
     /// returns the whole body, the range is sliced out of that body.
-    fn get(&self, fragment: &Fragment, size_hint: Option<u64>) -> Result<Bytes, Error> {
-        let mut request = ureq::Agent::get(self, &fragment.url);
-        if let Some(range) = &fragment.range {
+    fn get(&self, segment: &SegmentLocation, size_hint: Option<u64>) -> Result<Bytes, Error> {
+        let mut request = ureq::Agent::get(self, &segment.url);
+        if let Some(range) = &segment.range {
             request = request.header(
                 ureq::http::header::RANGE,
                 format!("bytes={}-{}", range.start(), range.end()),
@@ -73,12 +73,10 @@ impl Transport for ureq::Agent {
             .unwrap_or_default();
         response.into_body().into_reader().read_to_end(&mut bytes)?;
         let body = Bytes::from(bytes);
-        match &fragment.range {
+        match &segment.range {
             Some(range) if !partial => {
                 #[cfg(feature = "log")]
-                log::warn!(
-                    "server ignored the Range request for {fragment}; slicing the full body"
-                );
+                log::warn!("server ignored the Range request for {segment}; slicing the full body");
                 Ok(slice_range(&body, range)
                     .map_or_else(|| body.clone(), |part| body.slice_ref(part)))
             }
@@ -86,8 +84,8 @@ impl Transport for ureq::Agent {
         }
     }
 
-    fn head(&self, fragment: &Fragment) -> Result<u64, Error> {
-        let url = &fragment.url;
+    fn head(&self, segment: &SegmentLocation) -> Result<u64, Error> {
+        let url = &segment.url;
         let response = ureq::Agent::head(self, url).call()?;
         response
             .headers()

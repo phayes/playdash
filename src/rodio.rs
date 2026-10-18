@@ -2,9 +2,9 @@
 
 #[cfg(feature = "encryption")]
 use crate::ContentKeys;
-use crate::fragment::schedule;
-use crate::fragment::{FragmentStream, Fragments};
-use crate::{BufferHandle, DashManifest, Error, FragmentCache};
+use crate::segment::schedule;
+use crate::segment::{SegmentStream, Segments};
+use crate::{BufferHandle, DashManifest, Error, SegmentCache};
 use ::rodio::{Decoder, Source, source::SeekError};
 use std::ops::Range;
 use std::sync::Arc;
@@ -33,13 +33,13 @@ use std::time::Duration;
 /// # }
 /// ```
 pub struct DashSource {
-    fragments: Fragments,
+    segments: Segments,
     /// Presentation time of the media's start and end. Rodio positions count
     /// from the start.
     media: Range<Duration>,
-    cache: Arc<FragmentCache>,
+    cache: Arc<SegmentCache>,
     mime_type: String,
-    decoder: Decoder<FragmentStream>,
+    decoder: Decoder<SegmentStream>,
 }
 
 impl DashSource {
@@ -47,7 +47,7 @@ impl DashSource {
     ///
     /// `id` uses the same full-ID or format-token matching as
     /// [`DashManifest::representation`]. Fetches through a new
-    /// [`FragmentCache`] dedicated to this source.
+    /// [`SegmentCache`] dedicated to this source.
     pub fn new(manifest: &DashManifest, id: impl AsRef<str>) -> Result<Self, Error> {
         Self::new_with_cache(manifest, id, Arc::default())
     }
@@ -64,18 +64,18 @@ impl DashSource {
         id: impl AsRef<str>,
         keys: ContentKeys,
     ) -> Result<Self, Error> {
-        let cache = FragmentCache::default().with_keys(keys);
+        let cache = SegmentCache::default().with_keys(keys);
         Self::new_with_cache(manifest, id, Arc::new(cache))
     }
 
     /// Like [`DashSource::new`], but fetches through `cache`, for a custom
     /// [`crate::Transport`], content keys, or to share connections and
-    /// downloaded fragments with other sources. A protected representation
+    /// downloaded segments with other sources. A protected representation
     /// is rejected unless `cache` decrypts.
     pub fn new_with_cache(
         manifest: &DashManifest,
         id: impl AsRef<str>,
-        cache: Arc<FragmentCache>,
+        cache: Arc<SegmentCache>,
     ) -> Result<Self, Error> {
         let id = id.as_ref();
         if let Some(scheme) = manifest.protection_scheme(id)?
@@ -83,19 +83,19 @@ impl DashSource {
         {
             return Err(Error::RodioProtectedContent(scheme));
         }
-        let fragments = manifest.fragments(id)?;
-        let media = fragments
+        let segments = manifest.segments(id)?;
+        let media = segments
             .span(0)
-            .zip(fragments.end())
+            .zip(segments.end())
             .map(|(first, end)| first.start..end)
             .ok_or_else(|| {
-                Error::Initialization("rodio playback requires media fragments".to_owned())
+                Error::Initialization("rodio playback requires media segments".to_owned())
             })?;
         let mime_type = manifest.mime_type(id)?.unwrap_or_default().to_owned();
-        let (decoder, _) = Self::build_decoder(&fragments, &cache, &mime_type, media.start)?;
+        let (decoder, _) = Self::build_decoder(&segments, &cache, &mime_type, media.start)?;
 
         Ok(Self {
-            fragments,
+            segments,
             media,
             cache,
             mime_type,
@@ -108,25 +108,25 @@ impl DashSource {
     /// Get it before handing the source to rodio; it stays usable from any
     /// thread afterwards. Plays no part in playback.
     pub fn buffer(&self) -> BufferHandle {
-        // Manifest fragments are timed, so every one has a span.
-        let first = self.fragments.numbers().start;
-        let media = schedule::media_from(&self.fragments, first)
-            .filter_map(|(fragment, span)| Some((self.cache.data(fragment.clone()), span?)))
+        // Manifest segments are timed, so every one has a span.
+        let first = self.segments.numbers().start;
+        let media = schedule::media_from(&self.segments, first)
+            .filter_map(|(segment, span)| Some((self.cache.data(segment.clone()), span?)))
             .collect();
         BufferHandle::new(&self.cache.store, media)
     }
 
-    /// A decoder from the media fragment covering presentation time `time`,
-    /// and that fragment's start.
+    /// A decoder from the media segment covering presentation time `time`,
+    /// and that segment's start.
     fn build_decoder(
-        fragments: &Fragments,
-        cache: &Arc<FragmentCache>,
+        segments: &Segments,
+        cache: &Arc<SegmentCache>,
         mime_type: &str,
         time: Duration,
-    ) -> Result<(Decoder<FragmentStream>, Duration), Error> {
+    ) -> Result<(Decoder<SegmentStream>, Duration), Error> {
         // The decoder is unseekable and seeks rebuild by timeline, so byte
         // sizes from eager HEADs would go unused.
-        let (reader, start) = FragmentStream::starting_at(fragments.clone(), time, cache.clone())?;
+        let (reader, start) = SegmentStream::starting_at(segments.clone(), time, cache.clone())?;
 
         let decoder = Decoder::builder()
             .with_data(reader)
@@ -170,14 +170,14 @@ impl Source for DashSource {
     }
 
     fn try_seek(&mut self, requested: Duration) -> Result<(), SeekError> {
-        // Past the end, play from the end of the last fragment.
+        // Past the end, play from the end of the last segment.
         let target = self.media.start + requested.min(self.total_duration_value());
-        let (mut decoder, fragment_start) =
-            Self::build_decoder(&self.fragments, &self.cache, &self.mime_type, target)
+        let (mut decoder, segment_start) =
+            Self::build_decoder(&self.segments, &self.cache, &self.mime_type, target)
                 .map_err(|error| SeekError::Other(Arc::new(error)))?;
 
         let frames_to_skip = target
-            .saturating_sub(fragment_start)
+            .saturating_sub(segment_start)
             .as_nanos()
             .saturating_mul(u128::from(decoder.sample_rate().get()))
             / 1_000_000_000;
@@ -206,7 +206,7 @@ impl Source for DashSource {
 mod tests {
     use super::*;
     use crate::Transport;
-    use crate::fragment::Fragment;
+    use crate::segment::SegmentLocation;
 
     #[test]
     fn protected_representation_is_rejected_before_streaming() {
@@ -237,10 +237,10 @@ mod tests {
         impl Transport for Offline {
             fn get(
                 &self,
-                fragment: &Fragment,
+                segment: &SegmentLocation,
                 _size_hint: Option<u64>,
             ) -> Result<crate::Bytes, Error> {
-                Err(Error::Initialization(format!("offline: {fragment}")))
+                Err(Error::Initialization(format!("offline: {segment}")))
             }
         }
 
@@ -266,7 +266,7 @@ mod tests {
             DashSource::new_with_cache(
                 &manifest,
                 "FLAC",
-                Arc::new(FragmentCache::new(Arc::new(Offline)))
+                Arc::new(SegmentCache::new(Arc::new(Offline)))
             ),
             Err(Error::Initialization(message))
                 if message == "offline: https://cdn.example/init.mp4"

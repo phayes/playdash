@@ -8,12 +8,12 @@ use super::{
 #[cfg(feature = "encryption")]
 use crate::cenc::ContentKeys;
 use crate::error::Error;
-use crate::fragment::FragmentCache;
-use crate::fragment::buffer::BufferHandle;
-use crate::fragment::schedule::Retention;
 use crate::manifest::{ContentKind, DashManifest};
 use crate::mp4::codec::Codec;
 use crate::packet::{PacketSeeked, PacketStream};
+use crate::segment::SegmentCache;
+use crate::segment::buffer::BufferHandle;
+use crate::segment::schedule::Retention;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,7 +151,7 @@ impl MediaStream {
 impl Iterator for MediaStream {
     type Item = Result<MediaPacket, Error>;
 
-    /// The next packet in decode order. Blocks while its fragment downloads.
+    /// The next packet in decode order. Blocks while its segment downloads.
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed {
             return None;
@@ -169,7 +169,7 @@ impl Iterator for MediaStream {
 ///
 /// Get a builder from [`DashManifest::media_stream`]. Calling [`Self::open`] with no
 /// other options selects the representation's only track, uses the codec's elementary
-/// format, creates a private [`FragmentCache`], and keeps downloaded fragments.
+/// format, creates a private [`SegmentCache`], and keeps downloaded segments.
 ///
 /// # Examples
 ///
@@ -353,7 +353,7 @@ impl Iterator for MediaStream {
 pub struct MediaStreamBuilder<'a> {
     manifest: &'a DashManifest,
     representation_id: String,
-    cache: Option<Arc<FragmentCache>>,
+    cache: Option<Arc<SegmentCache>>,
     #[cfg(feature = "encryption")]
     keys: Option<ContentKeys>,
     retention: Option<Retention>,
@@ -383,7 +383,7 @@ impl<'a> MediaStreamBuilder<'a> {
     ///
     /// Share one cache between related streams to reuse downloaded segments and HTTP
     /// connections. A custom cache can also provide a custom transport or content keys.
-    pub fn cache(mut self, cache: Arc<FragmentCache>) -> Self {
+    pub fn cache(mut self, cache: Arc<SegmentCache>) -> Self {
         self.cache = Some(cache);
         self
     }
@@ -427,7 +427,7 @@ impl<'a> MediaStreamBuilder<'a> {
     /// Selects a track by its numeric MP4 track ID.
     ///
     /// Discover IDs with
-    /// [`FragmentStream::tracks`](crate::fragment::FragmentStream::tracks). Most DASH
+    /// [`SegmentStream::tracks`](crate::segment::SegmentStream::tracks). Most DASH
     /// representations contain one track and need no explicit selection. Calling this
     /// replaces a previous [`Self::track`] choice.
     ///
@@ -477,27 +477,27 @@ impl<'a> MediaStreamBuilder<'a> {
     /// stream's codec and [`MediaStream::initialization`] are immediately available.
     /// Media segments download as the stream advances.
     ///
-    /// Fails like [`DashManifest::fragment_stream`], [`PacketStream::new`] and
+    /// Fails like [`DashManifest::segment_stream`], [`PacketStream::new`] and
     /// [`PacketStream::into_media_stream`]. Fails with [`Error::Initialization`] if
     /// content keys cannot be added to the cache, or the representation has no track
     /// that [`Self::track`] or [`Self::track_id`] asks for.
     pub fn open(mut self) -> Result<MediaStream, Error> {
-        // The representation's fragments.
+        // The representation's segments.
         let cache = self.take_cache()?;
-        let mut fragments = self
+        let mut segments = self
             .manifest
-            .fragment_stream_with_cache(&self.representation_id, cache)?;
+            .segment_stream_with_cache(&self.representation_id, cache)?;
         if let Some(retention) = self.retention {
-            fragments = fragments.with_retention(retention);
+            segments = segments.with_retention(retention);
         }
 
         // The packets of the chosen track.
         let mut packets = match self.track {
-            None => PacketStream::new(fragments)?,
-            Some(TrackChoice::Id(track_id)) => PacketStream::with_track(fragments, track_id)?,
+            None => PacketStream::new(segments)?,
+            Some(TrackChoice::Id(track_id)) => PacketStream::with_track(segments, track_id)?,
             Some(TrackChoice::Kind(kind)) => {
-                let track_id = track_of_kind(&fragments.tracks()?, kind)?;
-                PacketStream::with_track(fragments, track_id)?
+                let track_id = track_of_kind(&segments.tracks()?, kind)?;
+                PacketStream::with_track(segments, track_id)?
             }
         };
         if let Some(preroll) = self.preroll {
@@ -532,7 +532,7 @@ impl<'a> MediaStreamBuilder<'a> {
     }
 
     /// The cache to fetch through: the one given, or a new one, with any keys given added.
-    fn take_cache(&mut self) -> Result<Arc<FragmentCache>, Error> {
+    fn take_cache(&mut self) -> Result<Arc<SegmentCache>, Error> {
         let cache = self.cache.take().unwrap_or_default();
         #[cfg(feature = "encryption")]
         if let Some(keys) = self.keys.take() {

@@ -1,4 +1,5 @@
-//! Media segments: each `moof` + `mdat` pair's samples, with their bytes, timing and flags.
+//! Movie fragments: each `moof` + `mdat` pair's samples in a media segment, with their
+//! bytes, timing and flags.
 
 use super::init::{RollGroups, TrackDefaults, roll_groups};
 use super::reader::{Atom, ParseError, atoms, find, malformed, require};
@@ -120,7 +121,7 @@ fn track_fragment(
             offset
                 .checked_sub(body_start)
                 .and_then(|offset| usize::try_from(offset).ok())
-                .ok_or_else(|| malformed("base data offset precedes the fragment"))?
+                .ok_or_else(|| malformed("base data offset precedes the segment"))?
         }
     };
     let mut fragment_defaults = trex;
@@ -242,7 +243,7 @@ fn track_run(
         let end = pos
             .checked_add(size as usize)
             .filter(|&end| end <= body.len())
-            .ok_or_else(|| malformed("sample data extends past the fragment"))?;
+            .ok_or_else(|| malformed("sample data extends past the segment"))?;
         samples.push(Sample {
             range: pos..end,
             decode_offset,
@@ -311,18 +312,18 @@ pub(crate) mod tests {
 
     /// A `moof` with one `traf` for `track_id`, then an `mdat` of `data`. The trun's data
     /// offset points at the mdat payload, relative to the moof (default-base-is-moof).
-    pub(crate) fn segment(
+    pub(crate) fn movie_fragment(
         track_id: u32,
         decode_time: u64,
         samples: &[RunSample],
         extra: &[Vec<u8>],
         data: &[u8],
     ) -> Vec<u8> {
-        segment_from(track_id, Some(decode_time), samples, extra, data)
+        movie_fragment_from(track_id, Some(decode_time), samples, extra, data)
     }
 
-    /// [`segment`], with a `tfdt` only when `decode_time` is given.
-    pub(crate) fn segment_from(
+    /// [`movie_fragment`], with a `tfdt` only when `decode_time` is given.
+    pub(crate) fn movie_fragment_from(
         track_id: u32,
         decode_time: Option<u64>,
         samples: &[RunSample],
@@ -381,7 +382,7 @@ pub(crate) mod tests {
                 composition_offset: Some(7),
             },
         ];
-        let body = segment(1, 9000, &samples, &[], b"abcde");
+        let body = movie_fragment(1, 9000, &samples, &[], b"abcde");
         let trafs = parse(&body, 0, &[(1, TREX)]).unwrap();
         let [traf] = &trafs[..] else {
             panic!("one traf")
@@ -456,8 +457,8 @@ pub(crate) mod tests {
 
     #[test]
     fn several_moofs_and_skipped_top_level_boxes() {
-        let first = segment(1, 0, &[sized(2)], &[], b"ab");
-        let second = segment(1, 2048, &[sized(3)], &[], b"cde");
+        let first = movie_fragment(1, 0, &[sized(2)], &[], b"ab");
+        let second = movie_fragment(1, 2048, &[sized(3)], &[], b"cde");
         let body = [
             bx(b"styp", &[b"msdh"]),
             bx(b"emsg", &[&[0; 6]]),
@@ -511,14 +512,14 @@ pub(crate) mod tests {
                 &(-2i16).to_be_bytes(),
             ],
         );
-        let body = segment(1, 0, &[sized(1); 3], &[sgpd], b"abc");
+        let body = movie_fragment(1, 0, &[sized(1); 3], &[sgpd], b"abc");
         let traf = &parse(&body, 0, &[(1, TREX)]).unwrap()[0];
         assert_eq!(traf.roll.as_ref().unwrap().distances, [-2]);
     }
 
     #[test]
     fn truncation_is_an_error_not_a_panic() {
-        let body = segment(1, 0, &[sized(2), sized(2)], &[], b"abcd");
+        let body = movie_fragment(1, 0, &[sized(2), sized(2)], &[], b"abcd");
         for len in 0..body.len() {
             let _ = parse(&body[..len], 0, &[(1, TREX)]);
         }

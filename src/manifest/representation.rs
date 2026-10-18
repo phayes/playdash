@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// [`DashManifest`]: crate::DashManifest
 /// [`DashManifest::representations`]: crate::DashManifest::representations
-/// [`DashManifest::fragments`]: crate::DashManifest::fragments
+/// [`DashManifest::segments`]: crate::DashManifest::segments
 ///
 /// # Examples
 ///
