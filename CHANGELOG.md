@@ -64,13 +64,13 @@
   `PacketStream::with_track` reads one of them, as a muxed representation needs.
 - `SegmentCache::add_keys` (blocking and async, with the `encryption` feature): adds
   content keys to a cache that already decrypts, or to one no stream has used yet.
-- `SegmentStream::media_segment` (blocking and async): fetches any of the stream's media
-  segments without moving its position or retention window.
+- `SegmentStream::fetch_segment` (blocking and async): fetches the body of any of the
+  stream's media segments without moving its position or retention window.
 - Timed `Segments`: `Segments::timed` builds them from `MediaSegment`s, each a
   segment location with its start and duration in media ticks, on a `MediaTiming` clock
   (timescale, `@presentationTimeOffset` and `Period@start`). `DashManifest::segments`
-  returns timed segments. `span`, `segment_at`, `end`, `estimate_len`, `timing` and
-  `timed_media` read them.
+  returns timed segments. `span`, `segment_at`, `end`, `estimate_len` and `timing` read
+  them.
 - `Error::InvalidSegmentTiming`, for media segments with a zero duration or that overlap.
 - `Error::MalformedMedia` and `Error::UnsupportedMedia`.
 - `list_packets`, `list_tracks` and `save_flac` examples.

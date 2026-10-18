@@ -346,8 +346,8 @@ impl SegmentStream {
         })
     }
 
-    /// Fetches media segment `index` of the representation, blocking until it
-    /// downloads, without moving the stream's position or retention window.
+    /// Fetches the body of media segment `index` of the representation, blocking
+    /// until it downloads, without moving the stream's position or retention window.
     ///
     /// `index` counts the representation's media segments, as
     /// [`Segments::segment_at`] does, also for a stream from
@@ -357,7 +357,7 @@ impl SegmentStream {
     /// Fails with [`Error::Initialization`] for a segment before the stream's
     /// first or past its last, and with the download's error if it fails. A
     /// failed fetch does not end the stream.
-    pub fn media_segment(&self, index: usize) -> Result<Bytes, Error> {
+    pub fn fetch_segment(&self, index: usize) -> Result<Bytes, Error> {
         Ok(self.media_part_body(SegmentNumber(index as u64))?.body)
     }
 
@@ -376,7 +376,7 @@ impl SegmentStream {
         track::tracks(&body, &init.location)
     }
 
-    /// [`Self::media_segment`], with where the segment sits.
+    /// [`Self::fetch_segment`], with where the segment sits.
     pub(crate) fn media_part_body(&self, number: SegmentNumber) -> Result<PartBody, Error> {
         let part = Part::Media(number);
         let data = self.shared.lock().part_data(part).cloned().ok_or_else(|| {
@@ -1015,9 +1015,7 @@ mod tests {
         )
         .unwrap();
 
-        // Byte 6 is inside segment "b" (init=4, a=4, b starts at 8... wait)
-        // init=4, a=4, so offset 6 is in segment a (bytes 4..8), offset 2 within a.
-        // Use offset 9 to land in b (4+4+1).
+        // The init and "a" are 4 bytes each, so byte 9 is one byte into "b".
         assert_eq!(
             reader.seek_bytes(SeekFrom::Start(9)).unwrap(),
             position(Some(9), None)
@@ -2335,7 +2333,7 @@ mod tests {
     }
 
     #[test]
-    fn media_segment_fetches_without_moving_the_stream() {
+    fn fetch_segment_does_not_move_the_stream() {
         let (cache, transport) = counting_cache(&[]);
         // Keep nothing behind, and only the next second ahead.
         let (stream, _) =
@@ -2349,13 +2347,13 @@ mod tests {
         // Segment 0 is before this stream's first; segment 3 does not exist.
         for index in [0, 3] {
             assert!(matches!(
-                stream.media_segment(index),
+                stream.fetch_segment(index),
                 Err(Error::Initialization(_))
             ));
         }
 
         // Fetching the last segment leaves the stream reading its first.
-        assert_eq!(stream.media_segment(2).unwrap(), &b"c"[..]);
+        assert_eq!(stream.fetch_segment(2).unwrap(), &b"c"[..]);
         assert_eq!(stream.next().unwrap().unwrap(), &b"b"[..]);
         assert_eq!(stream.next().unwrap().unwrap(), &b"c"[..]);
         assert!(stream.next().is_none());
@@ -2363,13 +2361,13 @@ mod tests {
         // Behind the window now, so fetching it again downloads it again and
         // does not keep it.
         wait_for(|| cache.cached(&"b".into()).is_none());
-        assert_eq!(stream.media_segment(1).unwrap(), &b"b"[..]);
+        assert_eq!(stream.fetch_segment(1).unwrap(), &b"b"[..]);
         assert_eq!(cache.cached(&"b".into()), None);
         assert_eq!(transport.gets().iter().filter(|url| *url == "b").count(), 2);
     }
 
     #[test]
-    fn media_segment_errors_are_the_callers_alone() {
+    fn fetch_segment_errors_are_the_callers_alone() {
         let failed = Arc::new(AtomicBool::new(false));
         let released = Arc::new(AtomicBool::new(false));
         let get = {
@@ -2400,7 +2398,7 @@ mod tests {
 
         // The side fetch is the first GET of "b", and fails.
         assert!(matches!(
-            stream.media_segment(1),
+            stream.fetch_segment(1),
             Err(Error::Initialization(reason)) if reason == "refused"
         ));
 

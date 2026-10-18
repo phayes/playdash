@@ -262,7 +262,7 @@ impl From<crate::DashManifest> for DashManifest {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::segment::{SegmentLocation, parse_byte_range};
+    use crate::segment::{SegmentLocation, parse_byte_range, timed_media_for_test};
     use bytes::Bytes;
     use futures_util::StreamExt;
     use segment::SegmentStream;
@@ -380,8 +380,7 @@ pub(crate) mod tests {
             segments.init(),
             &SegmentLocation::with_range(format!("{base}/audio/track.mp4"), 0..=837)
         );
-        let durations: Vec<u64> = segments
-            .timed_media()
+        let durations: Vec<u64> = timed_media_for_test(&segments)
             .unwrap()
             .iter()
             .map(|segment| segment.duration)

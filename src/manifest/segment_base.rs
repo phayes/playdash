@@ -319,6 +319,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::manifest::tests::ranged;
     use crate::mp4::sidx::tests::{sidx, sidx_at};
+    use crate::segment::timed_media_for_test;
 
     #[test]
     fn parses_sidx_into_absolute_ranges() {
@@ -465,8 +466,7 @@ pub(crate) mod tests {
         let timing = segments.timing().unwrap();
         assert_eq!(timing.timescale.get(), 44_100);
         assert_eq!(timing.presentation_time_offset, 0);
-        let times: Vec<(u64, u64)> = segments
-            .timed_media()
+        let times: Vec<(u64, u64)> = timed_media_for_test(&segments)
             .unwrap()
             .iter()
             .map(|segment| (segment.start, segment.duration))

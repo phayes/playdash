@@ -225,8 +225,8 @@ impl SegmentStream {
         self
     }
 
-    /// Fetches media segment `index` of the representation, without moving the
-    /// stream's position or retention window.
+    /// Fetches the body of media segment `index` of the representation, without
+    /// moving the stream's position or retention window.
     ///
     /// `index` counts the representation's media segments, as
     /// [`Segments::segment_at`] does, also for a stream from
@@ -236,7 +236,7 @@ impl SegmentStream {
     /// Fails with [`Error::Initialization`] for a segment before the stream's
     /// first or past its last, and with the download's error if it fails. A
     /// failed fetch does not end the stream.
-    pub async fn media_segment(&self, index: usize) -> Result<Bytes, Error> {
+    pub async fn fetch_segment(&self, index: usize) -> Result<Bytes, Error> {
         Ok(self
             .media_part_body(SegmentNumber(index as u64))
             .await?
@@ -258,7 +258,7 @@ impl SegmentStream {
         track::tracks(&body, &init.location)
     }
 
-    /// [`Self::media_segment`], with where the segment sits.
+    /// [`Self::fetch_segment`], with where the segment sits.
     pub(crate) async fn media_part_body(&self, number: SegmentNumber) -> Result<PartBody, Error> {
         let part = Part::Media(number);
         let data = self.shared.lock().part_data(part).cloned().ok_or_else(|| {
@@ -935,7 +935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_segment_fetches_without_moving_the_stream() {
+    async fn fetch_segment_does_not_move_the_stream() {
         // The first request for segment 3 fails.
         let refused = Arc::new(AtomicBool::new(false));
         let (base, counts) = serve({
@@ -949,16 +949,16 @@ mod tests {
         let mut stream = stream.with_retention(seconds(Some(0), Some(1)));
 
         // Fetching the last segment leaves the stream at its start.
-        assert_eq!(stream.media_segment(4).await.unwrap(), &b"5"[..]);
+        assert_eq!(stream.fetch_segment(4).await.unwrap(), &b"5"[..]);
         assert!(matches!(
-            stream.media_segment(5).await,
+            stream.fetch_segment(5).await,
             Err(Error::Initialization(_))
         ));
         assert_eq!(stream.next().await.unwrap().unwrap(), &b"init"[..]);
         assert_eq!(stream.next().await.unwrap().unwrap(), &b"1"[..]);
 
         // A failed fetch is this caller's; the stream still downloads it itself.
-        assert!(stream.media_segment(2).await.is_err());
+        assert!(stream.fetch_segment(2).await.is_err());
         assert_eq!(texts(&mut stream).await, ["2", "3", "4", "5"]);
         assert_eq!(requests(&counts, "/3"), 2);
         // Segment 5 was outside the window, so it was not kept the first time.

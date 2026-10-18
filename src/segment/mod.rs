@@ -391,15 +391,6 @@ impl Segments {
         }
     }
 
-    /// Returns the timed media segments in playback order, or `None` for
-    /// untimed segments.
-    pub fn timed_media(&self) -> Option<&[MediaSegment]> {
-        match &self.index {
-            MediaIndex::Untimed(_) => None,
-            MediaIndex::List { segments, .. } => Some(segments),
-        }
-    }
-
     /// Returns the presentation time covered by media segment `index`.
     /// Returns `None` for untimed segments or an index past the last.
     pub fn span(&self, index: usize) -> Option<Range<Duration>> {
@@ -513,6 +504,13 @@ impl Segments {
 fn segment_span(timing: &MediaTiming, segment: &MediaSegment) -> Range<Duration> {
     let end = segment.start.saturating_add(segment.duration);
     timing.presentation_time(segment.start)..timing.presentation_time(end)
+}
+
+/// The timed media segments of `segments` in playback order, for tests, or
+/// `None` for untimed segments.
+#[cfg(test)]
+pub(crate) fn timed_media_for_test(segments: &Segments) -> Option<&[MediaSegment]> {
+    segments.timed_segments().map(|(_, media)| media)
 }
 
 /// Timed segments for tests: `media` back to back from media time zero, each

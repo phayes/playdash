@@ -1,4 +1,5 @@
 use super::*;
+use crate::segment::timed_media_for_test;
 
 /// The init URL and the media URLs of a representation without byte ranges.
 fn urls(manifest: &DashManifest, id: &str) -> (String, Vec<String>) {
@@ -29,7 +30,7 @@ fn timescale(manifest: &DashManifest, id: &str) -> u32 {
 /// The duration of each of a representation's media segments, in its ticks.
 fn durations(manifest: &DashManifest, id: &str) -> Vec<u64> {
     let segments = manifest.segments(id).unwrap();
-    let media = segments.timed_media().unwrap();
+    let media = timed_media_for_test(&segments).unwrap();
     media.iter().map(|segment| segment.duration).collect()
 }
 
@@ -191,7 +192,7 @@ fn segments_keep_their_media_time_and_present_from_the_offset() {
         .unwrap()
     };
     let starts = |segments: &Segments| -> Vec<u64> {
-        let media = segments.timed_media().unwrap();
+        let media = timed_media_for_test(segments).unwrap();
         media.iter().map(|segment| segment.start).collect()
     };
     let millis = Duration::from_millis;
