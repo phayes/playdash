@@ -8,12 +8,13 @@ fn urls(manifest: &DashManifest, id: &str) -> (String, Vec<String>) {
         location.url.clone()
     };
     let segments = manifest.segments(id).unwrap();
-    (url(segments.init()), segments.media().map(url).collect())
+    let media = segments.media().map(|location| url(&location)).collect();
+    (url(segments.init()), media)
 }
 
 /// The locations of the init segment and the media segments of `segments`.
 fn parts(segments: &Segments) -> (SegmentLocation, Vec<SegmentLocation>) {
-    (segments.init().clone(), segments.media().cloned().collect())
+    (segments.init().clone(), segments.media().collect())
 }
 
 /// The timescale of a representation's media segments.

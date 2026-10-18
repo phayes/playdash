@@ -131,6 +131,26 @@ impl SegmentData {
     }
 }
 
+/// The decryption role a stream gives each media segment it schedules: the
+/// protection of its initialization segment, when its cache decrypts.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MediaRole {
+    #[cfg(feature = "encryption")]
+    protection: Option<Arc<cenc::Protection>>,
+}
+
+impl MediaRole {
+    /// Tags `data` as a media segment of this role, before its first GET.
+    #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
+    pub(crate) fn assign(&self, data: &SegmentData) {
+        #[cfg(feature = "encryption")]
+        if let Some(protection) = &self.protection {
+            // Already set if another stream of this store got here first.
+            let _ = data.role.set(SegmentRole::Media(protection.clone()));
+        }
+    }
+}
+
 /// Subscriber to a [`Store`]; see [`Store::subscribe`].
 pub(crate) trait CacheListener: Send + Sync {
     /// `data`'s body or size has just changed.
@@ -295,33 +315,28 @@ impl Store {
         let _ = init.role.set(SegmentRole::Init);
     }
 
-    /// Tags `media` with the protection parsed from the already fetched and
-    /// cleared body of `init`. Fails before any media GET if a protected
-    /// track's KID has no key.
-    #[cfg(feature = "encryption")]
-    pub(crate) fn assign_media_roles<'a>(
-        &self,
-        init: &SegmentData,
-        media: impl IntoIterator<Item = &'a SegmentData>,
-    ) -> Result<(), Error> {
-        let Some(keys) = self.keys() else {
-            return Ok(());
-        };
-        let body = init.body().expect("init fetched before media roles");
-        let protection = cenc::protection(&body).map_err(|problem| problem.at(&init.location))?;
-        if let Some(track) = protection
-            .tracks
-            .iter()
-            .find(|track| !keys.contains(&track.kid))
-        {
-            return Err(Error::MissingContentKey(cenc::hex(&track.kid)));
+    /// The role of the media segments that follow `init`, from the protection
+    /// parsed from its already fetched and cleared body. Fails before any
+    /// media GET if a protected track's KID has no key.
+    #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
+    pub(crate) fn media_role(&self, init: &SegmentData) -> Result<MediaRole, Error> {
+        #[cfg(feature = "encryption")]
+        if let Some(keys) = self.keys() {
+            let body = init.body().expect("init fetched before media roles");
+            let protection =
+                cenc::protection(&body).map_err(|problem| problem.at(&init.location))?;
+            if let Some(track) = protection
+                .tracks
+                .iter()
+                .find(|track| !keys.contains(&track.kid))
+            {
+                return Err(Error::MissingContentKey(cenc::hex(&track.kid)));
+            }
+            return Ok(MediaRole {
+                protection: Some(Arc::new(protection)),
+            });
         }
-        let protection = Arc::new(protection);
-        for data in media {
-            // Already set if another stream of this store got here first.
-            let _ = data.role.set(SegmentRole::Media(protection.clone()));
-        }
-        Ok(())
+        Ok(MediaRole::default())
     }
 
     /// Decrypts `body` according to `data`'s role. Same length out as in, so

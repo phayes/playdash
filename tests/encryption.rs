@@ -5,7 +5,7 @@
 use playdash::segment::{SegmentLocation, SegmentStream, Segments};
 use playdash::{
     BufferStatus, Bytes, ContentKeys, DashManifest, DashSource, Error, MediaPacket, MediaStream,
-    SegmentCache, Transport,
+    Retention, SegmentCache, Transport,
 };
 use rodio::{Decoder, Source};
 use std::io::{BufRead, BufReader, Cursor, Write};
@@ -308,9 +308,9 @@ fn cache_holds_same_length_plaintext() {
     assert!(source.count() > 0);
 
     let segments = manifest.segments("0").unwrap();
-    for segment in std::iter::once(segments.init()).chain(segments.media()) {
-        let raw = Fixtures.get(segment, None).unwrap();
-        let cached = cache.cached(segment).expect("fetched during playback");
+    for segment in std::iter::once(segments.init().clone()).chain(segments.media()) {
+        let raw = Fixtures.get(&segment, None).unwrap();
+        let cached = cache.cached(&segment).expect("fetched during playback");
         assert_eq!(cached.len(), raw.len(), "{segment}");
         assert_ne!(cached, raw, "{segment} was not decrypted");
     }
@@ -347,6 +347,29 @@ fn media_stream_decrypts_with_keys() {
             .unwrap();
         assert_eq!(keyed.initialization(), expected.initialization(), "{name}");
         assert_eq!(media_packets(keyed), media_packets(expected), "{name}");
+    }
+}
+
+#[test]
+fn media_stream_decrypts_segments_a_bounded_window_adds_late() {
+    // Each segment joins the schedule only once playback reaches it.
+    let retention = Retention {
+        behind: Some(Duration::ZERO),
+        ahead: Some(Duration::ZERO),
+    };
+    for name in ["shaka_cbcs.mpd", "shaka_cenc.mpd"] {
+        let bounded = manifest(name)
+            .media_stream("0")
+            .cache(keyed_cache())
+            .retention(retention)
+            .open()
+            .unwrap();
+        let expected = manifest(name)
+            .media_stream("0")
+            .cache(keyed_cache())
+            .open()
+            .unwrap();
+        assert_eq!(media_packets(bounded), media_packets(expected), "{name}");
     }
 }
 

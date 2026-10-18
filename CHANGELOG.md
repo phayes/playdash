@@ -106,6 +106,13 @@
   `new_with_cache` and `starting_at` (blocking and async) no longer take a timeline.
 - `Segments` fields are private, read with `init()`, `media()` and `media_len()`, and
   `Segments` is no longer `Serialize` or `Deserialize`.
+- `Segments::media()` yields owned `SegmentLocation`s rather than references.
+- A `SegmentTemplate` whose `@media` has an unsupported format tag, or names
+  `$Bandwidth$` without a `@bandwidth`, now fails `DashManifest::segments` even when it
+  addresses no media segments.
+- Streams with a bounded `Retention`, including a `MediaStream` opened with
+  `MediaStreamBuilder::retention` (blocking and async), set up only the segments their
+  window reaches, not every segment of the representation.
 - `BufferTotal::time` is replaced by `start` and `end`, the presentation times the
   representation's media spans. `BufferStatus` percentages count from `start`.
 - `DashSource` positions count from the start of the representation's media.
@@ -130,6 +137,11 @@
   when the `sidx` uses another timescale.
 - A `SegmentStream` with a `Retention` (blocking and async) no longer sometimes downloads a
   segment again just after reading past it.
+- `SegmentStream::seek_bytes` (blocking and async) with `SeekFrom::End` fails when the
+  stream's length is unknown because HEAD requests failed, rather than seeking as if the
+  length were 0.
+- A `SegmentTemplate` or `SegmentList` whose segment numbers or media times overflow fails
+  `DashManifest::segments` with `Error::DashManifestInvalidSegments`, rather than panicking.
 
 ## [0.2.0] - 2026-10-16
 

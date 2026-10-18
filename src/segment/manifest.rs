@@ -1,6 +1,7 @@
 //! Opening a manifest's representations as blocking [`SegmentStream`]s.
 
 use super::{SegmentCache, SegmentStream};
+use crate::Retention;
 use crate::error::Error;
 use crate::manifest::DashManifest;
 use std::sync::Arc;
@@ -65,6 +66,17 @@ impl DashManifest {
         cache: Arc<SegmentCache>,
     ) -> Result<SegmentStream, Error> {
         SegmentStream::new_with_cache(self.segments(representation_id)?, cache)
+    }
+
+    /// Like [`DashManifest::segment_stream_with_cache`], keeping as much as
+    /// `retention` says from the start.
+    pub(crate) fn segment_stream_retained(
+        &self,
+        representation_id: impl AsRef<str>,
+        cache: Arc<SegmentCache>,
+        retention: Retention,
+    ) -> Result<SegmentStream, Error> {
+        SegmentStream::new_retained(self.segments(representation_id)?, cache, retention)
     }
 
     /// Opens a representation as a [`SegmentStream`] that reads its

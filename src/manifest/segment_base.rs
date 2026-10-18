@@ -455,7 +455,7 @@ pub(crate) mod tests {
         let segments = manifest.segments("FLAC").unwrap();
         assert_eq!(segments.init(), &ranged(url, 0, 837));
         assert_eq!(
-            segments.media().cloned().collect::<Vec<_>>(),
+            segments.media().collect::<Vec<_>>(),
             [
                 ranged(url, index_end + 1, index_end + 100),
                 ranged(url, index_end + 101, index_end + 150),

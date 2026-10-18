@@ -27,7 +27,7 @@ Decisions (settled)
 - Seeks outside the available window clamp into it. Falling behind the window
   while reading follows a policy chosen on the builder (Phase 5).
 
-Prior art (dash.js 8502c40, androidx/media 8c6678b)
+Prior art (dash.js 8502c40, androidx/media 8c6678b) - see /opt/dash.js
 
 - ExoPlayer `DashSegmentIndex` (exoplayer_dash): an immutable, pure index
   queried with `now` passed in: `getSegmentNum(time)`, `getTimeUs(n)`,
@@ -94,27 +94,40 @@ Phase 2 (done): stable segment identity
   is gone; the cursor carries `first` to step from the init to the first
   media segment.
 
-Phase 3: a segment index behind `Segments`
-- `Segments` already wraps a crate-internal `MediaIndex` (`Untimed`,
-  `List`) behind accessors. Add the live variants:
-      enum MediaIndex { Untimed(..), List { .. }, Template(..), Timeline(..) }
-  each defining segment numbers, and share it as `Arc<MediaIndex>`.
-  `Segments::new(init, media)` and manifests' static segments behave
-  exactly as today.
-- Index queries are pure and take `now`, modelled on ExoPlayer's
-  `DashSegmentIndex`: the segment at a media time, the segment after a given
-  start, the first available segment and the live edge at `now`, the end
-  (`None` while live), and when the next segment becomes available.
-- The schedule materialises segments from the index around the cursor as the
-  window moves, through the internal cursor. It holds an `Arc<MediaIndex>`
-  snapshot and swaps it when a refresh lands (Phase 4). The streams run all
-  I/O; the index and `Schedule` stay free of it.
-- Segments the schedule adds after it opens need their decryption roles set
-  (`Store::assign_media_roles`), which today happens once, at open.
+Phase 3 (done): a segment index behind `Segments`
+- `Segments` holds an `Arc<MediaIndex>` (`segment/index.rs`): `Untimed`,
+  `List`, `Template` (`@duration`, arithmetic) and `Timeline` (run-length
+  `S` entries), each numbering its segments from zero. Static
+  `SegmentTemplate`s build `Template` or `Timeline`; `SegmentList` and
+  `SegmentBase` stay `List`. Template URLs are filled per segment from a
+  parsed `UrlTemplate`, every one checked once when the index is built.
+- Index queries are pure: the segment at a time (`number_at`,
+  `ending_after`), the first starting from a time (`starting_from`), the
+  numbers, and `available(now)`, which is every segment while static. A
+  crate-internal `Clock` gives streams `now`.
+- The schedule adds segments from the index as its window, a priority
+  request, a byte seek, a HEAD probe or `fetch_segment` reaches them, and
+  keeps every segment it has added. Retention reaches the schedule at open
+  (`MediaStreamBuilder` passes it through), so a bounded window adds only
+  what it keeps. Each added segment gets the `MediaRole` the init's
+  protection gave at open.
 
 Phase 4: the live index and the shared refresh
 - Parse and keep the dynamic-MPD fields listed above in `DashManifest`
   (an `is_live()` and the timing anchors).
+- Index queries Phase 3 left out for want of a caller: the live edge at
+  `now`, when the next segment becomes available, and the end (`None` while
+  live; `Schedule::end` becomes optional with it). The schedule's
+  `extend_to`, capped by `available(now)` today, becomes the internal cursor
+  whose step yields a segment, "not before <time>", or the end.
+- `Schedule::replace_index` swaps in a refreshed `Arc<MediaIndex>`. The
+  streams' time queries already read the schedule's index, but the
+  demuxer keeps the `Arc<MediaIndex>` its `PacketStream` was opened with
+  (`Demuxer::seek_range`, `segment_start`); hand it the new one too, or have
+  it ask the stream.
+- Template URLs are checked once at build; an unbounded live template needs
+  a structural check instead (e.g. reject `$Number$`/`$Time$` in the scheme
+  or authority), since its segments cannot all be listed.
 - `Template` index (`$Number$` + `@duration`): availability is arithmetic, and
   finding new segments needs no MPD refresh. Segment `n` is available once
   `availabilityStartTime + Period@start + (n - startNumber + 1) * duration -
@@ -295,10 +308,7 @@ These are ranked by how much they matter. These are candidates for follow-up wor
    - dash.js resolves inheritance once, at parse time (objectiron), and computes `segmentInfoType` once per representation.
    - A single resolved representation, built once, would replace all of this.
 
-4. **Segment timing and URLs are built as two separate lists, then zipped together** (mod.rs:242-245).
-   - `zip` silently truncates if the two lengths ever differ.
-   - dash.js builds one `Segment` object that carries both the URL and the timing.
-   - Naming adds to the confusion: `manifest::segments` (timing) and `segment::Segments` (the public list) are different things.
+4. **Naming: `manifest::segments` (timing arithmetic) and `segment::Segments` (the public list) are different things.** Segment timing and URLs are no longer built as separate lists: templates fill each URL from the segment's number and time, and `ListChain::segments` pairs each `SegmentURL` with its timing as it builds the list.
 
 5. **No retries, failover or error types.**
    - The first failed GET ends the stream.
@@ -310,7 +320,7 @@ These are ranked by how much they matter. These are candidates for follow-up wor
 6. **The blocking and async code are near-copies of each other.**
    - `segment/stream.rs` and `nonblocking/segment/stream.rs` differ in about 3,000 lines.
    - Cache, transport, the packet-stream seek loop and the `MediaStream` builder are also copied.
-   - `Schedule` and `Store` already contain no I/O. More of the shared logic could move into them: the worker step, `ensure_sizes`, and the seek loop in `packet/stream.rs` and `nonblocking/packet.rs`. dash.js has a single code path, so there is no direct comparison.
+   - `Schedule` and `Store` contain no I/O. The segment streams' shared steps now live on `Schedule` (GET and HEAD worker steps, `size_step` for `ensure_sizes`, time and byte seek begin/land, `reported_end`); what is left in each stream is its waiting, its I/O, and the read loops around them. Still copied: the packet-stream seek loop in `packet/stream.rs` and `nonblocking/packet.rs`, the caches, transports and `MediaStream` builders. dash.js has a single code path, so there is no direct comparison.
 
 7. **The manifest fetch skips `Transport`.**
    - fetch.rs:17 uses the global `ureq::get`, then builds a second agent to load indexes. The async version uses `Client::new`.
@@ -326,5 +336,4 @@ These are ranked by how much they matter. These are candidates for follow-up wor
    - `cenc:default_KID` and `pssh` are parsed by the vendored crate but never read. Keys come only from `tenc` in the init segment.
    - `protected_entries` skips any track whose handler is not `soun` (cenc.rs:272). Encrypted video therefore fails later with "samples are encrypted", not with a clear "unsupported" error.
 
-10. **Every segment is built up front.** playdash creates a `Vec` of all segments; dash.js getters compute a segment from its index or time when asked. TODO §1 Phase 3 already plans the on-demand approach (ExoPlayer-style), so this is listed only for completeness.
-```
+10. **Every `SegmentList` segment is built up front.** Templates now compute segments on demand (TODO §1 Phase 3), but `SegmentList` and `SegmentBase` build a `Vec` of `MediaSegment`s, one per `SegmentURL`. That matches what the MPD lists, so it only matters for very long lists.

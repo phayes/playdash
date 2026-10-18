@@ -338,13 +338,11 @@ impl<'a> MediaStreamBuilder<'a> {
     pub async fn open(mut self) -> Result<MediaStream, Error> {
         // The representation's segments.
         let cache = self.take_cache()?;
-        let mut segments = self
+        let retention = self.retention.unwrap_or_default();
+        let segments = self
             .manifest
-            .segment_stream_with_cache(&self.representation_id, cache)
+            .segment_stream_retained(&self.representation_id, cache, retention)
             .await?;
-        if let Some(retention) = self.retention {
-            segments = segments.with_retention(retention);
-        }
 
         // The packets of the chosen track.
         let mut packets = match self.track {

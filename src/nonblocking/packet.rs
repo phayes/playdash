@@ -91,7 +91,7 @@ impl PacketStream {
                 ));
             }
         };
-        let representation = segments.representation_segments().clone();
+        let representation = segments.representation_index();
         let demuxer = Demuxer::new(init.body, &init.location, Some(representation), track_id)?;
         Ok(Self {
             segments,

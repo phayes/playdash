@@ -2,8 +2,11 @@
 //! their workers follow, and the arithmetic of reading and seeking. Nothing here does I/O or
 //! waits.
 
-use super::store::SegmentData;
-use super::{SegmentLocation, SegmentNumber, Segments};
+#[cfg(test)]
+use super::Segments;
+use super::index::MediaIndex;
+use super::store::{MediaRole, SegmentData, Store};
+use super::{SegmentLocation, SegmentNumber, each};
 use crate::error::Error;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -12,7 +15,7 @@ use std::fmt;
 use std::io::{self, SeekFrom};
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Retention windows for a [`SegmentStream`](crate::segment::SegmentStream): the media time of a
 /// representation it keeps around its position. The default keeps everything and downloads to
@@ -142,32 +145,34 @@ impl fmt::Display for Part {
     }
 }
 
-/// A media segment in a stream's schedule: its data, and the presentation
-/// time it spans when timed.
-#[derive(Debug)]
-pub(crate) struct Scheduled {
-    pub(crate) data: Arc<SegmentData>,
-    pub(crate) span: Option<Range<Duration>>,
-}
-
-/// The numbers from the start of `range` to just before its end.
-fn each(range: Range<SegmentNumber>) -> impl DoubleEndedIterator<Item = SegmentNumber> {
-    (range.start.0..range.end.0).map(SegmentNumber)
+/// The inputs a schedule adds media segments with: the store whose segment
+/// data they share, and the time now.
+#[derive(Clone, Copy)]
+pub(crate) struct Supply<'a> {
+    pub(crate) store: &'a Store,
+    pub(crate) now: SystemTime,
 }
 
 /// A stream's download schedule: the segments it wants, and how its workers
-/// fetch them. Shared
-/// between a stream and its GET and HEAD workers, under one lock.
+/// fetch them. Shared between a stream and its GET and HEAD workers, under
+/// one lock.
+///
+/// The schedule adds media segments from its index as it needs them: those
+/// in the window, and those a byte seek, a size probe or a fetch asks for.
+/// It keeps every segment it has added.
 #[derive(Debug)]
 pub(crate) struct Schedule {
     /// Initialization segment, always kept.
     pub(crate) init: Arc<SegmentData>,
-    /// Number of the first media segment in `media`.
+    /// The representation's media segments, which the schedule adds from.
+    index: Arc<MediaIndex>,
+    /// The decryption role each media segment gets as it is added.
+    role: MediaRole,
+    /// Number of the stream's first media segment, the first in `media`.
     first: SegmentNumber,
-    /// Media segments in timeline order, numbered on from `first`.
-    media: VecDeque<Scheduled>,
-    /// Every media segment has a span, so retention can place the window.
-    timed: bool,
+    /// Media segments added so far, in timeline order, numbered on from
+    /// `first`.
+    media: VecDeque<Arc<SegmentData>>,
     /// When false, byte seeks wait on downloaded bodies instead of HEAD.
     pub(crate) head_available: bool,
     /// Background HEAD prefetch is wanted. Does not gate on-demand seek HEADs.
@@ -181,41 +186,48 @@ pub(crate) struct Schedule {
     pub(crate) complete: bool,
     pub(crate) error: Option<String>,
     retention: Retention,
-    /// The media segments the stream keeps now: its retention window.
+    /// The media segments the stream keeps now: its retention window, always
+    /// among the segments added.
     pub(crate) window: Range<SegmentNumber>,
 }
 
 impl Schedule {
-    /// A schedule for `init` and `media`, the media segments numbered on from
-    /// `first`, each with the presentation time it spans when timed. Unless
-    /// every one is timed, retention keeps everything.
+    /// A schedule for `init` and the media segments of `index` from the one
+    /// numbered `first` on, keeping as much as `retention` says. Each media
+    /// segment added gets `role`. Retention keeps everything of an untimed
+    /// index.
     pub(crate) fn new(
         init: Arc<SegmentData>,
+        index: Arc<MediaIndex>,
         first: SegmentNumber,
-        media: Vec<(Arc<SegmentData>, Option<Range<Duration>>)>,
+        retention: Retention,
+        role: MediaRole,
+        supply: Supply,
     ) -> Self {
-        let media: VecDeque<Scheduled> = media
-            .into_iter()
-            .map(|(data, span)| Scheduled { data, span })
-            .collect();
-        let complete = init.has_body() && media.iter().all(|segment| segment.data.has_body());
-        let timed = media.iter().all(|segment| segment.span.is_some());
-        let window = first..first.plus(media.len());
-        Self {
+        let mut schedule = Self {
             init,
+            index,
+            role,
             first,
-            media,
-            timed,
+            media: VecDeque::new(),
             head_available: true,
             eager_head: false,
             head_worker_running: false,
             cursor: Part::Init,
             priority: None,
-            complete,
+            complete: false,
             error: None,
-            retention: Retention::default(),
-            window,
-        }
+            retention,
+            window: first..first,
+        };
+
+        // Add the window's segments, and see whether any is still to fetch.
+        let window = schedule.window_at(Part::Init);
+        schedule.extend_to(window.end, supply);
+        schedule.complete = !schedule.missing_body(Part::Init)
+            && each(window.clone()).all(|number| !schedule.missing_body(Part::Media(number)));
+        schedule.window = window;
+        schedule
     }
 
     /// The number of the first media segment.
@@ -223,8 +235,27 @@ impl Schedule {
         self.first
     }
 
-    /// The scheduled media segment numbered `number`.
-    fn segment(&self, number: SegmentNumber) -> Option<&Scheduled> {
+    /// The number just past the last media segment added.
+    fn frontier(&self) -> SegmentNumber {
+        self.first.plus(self.media.len())
+    }
+
+    /// Adds media segments from the index up to just before `end`, as far as
+    /// they are available.
+    fn extend_to(&mut self, end: SegmentNumber, supply: Supply) {
+        let end = end.min(self.index.available(supply.now).end);
+        while self.frontier() < end {
+            let Some(segment) = self.index.segment(self.frontier()) else {
+                break;
+            };
+            let data = supply.store.data(segment.location);
+            self.role.assign(&data);
+            self.media.push_back(data);
+        }
+    }
+
+    /// The data of the media segment numbered `number`, if added.
+    fn segment(&self, number: SegmentNumber) -> Option<&Arc<SegmentData>> {
         self.media.get(number.offset_from(self.first)?)
     }
 
@@ -239,42 +270,48 @@ impl Schedule {
         slot(range.start)..slot(range.end)
     }
 
-    /// The data of the segment at `part`, or `None` past the end.
+    /// The data of the segment at `part`, or `None` for a media segment not
+    /// added.
     pub(crate) fn part_data(&self, part: Part) -> Option<&Arc<SegmentData>> {
         match part {
             Part::Init => Some(&self.init),
-            Part::Media(number) => Some(&self.segment(number)?.data),
+            Part::Media(number) => self.segment(number),
         }
     }
 
-    /// Every segment in byte order, with its part.
+    /// The data of the segment at `part`, adding media segments up to it
+    /// first. `None` before the first media segment or past the end.
+    pub(crate) fn materialise(&mut self, part: Part, supply: Supply) -> Option<&Arc<SegmentData>> {
+        if let Part::Media(number) = part {
+            self.extend_to(number.next(), supply);
+        }
+        self.part_data(part)
+    }
+
+    /// Every segment added, in byte order, with its part.
     fn parts(&self) -> impl Iterator<Item = (Part, &Arc<SegmentData>)> {
         std::iter::once((Part::Init, &self.init)).chain(
             self.media
                 .iter()
                 .enumerate()
-                .map(|(slot, segment)| (Part::Media(self.first.plus(slot)), &segment.data)),
+                .map(|(slot, data)| (Part::Media(self.first.plus(slot)), data)),
         )
     }
 
-    /// The media segments, in byte order.
+    /// The media segments added, in byte order.
     #[cfg(test)]
     pub(crate) fn media_data(&self) -> impl Iterator<Item = &Arc<SegmentData>> {
-        self.media.iter().map(|segment| &segment.data)
-    }
-
-    /// The media segments, each with the presentation time it spans, if every
-    /// one is timed.
-    pub(crate) fn timed_media(&self) -> Option<Vec<(Arc<SegmentData>, Range<Duration>)>> {
-        self.media
-            .iter()
-            .map(|segment| Some((segment.data.clone(), segment.span.clone()?)))
-            .collect()
+        self.media.iter()
     }
 
     /// The part just past the last segment.
     pub(crate) fn end(&self) -> Part {
-        Part::Media(self.first.plus(self.media.len()))
+        Part::Media(self.end_number())
+    }
+
+    /// The number just past the last media segment.
+    fn end_number(&self) -> SegmentNumber {
+        self.index.numbers().end.max(self.first)
     }
 
     /// Whether `part` is at or past the end of the stream.
@@ -286,22 +323,19 @@ impl Schedule {
     /// its window.
     pub(crate) fn kept(&self) -> Vec<Arc<SegmentData>> {
         let window = self.media.range(self.slots(&self.window));
-        std::iter::once(&self.init)
-            .chain(window.map(|segment| &segment.data))
-            .cloned()
-            .collect()
+        std::iter::once(&self.init).chain(window).cloned().collect()
     }
 
     /// Changes the retention, and the window with it.
-    pub(crate) fn set_retention(&mut self, retention: Retention) -> WindowChange {
+    pub(crate) fn set_retention(&mut self, retention: Retention, supply: Supply) -> WindowChange {
         self.retention = retention;
-        self.rewindow()
+        self.rewindow(supply)
     }
 
     /// Moves the cursor to `part`, and the window with it.
-    pub(crate) fn move_cursor(&mut self, part: Part) -> WindowChange {
+    pub(crate) fn move_cursor(&mut self, part: Part, supply: Supply) -> WindowChange {
         self.cursor = part;
-        self.rewindow()
+        self.rewindow(supply)
     }
 
     /// Asks the GET worker for the segment at `part` before anything else,
@@ -321,10 +355,11 @@ impl Schedule {
         }
     }
 
-    /// Recomputes the window for the cursor, and tells which segments
-    /// entered and left it.
-    fn rewindow(&mut self) -> WindowChange {
+    /// Recomputes the window for the cursor, adding the segments it reaches,
+    /// and tells which segments entered and left it.
+    fn rewindow(&mut self, supply: Supply) -> WindowChange {
         let window = self.window_at(self.cursor);
+        self.extend_to(window.end, supply);
         if window == self.window {
             return WindowChange::default();
         }
@@ -332,7 +367,7 @@ impl Schedule {
         let pick = |range: &Range<SegmentNumber>, other: &Range<SegmentNumber>| -> Vec<_> {
             each(range.clone())
                 .filter(|number| !other.contains(number))
-                .filter_map(|number| Some(self.segment(number)?.data.clone()))
+                .filter_map(|number| self.segment(number).cloned())
                 .collect()
         };
         let change = WindowChange {
@@ -350,42 +385,39 @@ impl Schedule {
     /// that segment itself. A cursor in the initialization segment counts
     /// as the first media segment.
     fn window_at(&self, cursor: Part) -> Range<SegmentNumber> {
-        let len = self.media.len();
-        let all = self.first..self.first.plus(len);
-        if !self.timed || self.retention == Retention::default() {
+        let end = self.end_number();
+        let all = self.first..end;
+        if self.index.timing().is_none() || self.retention == Retention::default() {
             return all;
         }
-        let span = |segment: &Scheduled| segment.span.clone().unwrap_or_default();
 
         // Past the last segment, the position is the end of the media.
-        let cursor = cursor
-            .number_or(self.first)
-            .offset_from(self.first)
-            .unwrap_or(0);
-        let playhead = match self.media.get(cursor) {
-            Some(segment) => span(segment).start,
-            None => self
-                .media
-                .back()
-                .map_or(Duration::ZERO, |last| span(last).end),
+        let cursor = cursor.number_or(self.first).max(self.first);
+        let playhead = match self.index.span(cursor) {
+            Some(span) => span.start,
+            None => end
+                .checked_prev()
+                .filter(|&last| last >= self.first)
+                .and_then(|last| self.index.span(last))
+                .map_or(Duration::ZERO, |span| span.end),
         };
+
+        // As far behind and ahead of the playhead as retention says.
         let start = match self.retention.behind {
-            Some(behind) => {
-                let from = playhead.saturating_sub(behind);
-                self.media
-                    .partition_point(|segment| span(segment).end <= from)
-            }
-            None => 0,
+            Some(behind) => self
+                .index
+                .ending_after(playhead.saturating_sub(behind))
+                .map_or(all.start, |start| start.max(all.start)),
+            None => all.start,
         };
-        let end = match self.retention.ahead {
-            Some(ahead) => {
-                let until = playhead.saturating_add(ahead);
-                self.media
-                    .partition_point(|segment| span(segment).start < until)
-            }
-            None => len,
+        let until = match self.retention.ahead {
+            Some(ahead) => self
+                .index
+                .starting_from(playhead.saturating_add(ahead))
+                .map_or(end, |until| until.max(all.start)),
+            None => end,
         };
-        self.first.plus(start.min(cursor))..self.first.plus(end.max(cursor + 1).min(len))
+        start.min(cursor)..until.max(cursor.next()).min(end)
     }
 
     pub(crate) fn all_sizes_known(&self) -> bool {
@@ -397,11 +429,22 @@ impl Schedule {
         self.part_data(part).is_some_and(|data| !data.has_body())
     }
 
-    /// The first segment whose size is unknown.
-    pub(crate) fn first_unknown_size(&self) -> Option<Part> {
-        self.parts()
-            .find(|(_, data)| data.size().is_none())
-            .map(|(part, _)| part)
+    /// The first segment whose size is unknown, adding media segments until
+    /// one is found.
+    pub(crate) fn first_unknown_size(&mut self, supply: Supply) -> Option<Part> {
+        // Among the segments added so far.
+        if let Some((part, _)) = self.parts().find(|(_, data)| data.size().is_none()) {
+            return Some(part);
+        }
+
+        // Past them, one at a time.
+        loop {
+            let number = self.frontier();
+            self.extend_to(number.next(), supply);
+            if self.segment(number)?.size().is_none() {
+                return Some(Part::Media(number));
+            }
+        }
     }
 
     #[cfg_attr(not(feature = "log"), allow(unused_variables))]
@@ -433,16 +476,20 @@ impl Schedule {
     }
 
     /// The next segment whose size a HEAD should learn.
-    pub(crate) fn next_head(&self) -> Option<(Part, Arc<SegmentData>)> {
+    pub(crate) fn next_head(&mut self, supply: Supply) -> Option<(Part, Arc<SegmentData>)> {
         if !self.head_available {
             return None;
         }
-        let part = self.first_unknown_size()?;
+        let part = self.first_unknown_size(supply)?;
         Some((part, self.part_data(part)?.clone()))
     }
 
-    /// Sum of the sizes of every segment before `part`, if all are known.
+    /// Sum of the sizes of every segment before `part`, if all are added and
+    /// known.
     pub(crate) fn prefix_len(&self, part: Part) -> Option<u64> {
+        if part > Part::Media(self.frontier()) {
+            return None;
+        }
         self.parts()
             .take_while(|&(before, _)| before < part)
             .map(|(_, data)| data.size())
@@ -501,7 +548,7 @@ impl Schedule {
 
     /// Maps an absolute byte offset onto a part and an offset into it once
     /// contiguous sizes covering that offset are known. An offset past the
-    /// end lands at the end of the last segment.
+    /// end lands at the end of the last segment, once every segment is added.
     pub(crate) fn resolve_cursor(&self, target: u64) -> Option<(Part, usize)> {
         let mut acc = 0u64;
         for (part, data) in self.parts() {
@@ -512,6 +559,10 @@ impl Schedule {
             acc += len;
         }
 
+        // Past every segment added.
+        if self.frontier() < self.end_number() {
+            return None;
+        }
         let last = self
             .media
             .len()
@@ -611,7 +662,8 @@ impl Cursor {
 }
 
 /// The absolute offset `from` names, given the current position and, for
-/// [`SeekFrom::End`], the total length.
+/// [`SeekFrom::End`], the total length. Fails for [`SeekFrom::Current`]
+/// without a position, and for [`SeekFrom::End`] without a total.
 pub(crate) fn seek_target(
     from: SeekFrom,
     position: Option<u64>,
@@ -628,7 +680,14 @@ pub(crate) fn seek_target(
             };
             (position, delta)
         }
-        SeekFrom::End(delta) => (total.unwrap_or(0), delta),
+        SeekFrom::End(delta) => {
+            let Some(total) = total else {
+                return Err(io::Error::other(
+                    "MPEG stream length is unknown: HEAD requests failed to learn the sizes of segments not yet downloaded",
+                ));
+            };
+            (total, delta)
+        }
     };
     Ok(match delta >= 0 {
         true => base.saturating_add(delta as u64),
@@ -636,76 +695,285 @@ pub(crate) fn seek_target(
     })
 }
 
-/// The media segments of `segments` numbered from `first` on, each with the
-/// presentation time it spans when timed: what a stream from `first` schedules.
-pub(crate) fn media_from(
-    segments: &Segments,
-    first: SegmentNumber,
-) -> impl Iterator<Item = (&SegmentLocation, Option<Range<Duration>>)> {
-    each(first..segments.numbers().end)
-        .filter_map(|number| Some((segments.location_of(number)?, segments.span_of(number))))
+/// Time queries, answered from the schedule's index.
+impl Schedule {
+    /// The representation's media segments.
+    pub(crate) fn index(&self) -> &Arc<MediaIndex> {
+        &self.index
+    }
+
+    /// The number of the media segment a seek to `time` lands in.
+    pub(crate) fn time_target(&self, time: Duration) -> io::Result<SegmentNumber> {
+        let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, reason);
+        if self.index.timing().is_none() {
+            return Err(invalid("MPEG stream has no media timeline"));
+        }
+        let number = self
+            .index
+            .number_at(time)
+            .ok_or_else(|| invalid("MPEG stream has no media segments"))?;
+        match number < self.first {
+            true => Err(invalid("MPEG stream starts after the requested media time")),
+            false => Ok(number),
+        }
+    }
+
+    /// The start of the media segment at `part`, as a position of `accuracy`.
+    /// `None` for the initialization segment, which has no media time, and for
+    /// untimed segments.
+    pub(crate) fn time_at(&self, part: Part, accuracy: TimeAccuracy) -> Option<TimePosition> {
+        let Part::Media(number) = part else {
+            return None;
+        };
+        Some(TimePosition {
+            timestamp: self.index.span(number)?.start,
+            accuracy,
+        })
+    }
+
+    /// The end of the representation's media, as a packet-accurate position.
+    pub(crate) fn time_at_end(&self) -> Option<TimePosition> {
+        self.index.end_time().map(|timestamp| TimePosition {
+            timestamp,
+            accuracy: TimeAccuracy::Packet,
+        })
+    }
+
+    /// The timed media segments from the stream's first on, with their data
+    /// in `store` and the presentation time each spans: what a buffer handle
+    /// for the stream reports on. Empty for untimed segments.
+    pub(crate) fn timed_media(&self, store: &Store) -> Vec<(Arc<SegmentData>, Range<Duration>)> {
+        timed_media(&self.index, self.first, store)
+    }
+
+    /// The length a symphonia-compat stream reports before every size is
+    /// known, for media at `bitrate_bps`.
+    pub(crate) fn compat_estimate(&self, bitrate_bps: u32) -> Result<u64, Error> {
+        if self.index.timing().is_none() {
+            return Err(Error::Initialization(
+                "symphonia_compat requires a media timeline".to_owned(),
+            ));
+        }
+        let init_len = self.init.size().unwrap_or(0);
+        self.index
+            .estimate_len(self.first, init_len, bitrate_bps)
+            .ok_or_else(|| {
+                Error::Initialization(
+                    "symphonia_compat requires a non-zero bitrate and media segments".to_owned(),
+                )
+            })
+    }
 }
 
-/// The number of the media segment of `segments` covering `time`, where a
+/// What a stream does next to learn segment sizes: see
+/// [`Schedule::size_step`].
+pub(crate) enum SizeStep {
+    /// The sizes wanted are known.
+    Known,
+    /// HEAD this segment, then take another step.
+    Probe(Part, Arc<SegmentData>),
+    /// Wait until the sizes are known or the GET worker has nothing left to
+    /// fetch.
+    Wait,
+}
+
+/// The steps the blocking and async streams and their workers take, between
+/// the waiting and I/O each does its own way.
+impl Schedule {
+    /// The next step toward `known` holding: done, a HEAD to make, or, once
+    /// HEAD is unavailable, a GET of the first segment of unknown size, even
+    /// outside the window, to wait on. Its size is kept after its body is
+    /// dropped.
+    pub(crate) fn size_step(
+        &mut self,
+        known: impl Fn(&Schedule) -> bool,
+        supply: Supply,
+    ) -> SizeStep {
+        if known(self) {
+            return SizeStep::Known;
+        }
+        if let Some((part, data)) = self.next_head(supply) {
+            return SizeStep::Probe(part, data);
+        }
+        if let Some(part) = self.first_unknown_size(supply) {
+            self.request(part);
+        }
+        SizeStep::Wait
+    }
+
+    /// Records that a HEAD of the segment at `part` failed with `error`,
+    /// which stops HEAD probing.
+    pub(crate) fn probe_failed(&mut self, part: Part, error: &Error) {
+        self.disable_head(&format!("HEAD failed for {part}: {error}"));
+    }
+
+    /// The next segment the GET worker should fetch. `None` when it has
+    /// nothing to fetch for now, which marks the schedule complete.
+    pub(crate) fn take_get(&mut self) -> Option<(Part, Arc<SegmentData>)> {
+        let work = self.next_get();
+        if work.is_none() {
+            self.complete = true;
+        }
+        work
+    }
+
+    /// Records how the GET worker's fetch of the segment at `part` went: a
+    /// failure ends the stream. Returns whether the stream keeps the segment.
+    pub(crate) fn finish_get(&mut self, part: Part, result: Result<(), Error>) -> bool {
+        match result {
+            Ok(()) => self.fetched(part),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                self.keeps(part)
+            }
+        }
+    }
+
+    /// Checks the just fetched body of the segment at `part` against its HEAD
+    /// probe. Returns whether the stream keeps the segment.
+    pub(crate) fn fetched(&mut self, part: Part) -> bool {
+        self.check_probe(part);
+        self.keeps(part)
+    }
+
+    /// Asks for background HEADs of unknown sizes. Returns whether a HEAD
+    /// worker should start for them: none runs yet, and there is one to make.
+    pub(crate) fn start_eager_head(&mut self, supply: Supply) -> bool {
+        self.eager_head = true;
+        if self.head_worker_running || self.error.is_some() || self.next_head(supply).is_none() {
+            // A running worker sees `eager_head` on its next check and continues.
+            return false;
+        }
+        self.head_worker_running = true;
+        true
+    }
+
+    /// The next HEAD the background worker should make. `None` when it should
+    /// stop, which records that it has.
+    pub(crate) fn next_eager_head(&mut self, supply: Supply) -> Option<(Part, Arc<SegmentData>)> {
+        let next = match self.eager_head && self.error.is_none() {
+            true => self.next_head(supply),
+            false => None,
+        };
+        if next.is_none() {
+            self.head_worker_running = false;
+        }
+        next
+    }
+
+    /// Whether a reader waiting on the segment at `part` can stop: its body
+    /// is here, or nothing more will download.
+    pub(crate) fn settled(&self, part: Part) -> bool {
+        !self.missing_body(part) || self.complete
+    }
+
+    /// The body and location of the segment at `part`, as
+    /// [`Self::checked_body`] takes it.
+    pub(crate) fn checked_part(&mut self, part: Part) -> Option<(Bytes, SegmentLocation)> {
+        let body = self.checked_body(part)?;
+        Some((body, self.part_data(part)?.location.clone()))
+    }
+
+    /// The part and position a [`SeekFrom::End`]`(0)` reports without
+    /// waiting on sizes: the end, at the exact length once every size is
+    /// known, else at least `estimate`. `None` with neither.
+    pub(crate) fn reported_end(&self, estimate: Option<u64>) -> Option<(Part, Position)> {
+        let len = self.reported_end_len(estimate)?;
+        let position = Position {
+            byte: Some(len),
+            time: self.time_at_end(),
+        };
+        Some((self.end(), position))
+    }
+
+    /// Lands a byte seek at absolute offset `target`, once the sizes before it
+    /// are known: moves the cursor and the window there and asks for its
+    /// segment first. Returns the part and offset into it, the position, and
+    /// the window change.
+    pub(crate) fn land_byte_seek(
+        &mut self,
+        target: u64,
+        supply: Supply,
+    ) -> io::Result<(Part, usize, Position, WindowChange)> {
+        let (part, offset_in_segment) = self.resolve_cursor(target).ok_or_else(|| {
+            io::Error::other(
+                "MPEG stream cannot place the requested byte offset: HEAD requests failed to learn the sizes of the segments before it, which are not yet downloaded",
+            )
+        })?;
+        let change = self.move_cursor(part, supply);
+        self.request(part);
+        let position = Position {
+            byte: Some(target),
+            time: self.time_at(part, accuracy_at(offset_in_segment)),
+        };
+        Ok((part, offset_in_segment, position, change))
+    }
+
+    /// Starts a seek to the media segment covering `time`: moves the cursor
+    /// and the window there and asks for it first. Returns the segment's part
+    /// and the window change.
+    pub(crate) fn begin_time_seek(
+        &mut self,
+        time: Duration,
+        supply: Supply,
+    ) -> io::Result<(Part, WindowChange)> {
+        let target = Part::Media(self.time_target(time)?);
+        if self.past_end(target) {
+            return Err(io::Error::other(
+                "MPEG stream ended before the requested media time",
+            ));
+        }
+        let change = self.move_cursor(target, supply);
+        self.request(target);
+        Ok((target, change))
+    }
+
+    /// Finishes a time seek to `target` once [`Self::settled`]: the position
+    /// it landed on, at the start of the segment.
+    pub(crate) fn land_time_seek(&self, target: Part) -> io::Result<Position> {
+        if self.missing_body(target) {
+            return Err(io::Error::other(
+                "MPEG stream ended before the requested media time",
+            ));
+        }
+        Ok(Position {
+            byte: self.prefix_len(target),
+            time: self.time_at(target, TimeAccuracy::Packet),
+        })
+    }
+}
+
+/// The timed media segments of `index` numbered from `first` on, with their
+/// data in `store` and the presentation time each spans. Empty for an untimed
+/// index.
+pub(crate) fn timed_media(
+    index: &MediaIndex,
+    first: SegmentNumber,
+    store: &Store,
+) -> Vec<(Arc<SegmentData>, Range<Duration>)> {
+    each(first..index.numbers().end)
+        .filter_map(|number| {
+            let segment = index.segment(number)?;
+            Some((store.data(segment.location), segment.span?))
+        })
+        .collect()
+}
+
+/// The number of the media segment of `index` covering `time`, where a
 /// stream starting at a time begins, and that segment's start. A time at or
 /// past the end starts at the last media segment.
 pub(crate) fn start_at(
-    segments: &Segments,
+    index: &MediaIndex,
     time: Duration,
 ) -> Result<(SegmentNumber, Duration), Error> {
-    segments
+    index
         .number_at(time)
-        .and_then(|first| Some((first, segments.span_of(first)?.start)))
+        .and_then(|first| Some((first, index.span(first)?.start)))
         .ok_or_else(|| {
             Error::Initialization(
                 "MPEG stream needs timed media segments to start at a time".to_owned(),
             )
         })
-}
-
-/// The number of the media segment a seek to `time` lands in, for a stream
-/// of `segments` whose first media segment is numbered `first`.
-pub(crate) fn time_target(
-    segments: &Segments,
-    first: SegmentNumber,
-    time: Duration,
-) -> io::Result<SegmentNumber> {
-    let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, reason);
-    if segments.timing().is_none() {
-        return Err(invalid("MPEG stream has no media timeline"));
-    }
-    let number = segments
-        .number_at(time)
-        .ok_or_else(|| invalid("MPEG stream has no media segments"))?;
-    match number < first {
-        true => Err(invalid("MPEG stream starts after the requested media time")),
-        false => Ok(number),
-    }
-}
-
-/// The start of the media segment at `part`, as a position of `accuracy`.
-/// `None` for the initialization segment, which has no media time, and for
-/// untimed segments.
-pub(crate) fn time_at_segment(
-    segments: &Segments,
-    part: Part,
-    accuracy: TimeAccuracy,
-) -> Option<TimePosition> {
-    let Part::Media(number) = part else {
-        return None;
-    };
-    Some(TimePosition {
-        timestamp: segments.span_of(number)?.start,
-        accuracy,
-    })
-}
-
-/// The end of the representation's media, as a packet-accurate position.
-pub(crate) fn time_at_end(segments: &Segments) -> Option<TimePosition> {
-    segments.end().map(|timestamp| TimePosition {
-        timestamp,
-        accuracy: TimeAccuracy::Packet,
-    })
 }
 
 /// The accuracy of a segment's start time for a byte position
@@ -716,28 +984,6 @@ pub(crate) fn accuracy_at(offset_in_segment: usize) -> TimeAccuracy {
         true => TimeAccuracy::Packet,
         false => TimeAccuracy::Segment,
     }
-}
-
-/// The length a symphonia-compat stream reports before every size is known.
-pub(crate) fn compat_estimate(
-    segments: &Segments,
-    first: SegmentNumber,
-    init_len: u64,
-    bitrate_bps: u32,
-) -> Result<u64, Error> {
-    if segments.timing().is_none() {
-        return Err(Error::Initialization(
-            "symphonia_compat requires a media timeline".to_owned(),
-        ));
-    }
-    segments
-        .from(first)
-        .estimate_len(init_len, bitrate_bps)
-        .ok_or_else(|| {
-            Error::Initialization(
-                "symphonia_compat requires a non-zero bitrate and media segments".to_owned(),
-            )
-        })
 }
 
 #[cfg(test)]
@@ -765,54 +1011,108 @@ mod tests {
         )
     }
 
-    /// A schedule of `segments` from the media segment numbered `first`.
-    fn schedule_from(segments: &Segments, first: u64) -> Schedule {
-        let init = Arc::new(SegmentData::new(segments.init().clone()));
-        let media = media_from(segments, n(first))
-            .map(|(location, span)| (Arc::new(SegmentData::new(location.clone())), span))
-            .collect();
-        Schedule::new(init, n(first), media)
+    /// Four one-second segments of unknown size.
+    fn four_unsized() -> Segments {
+        timed_for_test("init", ["a", "b", "c", "d"], 1, &[1; 4])
+    }
+
+    /// Keeps nothing behind the position, and `ahead` seconds ahead of it.
+    fn ahead(ahead: u64) -> Retention {
+        Retention {
+            behind: Some(Duration::ZERO),
+            ahead: Some(secs(ahead)),
+        }
+    }
+
+    /// Inputs that add segments with data in `store`, at a fixed time.
+    fn supply(store: &Store) -> Supply<'_> {
+        Supply {
+            store,
+            now: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    /// A schedule of `segments` from the media segment numbered `first`,
+    /// keeping everything.
+    fn schedule_from(segments: &Segments, first: u64, store: &Store) -> Schedule {
+        retained_from(segments, first, Retention::default(), store)
+    }
+
+    /// A schedule of `segments` from the media segment numbered `first`,
+    /// keeping what `retention` says.
+    fn retained_from(
+        segments: &Segments,
+        first: u64,
+        retention: Retention,
+        store: &Store,
+    ) -> Schedule {
+        let init = store.data(segments.init().clone());
+        let index = segments.index().clone();
+        let role = MediaRole::default();
+        Schedule::new(init, index, n(first), retention, role, supply(store))
+    }
+
+    /// The numbers of the media segments `schedule` has added.
+    fn added(schedule: &Schedule) -> Range<SegmentNumber> {
+        schedule.first()..schedule.frontier()
     }
 
     #[test]
     fn time_target_lands_on_reported_segment_starts() {
         // A third of a second does not land on a whole nanosecond.
+        let store = Store::default();
         let segments = timed_for_test("init", ["a", "b"], 3, &[1, 1]);
+        let schedule = schedule_from(&segments, 0, &store);
         let second_start = segments.span(1).unwrap().start;
-        let target = |time| time_target(&segments, n(0), time).unwrap();
+        let target = |time| schedule.time_target(time).unwrap();
         assert_eq!(target(second_start), n(1));
         assert_eq!(target(second_start - Duration::from_nanos(1)), n(0));
         assert_eq!(target(Duration::from_secs(5)), n(1));
 
         let empty = timed_for_test("init", Vec::<SegmentLocation>::new(), 3, &[]);
-        let error = time_target(&empty, n(0), Duration::ZERO).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         let untimed = Segments::new("init", ["a"]);
-        let error = time_target(&untimed, n(0), Duration::ZERO).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        for segments in [empty, untimed] {
+            let schedule = schedule_from(&segments, 0, &store);
+            let error = schedule.time_target(Duration::ZERO).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]
     fn a_stream_from_partway_keeps_the_representation_times() {
         // Four one-second segments; the stream starts at the third.
         let segments = four_seconds();
-        let scheduled: Vec<_> = media_from(&segments, n(2)).collect();
+        let store = Store::default();
+        let schedule = schedule_from(&segments, 2, &store);
+        let timed = schedule.timed_media(&store);
+        let scheduled: Vec<_> = timed
+            .iter()
+            .map(|(data, span)| (data.location.clone(), span.clone()))
+            .collect();
         assert_eq!(
             scheduled,
             [
                 (
-                    &SegmentLocation::with_range("file", 24..=33),
-                    Some(secs(2)..secs(3))
+                    SegmentLocation::with_range("file", 24..=33),
+                    secs(2)..secs(3)
                 ),
                 (
-                    &SegmentLocation::with_range("file", 34..=43),
-                    Some(secs(3)..secs(4))
+                    SegmentLocation::with_range("file", 34..=43),
+                    secs(3)..secs(4)
                 ),
             ]
         );
 
+        // They share their data with the schedule's.
+        assert!(Arc::ptr_eq(
+            &timed[0].0,
+            schedule.part_data(media(2)).unwrap()
+        ));
+        let untimed = schedule_from(&Segments::new("init", ["a"]), 0, &store);
+        assert!(untimed.timed_media(&store).is_empty());
+
         // Seeks name the representation's time, and land on the stream's own segments.
-        let target = |time| time_target(&segments, n(2), time);
+        let target = |time| schedule.time_target(time);
         assert_eq!(target(secs(2)).unwrap(), n(2));
         assert_eq!(target(Duration::from_millis(3_500)).unwrap(), n(3));
         assert_eq!(
@@ -820,18 +1120,36 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
 
-        let at = |part| time_at_segment(&segments, part, TimeAccuracy::Packet);
+        let at = |part| schedule.time_at(part, TimeAccuracy::Packet);
         assert_eq!(at(Part::Init), None);
         assert_eq!(at(media(3)).unwrap().timestamp, secs(3));
         assert_eq!(at(media(4)), None);
-        assert_eq!(time_at_end(&segments).unwrap().timestamp, secs(4));
-        assert_eq!(start_at(&segments, secs(3)).unwrap(), (n(3), secs(3)));
+        assert_eq!(schedule.time_at_end().unwrap().timestamp, secs(4));
+        assert_eq!(
+            start_at(segments.index(), secs(3)).unwrap(),
+            (n(3), secs(3))
+        );
+    }
+
+    #[test]
+    fn an_end_relative_target_needs_the_total() {
+        assert_eq!(seek_target(SeekFrom::End(-2), None, Some(10)).unwrap(), 8);
+        assert_eq!(seek_target(SeekFrom::Current(3), Some(4), None).unwrap(), 7);
+        assert_eq!(seek_target(SeekFrom::Start(5), None, None).unwrap(), 5);
+        assert!(seek_target(SeekFrom::End(0), Some(4), None).is_err());
+        assert!(seek_target(SeekFrom::Current(0), None, Some(10)).is_err());
     }
 
     #[test]
     fn a_schedule_addresses_segments_by_number() {
-        let schedule = schedule_from(&four_seconds(), 2);
+        let store = Store::default();
+        let schedule = schedule_from(&four_seconds(), 2, &store);
         assert_eq!(schedule.first(), n(2));
+        assert_eq!(
+            added(&schedule),
+            n(2)..n(4),
+            "keeping everything adds it all"
+        );
         assert_eq!(schedule.end(), media(4));
         assert!(schedule.part_data(media(1)).is_none());
         assert!(schedule.part_data(media(4)).is_none());
@@ -849,15 +1167,13 @@ mod tests {
 
     #[test]
     fn the_window_and_downloads_follow_numbered_segments() {
-        let mut schedule = schedule_from(&four_seconds(), 2);
+        let store = Store::default();
+        let mut schedule = schedule_from(&four_seconds(), 2, &store);
         assert_eq!(schedule.window, n(2)..n(4));
 
         // Keep nothing behind and one second ahead of the last segment.
-        schedule.set_retention(Retention {
-            behind: Some(Duration::ZERO),
-            ahead: Some(secs(1)),
-        });
-        let change = schedule.move_cursor(media(3));
+        schedule.set_retention(ahead(1), supply(&store));
+        let change = schedule.move_cursor(media(3), supply(&store));
         assert_eq!(schedule.window, n(3)..n(4));
         assert_eq!(change.released.len(), 1);
         assert!(schedule.keeps(media(3)) && !schedule.keeps(media(2)));
@@ -872,15 +1188,12 @@ mod tests {
     #[test]
     fn a_request_is_settled_once_the_reader_takes_its_body() {
         let store = Store::default();
-        let mut schedule = schedule_from(&four_seconds(), 0);
+        let mut schedule = schedule_from(&four_seconds(), 0, &store);
         schedule.init.set_body(b"init");
-        schedule.set_retention(Retention {
-            behind: Some(Duration::ZERO),
-            ahead: Some(Duration::ZERO),
-        });
+        schedule.set_retention(ahead(0), supply(&store));
 
         // The reader asks for segment 0 while it is already downloading.
-        schedule.move_cursor(media(0));
+        schedule.move_cursor(media(0), supply(&store));
         schedule.request(media(0));
         schedule
             .part_data(media(0))
@@ -889,7 +1202,7 @@ mod tests {
 
         // It takes the body and moves on, which drops it.
         assert!(schedule.checked_body(media(0)).is_some());
-        let change = schedule.move_cursor(media(1));
+        let change = schedule.move_cursor(media(1), supply(&store));
         store.release(&change.released, true);
         assert!(schedule.missing_body(media(0)));
 
@@ -899,14 +1212,93 @@ mod tests {
 
     #[test]
     fn an_untimed_schedule_keeps_everything() {
-        let mut schedule = schedule_from(&Segments::new("init", ["a", "b", "c"]), 0);
-        schedule.set_retention(Retention {
-            behind: Some(Duration::ZERO),
-            ahead: Some(Duration::ZERO),
-        });
-        schedule.move_cursor(media(2));
+        let store = Store::default();
+        let untimed = Segments::new("init", ["a", "b", "c"]);
+        let mut schedule = retained_from(&untimed, 0, ahead(0), &store);
+        assert_eq!(added(&schedule), n(0)..n(3));
+        schedule.move_cursor(media(2), supply(&store));
         assert_eq!(schedule.window, n(0)..n(3));
-        assert!(schedule.timed_media().is_none());
+    }
+
+    #[test]
+    fn a_bounded_window_adds_only_what_it_keeps() {
+        let store = Store::default();
+        let mut schedule = retained_from(&four_unsized(), 0, ahead(1), &store);
+        assert_eq!(schedule.window, n(0)..n(1));
+        assert_eq!(added(&schedule), n(0)..n(1));
+        assert_eq!(store.len(), 2, "the init and the first segment");
+        assert_eq!(schedule.kept().len(), 2);
+        assert_eq!(schedule.end(), media(4));
+
+        // Moving on adds what enters the window, and acquires it.
+        let change = schedule.move_cursor(media(2), supply(&store));
+        assert_eq!(schedule.window, n(2)..n(3));
+        assert_eq!(added(&schedule), n(0)..n(3));
+        let acquired: Vec<_> = change.acquired.iter().map(|data| &data.location).collect();
+        assert_eq!(acquired, [&SegmentLocation::new("c")]);
+
+        // Moving back adds nothing; segments stay added.
+        schedule.move_cursor(media(0), supply(&store));
+        assert_eq!(added(&schedule), n(0)..n(3));
+    }
+
+    #[test]
+    fn byte_sizes_add_segments_to_the_end() {
+        // Ranged segments have known sizes, but the end needs them all added.
+        let store = Store::default();
+        let mut schedule = retained_from(&four_seconds(), 0, ahead(0), &store);
+        assert_eq!(added(&schedule), n(0)..n(1));
+        assert_eq!(schedule.total_len(), None);
+        assert_eq!(schedule.prefix_len(media(1)), Some(14));
+        assert_eq!(schedule.prefix_len(media(2)), None);
+        assert_eq!(schedule.resolve_cursor(30), None);
+        assert_eq!(schedule.first_unknown_size(supply(&store)), None);
+        assert_eq!(added(&schedule), n(0)..n(4));
+        assert_eq!(schedule.total_len(), Some(44));
+        assert_eq!(schedule.resolve_cursor(30), Some((media(2), 6)));
+        assert_eq!(schedule.resolve_cursor(99), Some((media(3), 10)));
+
+        // Unknown sizes are added one at a time, as HEADs learn them.
+        let store = Store::default();
+        let mut schedule = retained_from(&four_unsized(), 0, ahead(0), &store);
+        let mut probed = Vec::new();
+        schedule.init.set_body(b"init");
+        while let Some((part, data)) = schedule.next_head(supply(&store)) {
+            assert_eq!(added(&schedule).end, part.number().unwrap().next());
+            store.accept_probe(&data, 5);
+            probed.push(part);
+        }
+        assert_eq!(probed, [media(0), media(1), media(2), media(3)]);
+        assert_eq!(schedule.total_len(), Some(24));
+    }
+
+    #[test]
+    fn a_fetch_past_the_added_segments_adds_them() {
+        let store = Store::default();
+        let mut schedule = retained_from(&four_unsized(), 1, ahead(0), &store);
+        assert_eq!(added(&schedule), n(1)..n(2));
+        let location = |data: Option<&Arc<SegmentData>>| data.map(|data| data.location.url.clone());
+        assert_eq!(
+            location(schedule.materialise(media(3), supply(&store))),
+            Some("d".to_owned())
+        );
+        assert_eq!(added(&schedule), n(1)..n(4));
+        assert_eq!(
+            location(schedule.materialise(media(4), supply(&store))),
+            None
+        );
+        assert_eq!(
+            location(schedule.materialise(media(0), supply(&store))),
+            None
+        );
+        assert_eq!(
+            location(schedule.materialise(Part::Init, supply(&store))),
+            Some("init".to_owned())
+        );
+
+        // Added segments outside the window are not kept.
+        assert!(!schedule.keeps(media(3)));
+        assert_eq!(schedule.kept().len(), 2);
     }
 
     #[test]

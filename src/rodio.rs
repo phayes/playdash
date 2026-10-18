@@ -108,11 +108,8 @@ impl DashSource {
     /// Get it before handing the source to rodio; it stays usable from any
     /// thread afterwards. Plays no part in playback.
     pub fn buffer(&self) -> BufferHandle {
-        // Manifest segments are timed, so every one has a span.
-        let first = self.segments.numbers().start;
-        let media = schedule::media_from(&self.segments, first)
-            .filter_map(|(segment, span)| Some((self.cache.data(segment.clone()), span?)))
-            .collect();
+        let index = self.segments.index();
+        let media = schedule::timed_media(index, index.numbers().start, &self.cache.store);
         BufferHandle::new(&self.cache.store, media)
     }
 

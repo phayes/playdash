@@ -7,7 +7,8 @@ use super::init::{self, RollGroups, SampleEntry, TrackDefaults};
 use super::packet::{Packet, PacketSeeked, duration_to_ticks, ticks_to_duration};
 use super::reader::ParseError;
 use crate::error::Error;
-use crate::segment::{SegmentLocation, SegmentNumber, Segments};
+use crate::segment::index::MediaIndex;
+use crate::segment::{SegmentLocation, SegmentNumber};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::io;
@@ -84,9 +85,9 @@ pub(crate) struct Demuxer {
     sample_duration: u32,
     /// Pre-roll in samples that the initialization's `roll` or `prol` group signals.
     init_roll: Option<u32>,
-    /// The representation's segments, which place media segments in time when
+    /// The representation's media segments, which place them in time when
     /// timed.
-    segments: Option<Arc<Segments>>,
+    index: Option<Arc<MediaIndex>>,
     /// Media time of presentation time zero, in media ticks: the edit-list
     /// start, the presentation time offset, less the period start.
     shift: i64,
@@ -106,12 +107,12 @@ pub(crate) struct Demuxer {
 
 impl Demuxer {
     /// A demuxer of track `track_id` of `init`, the body of `init_location`, or of its
-    /// only track without one. `segments`, when timed, place its media segments in
+    /// only track without one. `index`, when timed, places its media segments in
     /// time.
     pub(crate) fn new(
         init: Bytes,
         init_location: &SegmentLocation,
-        segments: Option<Arc<Segments>>,
+        index: Option<Arc<MediaIndex>>,
         track_id: Option<u32>,
     ) -> Result<Self, Error> {
         let error = |error| media_error(init_location, error);
@@ -158,9 +159,9 @@ impl Demuxer {
             }
         };
         // The presentation time offset presents at the period start.
-        let origin = segments
+        let origin = index
             .as_ref()
-            .and_then(|segments| segments.timing())
+            .and_then(|index| index.timing())
             .map_or(0, |timing| {
                 let offset = rescale(
                     timing.presentation_time_offset,
@@ -202,7 +203,7 @@ impl Demuxer {
                 .collect(),
             sample_duration: track.defaults.sample_duration,
             init_roll: track.roll.as_ref().filter(|_| audio).and_then(roll_samples),
-            segments,
+            index,
             shift,
             end,
             preroll: None,
@@ -310,13 +311,13 @@ impl Demuxer {
     /// have to start, to the one containing `time`.
     pub(crate) fn seek_range(&self, time: Duration) -> io::Result<RangeInclusive<SegmentNumber>> {
         let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, reason);
-        let segments = self
-            .segments
+        let index = self
+            .index
             .as_ref()
-            .filter(|segments| segments.timing().is_some())
+            .filter(|index| index.timing().is_some())
             .ok_or_else(|| invalid("MPEG stream has no media timeline"))?;
         let segment_at = |time| {
-            segments
+            index
                 .number_at(time)
                 .ok_or_else(|| invalid("MPEG stream has no media segments"))
         };
@@ -547,9 +548,9 @@ impl Demuxer {
     /// The presentation time at which the media segment numbered `number`
     /// starts.
     fn segment_start(&self, number: SegmentNumber) -> Duration {
-        self.segments
+        self.index
             .as_ref()
-            .and_then(|segments| segments.span_of(number))
+            .and_then(|index| index.span(number))
             .map(|span| span.start)
             .unwrap_or_default()
     }
@@ -651,7 +652,7 @@ mod tests {
     use super::*;
     use crate::mp4::fragment::tests::{RunSample, movie_fragment_from};
     use crate::mp4::init::tests::{SOUND, TrackSpec, audio_entry, bx, full, init, video_entry};
-    use crate::segment::{MediaSegment, MediaTiming, timed_for_test};
+    use crate::segment::{MediaSegment, MediaTiming, Segments, timed_for_test};
     use std::num::NonZeroU32;
 
     const SYNC: u32 = 0x0200_0000;
@@ -697,9 +698,11 @@ mod tests {
     }
 
     /// Media segments lasting `durations` in milliseconds, back to back from zero.
-    fn timeline(durations: &[u64]) -> Arc<Segments> {
+    fn timeline(durations: &[u64]) -> Arc<MediaIndex> {
         let media = (0..durations.len()).map(|index| format!("{index}"));
-        Arc::new(timed_for_test("init", media, 1000, durations))
+        timed_for_test("init", media, 1000, durations)
+            .index()
+            .clone()
     }
 
     fn demuxer(init: Bytes, durations: &[u64]) -> Demuxer {
@@ -797,7 +800,7 @@ mod tests {
 
     /// One 20-tick segment at media time 450 of a 500 Hz timeline, in a period
     /// starting at `period_start` whose presentation time offset is 450.
-    fn offset_timeline(period_start: Duration) -> Arc<Segments> {
+    fn offset_timeline(period_start: Duration) -> Arc<MediaIndex> {
         let timing = MediaTiming {
             timescale: NonZeroU32::new(500).unwrap(),
             presentation_time_offset: 450,
@@ -808,7 +811,10 @@ mod tests {
             start: 450,
             duration: 20,
         };
-        Arc::new(Segments::timed("init", timing, [segment]).unwrap())
+        Segments::timed("init", timing, [segment])
+            .unwrap()
+            .index()
+            .clone()
     }
 
     #[test]
@@ -828,7 +834,7 @@ mod tests {
             assert_eq!(pts(drain(&mut demuxer)), [first_pts, first_pts + 10]);
 
             // Packets present when the segments say they do.
-            let start = timeline.span(0).unwrap().start;
+            let start = timeline.span(SegmentNumber(0)).unwrap().start;
             assert_eq!(start, Duration::from_millis(first_pts as u64));
         }
     }

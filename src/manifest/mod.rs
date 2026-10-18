@@ -14,15 +14,19 @@ pub(crate) mod tests;
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::segment::{MediaSegment, MediaTiming, SegmentLocation, Segments};
+use crate::segment::index::MediaIndex;
+use crate::segment::{MediaTiming, SegmentLocation, Segments, check_segment};
 use crate::vendor::dash_mpd_core::{
     AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation as CoreRepresentation,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 pub use representation::{ContentKind, FrameRate, Representation};
 use segment_list::ListChain;
-use segments::SegmentTimes;
+use segments::SegmentClock;
+pub(crate) use segments::{FixedSegments, TimelineSegments};
 use std::collections::HashMap;
+use std::num::NonZeroU32;
+pub(crate) use template::MediaUrls;
 use template::{TemplateChain, TemplateValues};
 use url::Url;
 
@@ -197,61 +201,98 @@ impl<'a> Selected<'a> {
         end.checked_sub(self.period.start.unwrap_or_default())
     }
 
-    fn segment_times(self) -> Result<SegmentTimes, Error> {
+    /// The representation's segments, with URLs resolved against the BaseURL
+    /// chain from `manifest_url`.
+    fn segments(self, manifest_url: Option<&Url>) -> Result<Segments, Error> {
         if self.needs_segment_index() {
             return Err(Error::DashManifestInvalidSegments(
                 "SegmentBase index not loaded; load it with load_segment_indexes".to_owned(),
             ));
         }
-        if self.uses_segment_list() {
-            self.lists().segment_times(self.period_duration())
-        } else {
-            self.templates().segment_times(self.period_duration())
+        match self.uses_segment_list() {
+            true => self.list_segments(manifest_url),
+            false => self.template_segments(manifest_url),
         }
     }
 
-    fn segments(self, manifest_url: Option<&Url>, times: &SegmentTimes) -> Result<Segments, Error> {
-        let urls = if self.uses_segment_list() {
-            self.lists().urls(times)?
-        } else {
-            let values = TemplateValues {
-                representation_id: self.id(),
-                bandwidth: self.representation.bandwidth,
-                ..TemplateValues::default()
-            };
-            self.templates().urls(values, times)?
-        };
+    /// The segments of the representation's `SegmentList`.
+    fn list_segments(self, manifest_url: Option<&Url>) -> Result<Segments, Error> {
+        let mut list = self.lists().segments(self.period_duration())?;
 
         // Resolve every URL against the BaseURL chain.
         let base = self.base_url(manifest_url)?;
-        let resolve = |location: SegmentLocation| -> Result<SegmentLocation, Error> {
-            Ok(SegmentLocation {
-                url: resolve_url(base.as_ref(), &location.url)?.into(),
-                ..location
-            })
+        let resolve = |location: &mut SegmentLocation| -> Result<(), Error> {
+            location.url = resolve_url(base.as_ref(), &location.url)?.into();
+            Ok(())
         };
+        resolve(&mut list.init)?;
+        for segment in &mut list.media {
+            resolve(&mut segment.location)?;
+        }
 
-        let init = resolve(urls.init)?;
+        let timing = self.timing(list.timescale, list.presentation_time_offset);
+        Segments::timed(list.init, timing, list.media)
+    }
 
-        // Time each media segment, on the Period's clock.
-        let timing = MediaTiming {
-            timescale: times.timescale,
-            presentation_time_offset: times.presentation_time_offset,
+    /// The segments of the representation's `SegmentTemplate`.
+    fn template_segments(self, manifest_url: Option<&Url>) -> Result<Segments, Error> {
+        let addressed = self.templates().addressed(self.period_duration())?;
+        let values = TemplateValues {
+            representation_id: self.id(),
+            bandwidth: self.representation.bandwidth,
+            ..TemplateValues::default()
+        };
+        let init = self.templates().init_location(values)?;
+        let media = self.templates().media_template(values)?;
+
+        // Resolve the URLs against the BaseURL chain.
+        let base = self.base_url(manifest_url)?;
+        let init = SegmentLocation {
+            url: resolve_url(base.as_ref(), &init.url)?.into(),
+            ..init
+        };
+        let urls = MediaUrls::new(media, base);
+
+        // Every media segment's URL must resolve, and each segment follow the one ahead.
+        for segment in addressed.segments.times() {
+            urls.try_location(segment.number, segment.time)?;
+        }
+        let mut end = 0;
+        for (index, segment) in addressed.segments.times().enumerate() {
+            let location = || urls.location(segment.number, segment.time);
+            check_segment(
+                index as u64,
+                location,
+                segment.time,
+                segment.duration,
+                &mut end,
+            )?;
+        }
+
+        let timing = self.timing(addressed.timescale, addressed.presentation_time_offset);
+        let index = match addressed.segments {
+            SegmentClock::Fixed(segments) => MediaIndex::Template {
+                timing,
+                segments,
+                urls,
+            },
+            SegmentClock::Timeline(segments) => MediaIndex::Timeline {
+                timing,
+                segments,
+                urls,
+            },
+        };
+        Ok(Segments::indexed(init, index))
+    }
+
+    /// The media clock of segments at `timescale` whose media time
+    /// `presentation_time_offset` presents at the start of the Period.
+    fn timing(self, timescale: NonZeroU32, presentation_time_offset: u64) -> MediaTiming {
+        MediaTiming {
+            timescale,
+            presentation_time_offset,
             period_start: self.period.start.unwrap_or_default(),
-        };
-        let media = urls
-            .media
-            .into_iter()
-            .zip(&times.segments)
-            .map(|(location, time)| {
-                Ok(MediaSegment {
-                    location: resolve(location)?,
-                    start: time.time,
-                    duration: time.duration,
-                })
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        Segments::timed(init, timing, media)
+        }
     }
 
     /// Resolves the first `BaseURL` of each level (MPD, Period, AdaptationSet,
@@ -404,8 +445,8 @@ impl DashManifest {
     /// against the `BaseURL` chain and [`DashManifest::base_url`]. Their spans
     /// are presentation time, shared by every representation of the manifest.
     pub fn segments(&self, representation_id: impl AsRef<str>) -> Result<Segments, Error> {
-        let (selected, times) = self.select_segment_times(representation_id.as_ref())?;
-        selected.segments(self.base_url.as_ref(), &times)
+        self.select_indexed(representation_id.as_ref())?
+            .segments(self.base_url.as_ref())
     }
 
     /// Returns a representation's MIME type, inherited from its adaptation set.
@@ -464,9 +505,9 @@ impl DashManifest {
             })
     }
 
-    /// A representation and its media segments' times, or the error that kept its
-    /// `SegmentBase` index from loading.
-    fn select_segment_times(&self, id: &str) -> Result<(Selected<'_>, SegmentTimes), Error> {
+    /// A representation, or the error that kept its `SegmentBase` index from
+    /// loading.
+    fn select_indexed(&self, id: &str) -> Result<Selected<'_>, Error> {
         let selected = self.select(id)?;
         if selected.needs_segment_index()
             && let Some(reason) = self.segment_index_errors.get(selected.id())
@@ -476,7 +517,7 @@ impl DashManifest {
                 reason: reason.clone(),
             });
         }
-        Ok((selected, selected.segment_times()?))
+        Ok(selected)
     }
 
     fn select(&self, id: &str) -> Result<Selected<'_>, Error> {

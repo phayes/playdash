@@ -1,13 +1,14 @@
 //! MPEG-DASH `SegmentList` expansion: explicit `SegmentURL` media, optionally
 //! narrowed by `@mediaRange`.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use crate::vendor::dash_mpd_core::{SegmentList, SegmentURL};
 
-use super::segments::{Addressing, SegmentTimes, SegmentUrls, Timing, initialization_location};
+use super::segments::{Addressing, Timing, initialization_location};
 use crate::error::Error;
-use crate::segment::{SegmentLocation, parse_byte_range};
+use crate::segment::{MediaSegment, SegmentLocation, parse_byte_range};
 
 /// `SegmentList` elements a representation inherits from, most specific first
 /// (Representation, AdaptationSet, Period).
@@ -38,18 +39,21 @@ impl<'a> ListChain<'a> {
             .unwrap_or_default()
     }
 
-    /// One media segment per `SegmentURL`, timed by `@duration` or a `SegmentTimeline`.
+    /// The list's segments, with unresolved URLs: one media segment per
+    /// `SegmentURL`, timed by `@duration` or a `SegmentTimeline`. A missing
+    /// `@media` means the BaseURL itself.
     ///
     /// The list length bounds the timing, so `@duration` lists need no Period
     /// duration. Segments past the end of the Period are dropped.
-    pub fn segment_times(self, period_duration: Option<Duration>) -> Result<SegmentTimes, Error> {
-        let count = self.segment_urls().len() as u64;
+    pub fn segments(self, period_duration: Option<Duration>) -> Result<ListSegments, Error> {
+        let segment_urls = self.segment_urls();
+        let count = segment_urls.len() as u64;
         if count == 0 {
             return Err(Error::DashManifestInvalidSegments(
                 "SegmentList has no SegmentURL elements".to_owned(),
             ));
         }
-        let times = Timing {
+        let addressed = Timing {
             timescale: self.get(|list| list.timescale),
             start_number: None,
             end_number: Some(count),
@@ -64,41 +68,55 @@ impl<'a> ListChain<'a> {
                         .map(|duration| Addressing::Duration(duration as f64)))
             }),
         }
-        .segment_times(period_duration)?;
+        .addressed(period_duration)?;
 
         #[cfg(feature = "log")]
-        if (times.segments.len() as u64) < count {
+        if addressed.segments.len() < count {
             log::warn!(
                 "SegmentList timing covers {} of {count} SegmentURL elements; ignoring the rest",
-                times.segments.len()
+                addressed.segments.len()
             );
         }
-        Ok(times)
-    }
-
-    /// The initialization segment's location and one media segment location per
-    /// timed segment, with unresolved URLs. A missing `@media` means the BaseURL itself.
-    pub fn urls(self, times: &SegmentTimes) -> Result<SegmentUrls, Error> {
         let initialization = self
             .get(|list| list.Initialization.as_ref())
             .ok_or(Error::DashManifestMissingUrls)?;
         let init = initialization_location(initialization)?;
 
-        let media = self
-            .segment_urls()
+        // Each SegmentURL in turn with each timed segment, as far as both go.
+        let media = segment_urls
             .iter()
-            .take(times.segments.len())
-            .map(|segment_url| {
-                Ok(SegmentLocation {
+            .zip(addressed.segments.times())
+            .map(|(segment_url, time)| {
+                let location = SegmentLocation {
                     url: segment_url.media.clone().unwrap_or_default(),
                     range: segment_url
                         .mediaRange
                         .as_deref()
                         .map(parse_byte_range)
                         .transpose()?,
+                };
+                Ok(MediaSegment {
+                    location,
+                    start: time.time,
+                    duration: time.duration,
                 })
             })
             .collect::<Result<_, Error>>()?;
-        Ok(SegmentUrls { init, media })
+        Ok(ListSegments {
+            init,
+            timescale: addressed.timescale,
+            presentation_time_offset: addressed.presentation_time_offset,
+            media,
+        })
     }
+}
+
+/// A representation's `SegmentList` segments, with unresolved URLs.
+pub(crate) struct ListSegments {
+    pub init: SegmentLocation,
+    pub timescale: NonZeroU32,
+    /// `@presentationTimeOffset`: media time at the start of the Period.
+    pub presentation_time_offset: u64,
+    /// Media segments in timeline order, on the `timescale` clock.
+    pub media: Vec<MediaSegment>,
 }
