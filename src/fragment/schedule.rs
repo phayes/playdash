@@ -3,10 +3,11 @@
 //! waits.
 
 use super::store::FragmentData;
-use super::{Fragment, Fragments, MediaTimeline};
+use super::{Fragment, Fragments, SegmentNumber};
 use crate::error::Error;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, SeekFrom};
 use std::ops::Range;
@@ -19,8 +20,9 @@ use std::time::Duration;
 ///
 /// Both windows are measured from the start of the fragment under the
 /// stream's position, and that fragment is always kept. The initialization
-/// segment is always kept too. Retention needs the stream's
-/// [`MediaTimeline`]; a stream without one keeps everything.
+/// segment is always kept too. Retention needs timed
+/// [`Fragments`](crate::fragment::Fragments); a stream of untimed ones keeps
+/// everything.
 ///
 /// # Examples
 ///
@@ -94,29 +96,39 @@ pub enum TimeAccuracy {
 }
 
 /// A place in a stream's bytes: the initialization fragment, or a media
-/// fragment by its index in playback order. `Media(len)` is the end of the
-/// stream. Ordered as the bytes are.
+/// fragment by its segment number. `Media` just past the last segment is the
+/// end of the stream. Ordered as the bytes are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Part {
     Init,
-    Media(usize),
+    Media(SegmentNumber),
 }
 
 impl Part {
-    /// The part after this one.
-    fn next(self) -> Self {
+    /// The part after this one, in a stream whose first media segment is
+    /// numbered `first`.
+    fn next(self, first: SegmentNumber) -> Self {
         match self {
-            Part::Init => Part::Media(0),
-            Part::Media(index) => Part::Media(index + 1),
+            Part::Init => Part::Media(first),
+            Part::Media(number) => Part::Media(number.next()),
         }
     }
 
-    /// The index of this media fragment, or of the first one for the
-    /// initialization fragment.
-    fn media_index(self) -> usize {
+    /// The number of this media fragment. `None` for the initialization
+    /// fragment.
+    pub(crate) fn number(self) -> Option<SegmentNumber> {
         match self {
-            Part::Init => 0,
-            Part::Media(index) => index,
+            Part::Init => None,
+            Part::Media(number) => Some(number),
+        }
+    }
+
+    /// The number of this media fragment, or `first` for the initialization
+    /// fragment.
+    fn number_or(self, first: SegmentNumber) -> SegmentNumber {
+        match self {
+            Part::Init => first,
+            Part::Media(number) => number,
         }
     }
 }
@@ -125,9 +137,22 @@ impl fmt::Display for Part {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Part::Init => f.write_str("the initialization fragment"),
-            Part::Media(index) => write!(f, "media fragment {index}"),
+            Part::Media(number) => write!(f, "media fragment {number}"),
         }
     }
+}
+
+/// A media segment in a stream's schedule: its data, and the presentation
+/// time it spans when timed.
+#[derive(Debug)]
+pub(crate) struct Scheduled {
+    pub(crate) data: Arc<FragmentData>,
+    pub(crate) span: Option<Range<Duration>>,
+}
+
+/// The numbers from the start of `range` to just before its end.
+fn each(range: Range<SegmentNumber>) -> impl DoubleEndedIterator<Item = SegmentNumber> {
+    (range.start.0..range.end.0).map(SegmentNumber)
 }
 
 /// A stream's download schedule: the fragments it wants, and how its workers
@@ -137,8 +162,12 @@ impl fmt::Display for Part {
 pub(crate) struct Schedule {
     /// Initialization fragment, always kept.
     pub(crate) init: Arc<FragmentData>,
-    /// Media fragments in timeline order.
-    pub(crate) media: Vec<Arc<FragmentData>>,
+    /// Number of the first media segment in `media`.
+    first: SegmentNumber,
+    /// Media segments in timeline order, numbered on from `first`.
+    media: VecDeque<Scheduled>,
+    /// Every media segment has a span, so retention can place the window.
+    timed: bool,
     /// When false, byte seeks wait on downloaded bodies instead of HEAD.
     pub(crate) head_available: bool,
     /// Background HEAD prefetch is wanted. Does not gate on-demand seek HEADs.
@@ -152,40 +181,31 @@ pub(crate) struct Schedule {
     pub(crate) complete: bool,
     pub(crate) error: Option<String>,
     retention: Retention,
-    /// Media time spanned by each media fragment. Empty without a usable
-    /// timeline, which keeps everything.
-    spans: Vec<Range<Duration>>,
-    /// The media fragments the stream keeps now: its retention window, as
-    /// indexes into `media`.
-    pub(crate) window: Range<usize>,
+    /// The media segments the stream keeps now: its retention window.
+    pub(crate) window: Range<SegmentNumber>,
 }
 
 impl Schedule {
-    /// A schedule for `init` and `media`, each media fragment spanning the
-    /// same-index entry of `spans`. Without `spans`, retention keeps
-    /// everything.
+    /// A schedule for `init` and `media`, the media segments numbered on from
+    /// `first`, each with the presentation time it spans when timed. Unless
+    /// every one is timed, retention keeps everything.
     pub(crate) fn new(
         init: Arc<FragmentData>,
-        media: Vec<Arc<FragmentData>>,
-        mut spans: Vec<Range<Duration>>,
+        first: SegmentNumber,
+        media: Vec<(Arc<FragmentData>, Option<Range<Duration>>)>,
     ) -> Self {
-        let complete = init.has_body() && media.iter().all(|data| data.has_body());
-        // A timeline that does not line up with the media can't place the
-        // window, so the stream keeps everything instead.
-        if !spans.is_empty() && spans.len() != media.len() {
-            #[cfg(feature = "log")]
-            log::warn!(
-                "MPEG stream timeline has {} media spans for {} media fragments; \
-                 ignoring retention and keeping every fragment",
-                spans.len(),
-                media.len()
-            );
-            spans.clear();
-        }
-        let window = 0..media.len();
+        let media: VecDeque<Scheduled> = media
+            .into_iter()
+            .map(|(data, span)| Scheduled { data, span })
+            .collect();
+        let complete = init.has_body() && media.iter().all(|segment| segment.data.has_body());
+        let timed = media.iter().all(|segment| segment.span.is_some());
+        let window = first..first.plus(media.len());
         Self {
             init,
+            first,
             media,
+            timed,
             head_available: true,
             eager_head: false,
             head_worker_running: false,
@@ -194,16 +214,36 @@ impl Schedule {
             complete,
             error: None,
             retention: Retention::default(),
-            spans,
             window,
         }
+    }
+
+    /// The number of the first media segment.
+    pub(crate) fn first(&self) -> SegmentNumber {
+        self.first
+    }
+
+    /// The scheduled media segment numbered `number`.
+    fn segment(&self, number: SegmentNumber) -> Option<&Scheduled> {
+        self.media.get(number.offset_from(self.first)?)
+    }
+
+    /// Positions in `media` of the segments numbered in `range`.
+    fn slots(&self, range: &Range<SegmentNumber>) -> Range<usize> {
+        let slot = |number: SegmentNumber| {
+            number
+                .offset_from(self.first)
+                .unwrap_or(0)
+                .min(self.media.len())
+        };
+        slot(range.start)..slot(range.end)
     }
 
     /// The fragment at `part`, or `None` past the end.
     pub(crate) fn fragment(&self, part: Part) -> Option<&Arc<FragmentData>> {
         match part {
             Part::Init => Some(&self.init),
-            Part::Media(index) => self.media.get(index),
+            Part::Media(number) => Some(&self.segment(number)?.data),
         }
     }
 
@@ -213,13 +253,28 @@ impl Schedule {
             self.media
                 .iter()
                 .enumerate()
-                .map(|(index, data)| (Part::Media(index), data)),
+                .map(|(slot, segment)| (Part::Media(self.first.plus(slot)), &segment.data)),
         )
+    }
+
+    /// The media fragments, in byte order.
+    #[cfg(test)]
+    pub(crate) fn media_data(&self) -> impl Iterator<Item = &Arc<FragmentData>> {
+        self.media.iter().map(|segment| &segment.data)
+    }
+
+    /// The media segments, each with the presentation time it spans, if every
+    /// one is timed.
+    pub(crate) fn timed_media(&self) -> Option<Vec<(Arc<FragmentData>, Range<Duration>)>> {
+        self.media
+            .iter()
+            .map(|segment| Some((segment.data.clone(), segment.span.clone()?)))
+            .collect()
     }
 
     /// The part just past the last fragment.
     pub(crate) fn end(&self) -> Part {
-        Part::Media(self.media.len())
+        Part::Media(self.first.plus(self.media.len()))
     }
 
     /// Whether `part` is at or past the end of the stream.
@@ -230,8 +285,9 @@ impl Schedule {
     /// The fragments the stream keeps now: the initialization fragment and
     /// its window.
     pub(crate) fn kept(&self) -> Vec<Arc<FragmentData>> {
+        let window = self.media.range(self.slots(&self.window));
         std::iter::once(&self.init)
-            .chain(&self.media[self.window.clone()])
+            .chain(window.map(|segment| &segment.data))
             .cloned()
             .collect()
     }
@@ -261,7 +317,7 @@ impl Schedule {
     pub(crate) fn keeps(&self, part: Part) -> bool {
         match part {
             Part::Init => true,
-            Part::Media(index) => self.window.contains(&index),
+            Part::Media(number) => self.window.contains(&number),
         }
     }
 
@@ -273,21 +329,17 @@ impl Schedule {
             return WindowChange::default();
         }
         let old = std::mem::replace(&mut self.window, window.clone());
-        let pick = |range: &Range<usize>, other: &Range<usize>| -> Vec<_> {
-            range
-                .clone()
-                .filter(|index| !other.contains(index))
-                .map(|index| self.media[index].clone())
+        let pick = |range: &Range<SegmentNumber>, other: &Range<SegmentNumber>| -> Vec<_> {
+            each(range.clone())
+                .filter(|number| !other.contains(number))
+                .filter_map(|number| Some(self.segment(number)?.data.clone()))
                 .collect()
         };
         let change = WindowChange {
             acquired: pick(&window, &old),
             released: pick(&old, &window),
         };
-        if window
-            .clone()
-            .any(|index| self.missing_body(Part::Media(index)))
-        {
+        if each(window).any(|number| self.missing_body(Part::Media(number))) {
             self.complete = false;
         }
         change
@@ -297,32 +349,43 @@ impl Schedule {
     /// ahead of its media fragment's start as `retention` says, and at least
     /// that fragment itself. A cursor in the initialization fragment counts
     /// as the first media fragment.
-    fn window_at(&self, cursor: Part) -> Range<usize> {
+    fn window_at(&self, cursor: Part) -> Range<SegmentNumber> {
         let len = self.media.len();
-        if self.spans.is_empty() || self.retention == Retention::default() {
-            return 0..len;
+        let all = self.first..self.first.plus(len);
+        if !self.timed || self.retention == Retention::default() {
+            return all;
         }
+        let span = |segment: &Scheduled| segment.span.clone().unwrap_or_default();
+
         // Past the last fragment, the position is the end of the media.
-        let cursor = cursor.media_index();
-        let playhead = match self.spans.get(cursor) {
-            Some(span) => span.start,
-            None => self.spans.last().map_or(Duration::ZERO, |span| span.end),
+        let cursor = cursor
+            .number_or(self.first)
+            .offset_from(self.first)
+            .unwrap_or(0);
+        let playhead = match self.media.get(cursor) {
+            Some(segment) => span(segment).start,
+            None => self
+                .media
+                .back()
+                .map_or(Duration::ZERO, |last| span(last).end),
         };
         let start = match self.retention.behind {
             Some(behind) => {
                 let from = playhead.saturating_sub(behind);
-                self.spans.partition_point(|span| span.end <= from)
+                self.media
+                    .partition_point(|segment| span(segment).end <= from)
             }
             None => 0,
         };
         let end = match self.retention.ahead {
             Some(ahead) => {
                 let until = playhead.saturating_add(ahead);
-                self.spans.partition_point(|span| span.start < until)
+                self.media
+                    .partition_point(|segment| span(segment).start < until)
             }
             None => len,
         };
-        start.min(cursor)..end.max(cursor + 1).min(len)
+        self.first.plus(start.min(cursor))..self.first.plus(end.max(cursor + 1).min(len))
     }
 
     pub(crate) fn all_sizes_known(&self) -> bool {
@@ -355,14 +418,15 @@ impl Schedule {
     /// window from the cursor on, else one in the window before the cursor.
     pub(crate) fn next_get(&mut self) -> Option<(Part, Arc<FragmentData>)> {
         let Range { start, end } = self.window;
-        let cursor = self.cursor.media_index().clamp(start, end);
+        let cursor = self.cursor.number_or(self.first).clamp(start, end);
         let part = self
             .priority
             .take()
             .filter(|&priority| self.missing_body(priority))
             .or_else(|| {
+                let media = each(cursor..end).chain(each(start..cursor));
                 std::iter::once(Part::Init)
-                    .chain((cursor..end).chain(start..cursor).map(Part::Media))
+                    .chain(media.map(Part::Media))
                     .find(|&part| self.missing_body(part))
             })?;
         Some((part, self.fragment(part)?.clone()))
@@ -423,7 +487,14 @@ impl Schedule {
     /// probe. Readers take bodies through this, not straight from the store:
     /// the body is published before the fetching worker checks it, and may
     /// have been fetched by another stream sharing the cache.
+    ///
+    /// Also settles a request for `part`. One made while `part` was already
+    /// downloading outlives that download, and would otherwise fetch `part`
+    /// again once the window has dropped it.
     pub(crate) fn checked_body(&mut self, part: Part) -> Option<Bytes> {
+        if self.priority == Some(part) {
+            self.priority = None;
+        }
         self.check_probe(part);
         self.fragment(part)?.body()
     }
@@ -445,7 +516,7 @@ impl Schedule {
             .media
             .len()
             .checked_sub(1)
-            .map_or(Part::Init, Part::Media);
+            .map_or(Part::Init, |slot| Part::Media(self.first.plus(slot)));
         let last_len = self.fragment(last)?.size().unwrap_or(0);
         Some((last, last_len as usize))
     }
@@ -455,8 +526,8 @@ impl Schedule {
 #[derive(Clone, Debug)]
 pub(crate) struct PartBody {
     pub(crate) part: Part,
-    /// Index in the representation, for a media fragment.
-    pub(crate) index: Option<usize>,
+    /// Number in the representation, for a media fragment.
+    pub(crate) number: Option<SegmentNumber>,
     pub(crate) fragment: Fragment,
     pub(crate) body: Bytes,
 }
@@ -468,15 +539,20 @@ pub(crate) struct Cursor {
     pub(crate) part: Part,
     pub(crate) offset_in_fragment: usize,
     pub(crate) byte_position: Option<u64>,
+    /// Number of the stream's first media segment, which follows the
+    /// initialization fragment.
+    first: SegmentNumber,
 }
 
 impl Cursor {
-    /// The start of the initialization fragment.
-    pub(crate) fn start() -> Self {
+    /// The start of the initialization fragment of a stream whose first media
+    /// segment is numbered `first`.
+    pub(crate) fn start(first: SegmentNumber) -> Self {
         Self {
             part: Part::Init,
             offset_in_fragment: 0,
             byte_position: Some(0),
+            first,
         }
     }
 
@@ -523,7 +599,7 @@ impl Cursor {
     }
 
     fn next_fragment(&mut self) {
-        self.part = self.part.next();
+        self.part = self.part.next(self.first);
         self.offset_in_fragment = 0;
     }
 
@@ -560,153 +636,76 @@ pub(crate) fn seek_target(
     })
 }
 
-/// A stream's media timing: its representation's whole timeline, and the
-/// index on it of the stream's first media fragment. A stream that starts
-/// partway through a representation still reports and seeks by the
-/// representation's media time.
-#[derive(Clone, Debug)]
-pub(crate) struct StreamTimeline {
-    timeline: MediaTimeline,
-    first: usize,
+/// The media fragments of `fragments` numbered from `first` on, each with the
+/// presentation time it spans when timed: what a stream from `first` schedules.
+pub(crate) fn media_from(
+    fragments: &Fragments,
+    first: SegmentNumber,
+) -> impl Iterator<Item = (&Fragment, Option<Range<Duration>>)> {
+    each(first..fragments.numbers().end)
+        .filter_map(|number| Some((fragments.fragment_of(number)?, fragments.span_of(number))))
 }
 
-impl StreamTimeline {
-    /// The timing of a stream whose media fragments are those of `timeline`
-    /// from index `first` on.
-    pub(crate) fn new(timeline: MediaTimeline, first: usize) -> Self {
-        Self { timeline, first }
-    }
-
-    /// The representation's whole timeline.
-    pub(crate) fn timeline(&self) -> &MediaTimeline {
-        &self.timeline
-    }
-
-    /// Index in the representation of the stream's first media fragment.
-    pub(crate) fn first(&self) -> usize {
-        self.first
-    }
-
-    /// Media time spanned by each of the stream's media fragments.
-    pub(crate) fn spans(&self) -> Vec<Range<Duration>> {
-        let mut spans = self.timeline.spans();
-        spans.drain(..self.first.min(spans.len()));
-        spans
-    }
-
-    /// The durations of the stream's own media fragments.
-    fn media(&self) -> MediaTimeline {
-        MediaTimeline {
-            timescale: self.timeline.timescale,
-            origin: self
-                .timeline
-                .origin
-                .saturating_add(self.timeline.media_durations.iter().take(self.first).sum()),
-            media_durations: self
-                .timeline
-                .media_durations
-                .get(self.first..)
-                .unwrap_or_default()
-                .to_vec(),
-        }
-    }
-}
-
-/// The fragments of a stream starting at the media fragment of `fragments`
-/// covering `time` on `timeline`, the stream's timing, and that fragment's
-/// start. A time at or past the end starts at the last media fragment.
+/// The number of the media fragment of `fragments` covering `time`, where a
+/// stream starting at a time begins, and that fragment's start. A time at or
+/// past the end starts at the last media fragment.
 pub(crate) fn start_at(
-    mut fragments: Fragments,
-    timeline: MediaTimeline,
+    fragments: &Fragments,
     time: Duration,
-) -> Result<(Fragments, StreamTimeline, Duration), Error> {
-    let (first, span) = timeline.span_at(time).ok_or_else(|| {
-        Error::Initialization(
-            "MPEG stream timeline is missing a timescale or media durations".to_owned(),
-        )
-    })?;
-    if first >= fragments.media.len() {
-        return Err(Error::Initialization(format!(
-            "MPEG stream has {} media fragments, too few to start at {}s",
-            fragments.media.len(),
-            time.as_secs_f64()
-        )));
+) -> Result<(SegmentNumber, Duration), Error> {
+    fragments
+        .number_at(time)
+        .and_then(|first| Some((first, fragments.span_of(first)?.start)))
+        .ok_or_else(|| {
+            Error::Initialization(
+                "MPEG stream needs timed media fragments to start at a time".to_owned(),
+            )
+        })
+}
+
+/// The number of the media fragment a seek to `time` lands in, for a stream
+/// of `fragments` whose first media segment is numbered `first`.
+pub(crate) fn time_target(
+    fragments: &Fragments,
+    first: SegmentNumber,
+    time: Duration,
+) -> io::Result<SegmentNumber> {
+    let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, reason);
+    if fragments.timing().is_none() {
+        return Err(invalid("MPEG stream has no media timeline"));
     }
-    fragments.media.drain(..first);
-    Ok((fragments, StreamTimeline::new(timeline, first), span.start))
+    let number = fragments
+        .number_at(time)
+        .ok_or_else(|| invalid("MPEG stream has no media fragments"))?;
+    match number < first {
+        true => Err(invalid("MPEG stream starts after the requested media time")),
+        false => Ok(number),
+    }
 }
 
-/// The index of the stream's media fragment a seek to `time` lands in.
-pub(crate) fn time_target(timeline: Option<&StreamTimeline>, time: Duration) -> io::Result<usize> {
-    let timeline = timeline.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "MPEG stream has no SegmentTimeline",
-        )
-    })?;
-    let index = timeline.timeline.fragment_at(time).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "MPEG stream timeline is missing a timescale or media durations",
-        )
-    })?;
-    index.checked_sub(timeline.first).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "MPEG stream starts after the requested media time",
-        )
-    })
-}
-
-/// The stream's part for media fragment `index` of the representation, given the
-/// stream's `timeline`. A stream without one starts at the first fragment. `None`
-/// for a fragment before the stream's first.
-pub(crate) fn media_part(timeline: Option<&StreamTimeline>, index: usize) -> Option<Part> {
-    let first = timeline.map_or(0, |timeline| timeline.first);
-    index.checked_sub(first).map(Part::Media)
-}
-
-/// The index in the representation of the stream's `part`, given the stream's
-/// `timeline`. `None` for the initialization fragment.
-pub(crate) fn representation_index(timeline: Option<&StreamTimeline>, part: Part) -> Option<usize> {
-    let Part::Media(index) = part else {
-        return None;
-    };
-    Some(timeline.map_or(0, |timeline| timeline.first) + index)
-}
-
-/// The start of the media fragment at `part` on `timeline`, as a position of
-/// `accuracy`. `None` for the initialization fragment, which has no media
-/// time.
+/// The start of the media fragment at `part`, as a position of `accuracy`.
+/// `None` for the initialization fragment, which has no media time, and for
+/// untimed fragments.
 pub(crate) fn time_at_fragment(
-    timeline: Option<&StreamTimeline>,
+    fragments: &Fragments,
     part: Part,
     accuracy: TimeAccuracy,
 ) -> Option<TimePosition> {
-    let Part::Media(index) = part else {
+    let Part::Media(number) = part else {
         return None;
     };
-    let timeline = timeline?;
-    let span = timeline
-        .timeline
-        .spans()
-        .get(timeline.first + index)?
-        .clone();
     Some(TimePosition {
-        timestamp: span.start,
+        timestamp: fragments.span_of(number)?.start,
         accuracy,
     })
 }
 
-/// The end of `timeline`, as a packet-accurate position.
-pub(crate) fn time_at_end(timeline: Option<&StreamTimeline>) -> Option<TimePosition> {
-    timeline?
-        .timeline
-        .total_duration()
-        .map(|timestamp| TimePosition {
-            timestamp,
-            accuracy: TimeAccuracy::Packet,
-        })
+/// The end of the representation's media, as a packet-accurate position.
+pub(crate) fn time_at_end(fragments: &Fragments) -> Option<TimePosition> {
+    fragments.end().map(|timestamp| TimePosition {
+        timestamp,
+        accuracy: TimeAccuracy::Packet,
+    })
 }
 
 /// The accuracy of a fragment's start time for a byte position
@@ -721,19 +720,22 @@ pub(crate) fn accuracy_at(offset_in_fragment: usize) -> TimeAccuracy {
 
 /// The length a symphonia-compat stream reports before every size is known.
 pub(crate) fn compat_estimate(
-    timeline: Option<&StreamTimeline>,
+    fragments: &Fragments,
+    first: SegmentNumber,
     init_len: u64,
     bitrate_bps: u32,
 ) -> Result<u64, Error> {
-    let timeline = timeline.ok_or_else(|| {
-        Error::Initialization("symphonia_compat requires a SegmentTimeline".to_owned())
-    })?;
-    timeline
-        .media()
+    if fragments.timing().is_none() {
+        return Err(Error::Initialization(
+            "symphonia_compat requires a media timeline".to_owned(),
+        ));
+    }
+    fragments
+        .from(first)
         .estimate_len(init_len, bitrate_bps)
         .ok_or_else(|| {
             Error::Initialization(
-                "symphonia_compat requires a non-zero bitrate and timescale".to_owned(),
+                "symphonia_compat requires a non-zero bitrate and media fragments".to_owned(),
             )
         })
 }
@@ -741,64 +743,180 @@ pub(crate) fn compat_estimate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fragment::store::Store;
+    use crate::fragment::timed_for_test;
+
+    fn n(number: u64) -> SegmentNumber {
+        SegmentNumber(number)
+    }
+
+    fn media(number: u64) -> Part {
+        Part::Media(n(number))
+    }
+
+    /// Four one-second fragments of ten bytes each, after a four-byte init.
+    fn four_seconds() -> Fragments {
+        let ranged = |start: u64| Fragment::with_range("file", start..=start + 9);
+        timed_for_test(
+            Fragment::with_range("file", 0..=3),
+            [ranged(4), ranged(14), ranged(24), ranged(34)],
+            1,
+            &[1; 4],
+        )
+    }
+
+    /// A schedule of `fragments` from the media segment numbered `first`.
+    fn schedule_from(fragments: &Fragments, first: u64) -> Schedule {
+        let init = Arc::new(FragmentData::new(fragments.init().clone()));
+        let media = media_from(fragments, n(first))
+            .map(|(fragment, span)| (Arc::new(FragmentData::new(fragment.clone())), span))
+            .collect();
+        Schedule::new(init, n(first), media)
+    }
 
     #[test]
     fn time_target_lands_on_reported_fragment_starts() {
         // A third of a second does not land on a whole nanosecond.
-        let timeline = MediaTimeline {
-            timescale: 3,
-            origin: 0,
-            media_durations: vec![1, 1],
-        };
-        let second_start = timeline.spans()[1].start;
-        let whole = StreamTimeline::new(timeline, 0);
-        let target = |time| time_target(Some(&whole), time).unwrap();
-        assert_eq!(target(second_start), 1);
-        assert_eq!(target(second_start - Duration::from_nanos(1)), 0);
-        assert_eq!(target(Duration::from_secs(5)), 1);
+        let fragments = timed_for_test("init", ["a", "b"], 3, &[1, 1]);
+        let second_start = fragments.span(1).unwrap().start;
+        let target = |time| time_target(&fragments, n(0), time).unwrap();
+        assert_eq!(target(second_start), n(1));
+        assert_eq!(target(second_start - Duration::from_nanos(1)), n(0));
+        assert_eq!(target(Duration::from_secs(5)), n(1));
 
-        let empty = StreamTimeline::new(
-            MediaTimeline {
-                timescale: 3,
-                origin: 0,
-                media_durations: Vec::new(),
-            },
-            0,
-        );
-        let error = time_target(Some(&empty), Duration::ZERO).unwrap_err();
+        let empty = timed_for_test("init", Vec::<Fragment>::new(), 3, &[]);
+        let error = time_target(&empty, n(0), Duration::ZERO).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        let error = time_target(None, Duration::ZERO).unwrap_err();
+        let untimed = Fragments::new("init", ["a"]);
+        let error = time_target(&untimed, n(0), Duration::ZERO).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn a_stream_from_partway_keeps_the_representation_times() {
         // Four one-second fragments; the stream starts at the third.
-        let timeline = StreamTimeline::new(
-            MediaTimeline {
-                timescale: 1,
-                origin: 0,
-                media_durations: vec![1; 4],
-            },
-            2,
+        let fragments = four_seconds();
+        let scheduled: Vec<_> = media_from(&fragments, n(2)).collect();
+        assert_eq!(
+            scheduled,
+            [
+                (
+                    &Fragment::with_range("file", 24..=33),
+                    Some(secs(2)..secs(3))
+                ),
+                (
+                    &Fragment::with_range("file", 34..=43),
+                    Some(secs(3)..secs(4))
+                ),
+            ]
         );
-        assert_eq!(timeline.spans(), [secs(2)..secs(3), secs(3)..secs(4)]);
-        assert_eq!(timeline.media().media_durations, [1, 1]);
 
         // Seeks name the representation's time, and land on the stream's own fragments.
-        let target = |time| time_target(Some(&timeline), time);
-        assert_eq!(target(secs(2)).unwrap(), 0);
-        assert_eq!(target(Duration::from_millis(3_500)).unwrap(), 1);
+        let target = |time| time_target(&fragments, n(2), time);
+        assert_eq!(target(secs(2)).unwrap(), n(2));
+        assert_eq!(target(Duration::from_millis(3_500)).unwrap(), n(3));
         assert_eq!(
             target(Duration::from_millis(1_500)).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
 
-        let at = |part| time_at_fragment(Some(&timeline), part, TimeAccuracy::Packet);
+        let at = |part| time_at_fragment(&fragments, part, TimeAccuracy::Packet);
         assert_eq!(at(Part::Init), None);
-        assert_eq!(at(Part::Media(1)).unwrap().timestamp, secs(3));
-        assert_eq!(at(Part::Media(2)), None);
-        assert_eq!(time_at_end(Some(&timeline)).unwrap().timestamp, secs(4));
+        assert_eq!(at(media(3)).unwrap().timestamp, secs(3));
+        assert_eq!(at(media(4)), None);
+        assert_eq!(time_at_end(&fragments).unwrap().timestamp, secs(4));
+        assert_eq!(start_at(&fragments, secs(3)).unwrap(), (n(3), secs(3)));
+    }
+
+    #[test]
+    fn a_schedule_addresses_segments_by_number() {
+        let schedule = schedule_from(&four_seconds(), 2);
+        assert_eq!(schedule.first(), n(2));
+        assert_eq!(schedule.end(), media(4));
+        assert!(schedule.fragment(media(1)).is_none());
+        assert!(schedule.fragment(media(4)).is_none());
+        let range = |part| schedule.fragment(part).unwrap().fragment.range.clone();
+        assert_eq!(range(media(2)), Some(24..=33));
+        assert_eq!(range(media(3)), Some(34..=43));
+
+        // Bytes count the init, then the stream's own media.
+        assert_eq!(schedule.prefix_len(media(2)), Some(4));
+        assert_eq!(schedule.prefix_len(media(3)), Some(14));
+        assert_eq!(schedule.total_len(), Some(24));
+        assert_eq!(schedule.resolve_cursor(15), Some((media(3), 1)));
+        assert_eq!(schedule.resolve_cursor(99), Some((media(3), 10)));
+    }
+
+    #[test]
+    fn the_window_and_downloads_follow_numbered_segments() {
+        let mut schedule = schedule_from(&four_seconds(), 2);
+        assert_eq!(schedule.window, n(2)..n(4));
+
+        // Keep nothing behind and one second ahead of the last segment.
+        schedule.set_retention(Retention {
+            behind: Some(Duration::ZERO),
+            ahead: Some(secs(1)),
+        });
+        let change = schedule.move_cursor(media(3));
+        assert_eq!(schedule.window, n(3)..n(4));
+        assert_eq!(change.released.len(), 1);
+        assert!(schedule.keeps(media(3)) && !schedule.keeps(media(2)));
+        assert_eq!(schedule.kept().len(), 2);
+
+        // The init comes first, then the window from the cursor.
+        assert_eq!(schedule.next_get().unwrap().0, Part::Init);
+        schedule.init.set_body(b"init");
+        assert_eq!(schedule.next_get().unwrap().0, media(3));
+    }
+
+    #[test]
+    fn a_request_is_settled_once_the_reader_takes_its_body() {
+        let store = Store::default();
+        let mut schedule = schedule_from(&four_seconds(), 0);
+        schedule.init.set_body(b"init");
+        schedule.set_retention(Retention {
+            behind: Some(Duration::ZERO),
+            ahead: Some(Duration::ZERO),
+        });
+
+        // The reader asks for segment 0 while it is already downloading.
+        schedule.move_cursor(media(0));
+        schedule.request(media(0));
+        schedule.fragment(media(0)).unwrap().set_body(b"0123456789");
+
+        // It takes the body and moves on, which drops it.
+        assert!(schedule.checked_body(media(0)).is_some());
+        let change = schedule.move_cursor(media(1));
+        store.release(&change.released, true);
+        assert!(schedule.missing_body(media(0)));
+
+        // The GET worker fetches the new cursor's segment, not that one again.
+        assert_eq!(schedule.next_get().unwrap().0, media(1));
+    }
+
+    #[test]
+    fn an_untimed_schedule_keeps_everything() {
+        let mut schedule = schedule_from(&Fragments::new("init", ["a", "b", "c"]), 0);
+        schedule.set_retention(Retention {
+            behind: Some(Duration::ZERO),
+            ahead: Some(Duration::ZERO),
+        });
+        schedule.move_cursor(media(2));
+        assert_eq!(schedule.window, n(0)..n(3));
+        assert!(schedule.timed_media().is_none());
+    }
+
+    #[test]
+    fn a_cursor_moves_from_the_init_to_the_first_segment() {
+        let mut cursor = Cursor::start(n(2));
+        assert_eq!(
+            cursor.take_rest(Bytes::from_static(b"init")).unwrap(),
+            "init"
+        );
+        assert_eq!(cursor.part, media(2));
+        assert_eq!(cursor.take_rest(Bytes::from_static(b"c")).unwrap(), "c");
+        assert_eq!(cursor.part, media(3));
+        assert_eq!(cursor.byte_position, Some(5));
     }
 
     fn secs(secs: u64) -> Duration {

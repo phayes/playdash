@@ -33,8 +33,7 @@ impl DashManifest {
         representation_id: impl AsRef<str>,
         cache: Arc<FragmentCache>,
     ) -> Result<FragmentStream, Error> {
-        let (fragments, timeline) = self.manifest.stream_parts(representation_id.as_ref())?;
-        FragmentStream::new_with_cache(fragments, Some(timeline), cache).await
+        FragmentStream::new_with_cache(self.manifest.fragments(representation_id)?, cache).await
     }
 
     /// Opens a representation as a [`FragmentStream`] that reads its
@@ -60,8 +59,8 @@ impl DashManifest {
         time: Duration,
         cache: Arc<FragmentCache>,
     ) -> Result<(FragmentStream, Duration), Error> {
-        let (fragments, timeline) = self.manifest.stream_parts(representation_id.as_ref())?;
-        FragmentStream::starting_at(fragments, timeline, time, cache).await
+        let fragments = self.manifest.fragments(representation_id)?;
+        FragmentStream::starting_at(fragments, time, cache).await
     }
 
     /// A new, empty cache that fetches through this manifest's client.

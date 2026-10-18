@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use crate::vendor::dash_mpd_core::SegmentTemplate;
 
-use super::segments::{Addressing, Segments, Timing, initialization_fragment};
+use super::segments::{Addressing, SegmentUrls, Segments, Timing, initialization_fragment};
 use crate::error::Error;
-use crate::fragment::{Fragment, Fragments};
+use crate::fragment::Fragment;
 
 /// Values substituted for the `$...$` identifiers of a URL template.
 #[derive(Clone, Copy, Debug, Default)]
@@ -120,7 +120,7 @@ impl<'a> TemplateChain<'a> {
         self,
         values: TemplateValues,
         segments: &Segments,
-    ) -> Result<Fragments, Error> {
+    ) -> Result<SegmentUrls, Error> {
         let initialization = match self.get(|template| template.initialization.as_deref()) {
             Some(initialization) => Fragment::new(fill(initialization, &values)?),
             None => initialization_fragment(
@@ -144,7 +144,7 @@ impl<'a> TemplateChain<'a> {
                 Ok(Fragment::new(fill(media, &values)?))
             })
             .collect::<Result<_, Error>>()?;
-        Ok(Fragments {
+        Ok(SegmentUrls {
             init: initialization,
             media,
         })

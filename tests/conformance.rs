@@ -166,26 +166,18 @@ fn check_ids(manifest: &DashManifest) -> Checked {
     Ok(())
 }
 
-/// Checks each representation of `manifest` lists at least one media fragment, one per
-/// media segment of its timeline.
+/// Checks each representation of `manifest` lists at least one timed media fragment.
 fn check_fragments(manifest: &DashManifest) -> Checked {
     for representation in manifest.representations() {
         let id = representation.id;
-        let listed = manifest
+        let fragments = manifest
             .fragments(id)
-            .and_then(|fragments| Ok((fragments, manifest.media_timeline(id)?)));
-        let (fragments, timeline) =
-            listed.map_err(|error| format!("representation {id}: {error}"))?;
-        if fragments.media.is_empty() {
+            .map_err(|error| format!("representation {id}: {error}"))?;
+        if fragments.media_len() == 0 {
             return Err(format!("representation {id} has no media fragments").into());
         }
-        if fragments.media.len() != timeline.media_durations.len() {
-            return Err(format!(
-                "representation {id} lists {} media fragments for {} timeline segments",
-                fragments.media.len(),
-                timeline.media_durations.len()
-            )
-            .into());
+        if fragments.timing().is_none() {
+            return Err(format!("representation {id} has untimed media fragments").into());
         }
     }
     Ok(())
@@ -196,7 +188,7 @@ fn check_fragments(manifest: &DashManifest) -> Checked {
 mod stream {
     use super::{Checked, Entry, TestType, check_fragments, check_ids, index, manifests, parse};
     use crate::common::{self, Probe};
-    use playdash::fragment::{Fragment, FragmentStream};
+    use playdash::fragment::{Fragment, FragmentStream, MediaTiming};
     use playdash::packet::{Packet, PacketStream, Track};
     use playdash::{
         Bytes, ContentKind, DashManifest, Error, FragmentCache, Representation, Retention,
@@ -329,12 +321,12 @@ mod stream {
         );
 
         // Where reading stops, and where to seek: the middle of the representation.
-        let timeline = manifest.media_timeline(id)?;
-        let spans = timeline.spans();
-        let read = spans[FRAGMENTS.min(spans.len()) - 1].end - spans[0].start;
-        let middle = (spans[0].start + spans[spans.len() - 1].end) / 2;
-        let origin =
-            Duration::from_secs_f64(timeline.origin as f64 / f64::from(timeline.timescale));
+        let fragments = manifest.fragments(id)?;
+        let span = |index| fragments.span(index).expect("timed fragments");
+        let count = fragments.media_len();
+        let read = span(FRAGMENTS.min(count) - 1).end - span(0).start;
+        let middle = (span(0).start + span(count - 1).end) / 2;
+        let timing = *fragments.timing().expect("timed fragments");
         for track in &tracks {
             if track.kind == ContentKind::Text {
                 continue;
@@ -343,7 +335,7 @@ mod stream {
             let times = Times {
                 read,
                 seek: middle,
-                origin,
+                timing,
             };
             check_track(&context, &open, track, times, ffprobe)
                 .map_err(|error| format!("{context}: {error}"))?;
@@ -357,8 +349,9 @@ mod stream {
         read: Duration,
         /// Where to seek.
         seek: Duration,
-        /// The media time of the timeline's start, which packet timestamps omit.
-        origin: Duration,
+        /// The representation's media clock: packet timestamps count from its
+        /// presentation time offset, placed at its period start.
+        timing: MediaTiming,
     }
 
     /// Checks `track` of the representation `open` streams: the packets of its first
@@ -370,7 +363,7 @@ mod stream {
         times: Times,
         ffprobe: bool,
     ) -> Checked {
-        let Times { read, seek, origin } = times;
+        let Times { read, seek, timing } = times;
         // The packets from the start.
         let mut stream = PacketStream::with_track(open()?, track.id)?;
         assert_eq!(stream.timescale(), track.timescale, "{context} timescale");
@@ -386,7 +379,10 @@ mod stream {
         }
         check_packets(context, &packets);
         if ffprobe {
-            let origin = ticks(origin, track.timescale);
+            // Media time, in the track's ticks, of presentation time zero.
+            let offset = u128::from(timing.presentation_time_offset) * u128::from(track.timescale)
+                / u128::from(timing.timescale.get());
+            let origin = offset as i64 - ticks(timing.period_start, track.timescale);
             check_probed(context, open()?, track, origin, &packets)?;
         }
 

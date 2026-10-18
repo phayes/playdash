@@ -51,8 +51,7 @@ impl DashManifest {
         &self,
         representation_id: impl AsRef<str>,
     ) -> Result<FragmentStream, Error> {
-        let (fragments, timeline) = self.stream_parts(representation_id.as_ref())?;
-        FragmentStream::new(fragments, Some(timeline))
+        FragmentStream::new(self.fragments(representation_id)?)
     }
 
     /// Like [`DashManifest::fragment_stream`], but fetches through `cache`.
@@ -65,8 +64,7 @@ impl DashManifest {
         representation_id: impl AsRef<str>,
         cache: Arc<FragmentCache>,
     ) -> Result<FragmentStream, Error> {
-        let (fragments, timeline) = self.stream_parts(representation_id.as_ref())?;
-        FragmentStream::new_with_cache(fragments, Some(timeline), cache)
+        FragmentStream::new_with_cache(self.fragments(representation_id)?, cache)
     }
 
     /// Opens a representation as a [`FragmentStream`] that reads its
@@ -106,7 +104,6 @@ impl DashManifest {
         time: Duration,
         cache: Arc<FragmentCache>,
     ) -> Result<(FragmentStream, Duration), Error> {
-        let (fragments, timeline) = self.stream_parts(representation_id.as_ref())?;
-        FragmentStream::starting_at(fragments, timeline, time, cache)
+        FragmentStream::starting_at(self.fragments(representation_id)?, time, cache)
     }
 }

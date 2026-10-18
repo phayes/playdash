@@ -31,41 +31,110 @@ pub use transport::Transport;
 use crate::error::Error;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroU32;
 use std::ops::{Range, RangeInclusive};
 use std::time::Duration;
 
-/// Media-segment timing used to map playback positions to fragments.
+/// A representation's media clock: how the media timestamps of its segments map onto
+/// presentation time.
 ///
-/// Durations are expressed in `timescale` ticks. For example, a timescale of
-/// `1_000` makes a duration of `2_500` equal to 2.5 seconds. Time zero is the
-/// start of the first media fragment.
+/// Media timestamps count [`Self::timescale`] ticks on the representation's own
+/// timeline, as DASH `$Time$` and MP4 decode times do. Presentation time is shared by
+/// every representation of a presentation: a media timestamp equal to
+/// [`Self::presentation_time_offset`] presents at [`Self::period_start`].
 ///
 /// # Examples
 ///
 /// ```
-/// use playdash::fragment::MediaTimeline;
+/// use std::num::NonZeroU32;
+/// use std::time::Duration;
+/// use playdash::fragment::MediaTiming;
 ///
-/// let timeline = MediaTimeline {
-///     timescale: 1_000,
-///     origin: 0,
-///     media_durations: vec![2_500, 2_500],
+/// let timing = MediaTiming {
+///     timescale: NonZeroU32::new(1_000).unwrap(),
+///     presentation_time_offset: 5_000,
+///     period_start: Duration::from_secs(60),
 /// };
-///
-/// // Estimate storage for a 128 kbit/s, five-second stream.
-/// assert!(timeline.estimate_len(1_024, 128_000).is_some());
+/// assert_eq!(timing.presentation_time(7_500), Duration::from_millis(62_500));
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MediaTimeline {
-    /// Number of DASH timeline ticks per second. A zero value makes time conversion fail.
-    pub timescale: u32,
-    /// Source timestamp of the first media segment, in [`Self::timescale`] ticks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaTiming {
+    /// Number of media ticks per second.
+    pub timescale: NonZeroU32,
+    /// Media timestamp, in [`Self::timescale`] ticks, that presents at
+    /// [`Self::period_start`]: DASH's `@presentationTimeOffset`.
+    pub presentation_time_offset: u64,
+    /// Presentation time at which the representation's period starts: DASH's
+    /// `Period@start`.
+    pub period_start: Duration,
+}
+
+impl MediaTiming {
+    /// Converts a media timestamp in [`Self::timescale`] ticks, such as a segment start
+    /// or an MP4 decode time, to presentation time.
     ///
-    /// This includes DASH's presentation-time offset. Subtract it from MP4 timestamps to
-    /// express them relative to the representation's playback time zero.
-    pub origin: u64,
-    /// Duration of each media segment in [`Self::timescale`] ticks, in playback order.
-    /// Entry `n` corresponds to `Fragments::media[n]`.
-    pub media_durations: Vec<u64>,
+    /// A timestamp before [`Self::presentation_time_offset`] converts to
+    /// [`Self::period_start`].
+    pub fn presentation_time(&self, ticks: u64) -> Duration {
+        let offset = ticks.saturating_sub(self.presentation_time_offset);
+        self.period_start.saturating_add(self.duration(offset))
+    }
+
+    /// `ticks` as a duration.
+    fn duration(&self, ticks: u64) -> Duration {
+        let timescale = u64::from(self.timescale.get());
+        let nanos = u128::from(ticks % timescale) * 1_000_000_000 / u128::from(timescale);
+        Duration::new(ticks / timescale, nanos as u32)
+    }
+}
+
+/// A media segment's number in its representation: consecutive segments have
+/// consecutive numbers, and a number keeps naming the same segment while a
+/// stream reads it. For static fragments it is the segment's position.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SegmentNumber(pub(crate) u64);
+
+impl SegmentNumber {
+    /// The number of the segment after this one.
+    pub(crate) fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// The number of the segment before this one, or `None` before zero.
+    pub(crate) fn checked_prev(self) -> Option<Self> {
+        self.0.checked_sub(1).map(Self)
+    }
+
+    /// How many segments this one is after `first`, or `None` before it.
+    pub(crate) fn offset_from(self, first: Self) -> Option<usize> {
+        usize::try_from(self.0.checked_sub(first.0)?).ok()
+    }
+
+    /// The segment `count` after this one.
+    pub(crate) fn plus(self, count: usize) -> Self {
+        Self(self.0 + count as u64)
+    }
+}
+
+impl fmt::Display for SegmentNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A timed media segment: its fragment, and the media time it covers.
+///
+/// [`Self::start`] and [`Self::duration`] count [`MediaTiming::timescale`] ticks on the
+/// representation's media timeline, as DASH `$Time$` does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaSegment {
+    /// The segment's media resource.
+    pub fragment: Fragment,
+    /// Media timestamp of the segment's start, including any
+    /// [`MediaTiming::presentation_time_offset`].
+    pub start: u64,
+    /// Length of the segment's media, in ticks.
+    pub duration: u64,
 }
 
 /// Padding applied to advertised media bytes when guessing total length.
@@ -74,89 +143,6 @@ const SYMPHONIA_COMPAT_MEDIA_FACTOR: u128 = 4;
 
 /// Extra bytes reserved per media fragment for `moof` / box overhead.
 const SYMPHONIA_COMPAT_BYTES_PER_FRAGMENT: u128 = 64 * 1024;
-
-impl MediaTimeline {
-    fn ticks_to_duration(&self, ticks: u64) -> Option<Duration> {
-        if self.timescale == 0 {
-            return None;
-        }
-        let timescale = u64::from(self.timescale);
-        let seconds = ticks / timescale;
-        let nanos = (u128::from(ticks % timescale) * 1_000_000_000 / u128::from(timescale)) as u32;
-        Some(Duration::new(seconds, nanos))
-    }
-
-    /// Converts segment durations into consecutive ranges from playback time zero.
-    /// Returns an empty vector for a zero timescale.
-    pub fn spans(&self) -> Vec<Range<Duration>> {
-        let mut ticks = 0u64;
-        self.media_durations
-            .iter()
-            .map_while(|&duration| {
-                let start = self.ticks_to_duration(ticks)?;
-                ticks = ticks.saturating_add(duration);
-                Some(start..self.ticks_to_duration(ticks)?)
-            })
-            .collect()
-    }
-
-    /// Finds the media fragment whose media covers `time`, as an index into
-    /// [`Fragments::media`]. A time at or past the end lands in the last
-    /// fragment. `None` for an empty timeline.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::time::Duration;
-    /// use playdash::fragment::MediaTimeline;
-    ///
-    /// let timeline = MediaTimeline {
-    ///     timescale: 1_000,
-    ///     origin: 0,
-    ///     media_durations: vec![2_000, 2_000],
-    /// };
-    /// assert_eq!(timeline.fragment_at(Duration::ZERO), Some(0));
-    /// assert_eq!(timeline.fragment_at(Duration::from_millis(2_500)), Some(1));
-    /// assert_eq!(timeline.fragment_at(Duration::from_secs(60)), Some(1));
-    /// ```
-    pub fn fragment_at(&self, time: Duration) -> Option<usize> {
-        self.span_at(time).map(|(index, _)| index)
-    }
-
-    /// The media fragment covering `time`, as for [`Self::fragment_at`], and
-    /// the media time it spans.
-    pub(crate) fn span_at(&self, time: Duration) -> Option<(usize, Range<Duration>)> {
-        let mut spans = self.spans();
-        let last = spans.len().checked_sub(1)?;
-        let index = spans.partition_point(|span| span.end <= time).min(last);
-        Some((index, spans.swap_remove(index)))
-    }
-
-    /// Returns the sum of all segment durations as wall-clock time.
-    /// Returns `None` for a zero timescale.
-    pub fn total_duration(&self) -> Option<Duration> {
-        self.ticks_to_duration(self.media_durations.iter().copied().sum())
-    }
-
-    /// Returns a conservative stream-length estimate for a demuxer that needs
-    /// a length before all fragments have been downloaded.
-    ///
-    /// Returns `None` when the bitrate, timescale, or media durations are empty.
-    pub fn estimate_len(&self, init_len: u64, bitrate_bps: u32) -> Option<u64> {
-        if bitrate_bps == 0 || self.timescale == 0 || self.media_durations.is_empty() {
-            return None;
-        }
-        let ticks: u128 = self.media_durations.iter().copied().map(u128::from).sum();
-        let fragments = u128::from(self.media_durations.len() as u64);
-        let denom = u128::from(self.timescale) * 8;
-        let media = (u128::from(bitrate_bps) * ticks).div_ceil(denom);
-        let padded = media
-            .saturating_mul(SYMPHONIA_COMPAT_MEDIA_FACTOR)
-            .saturating_add(fragments.saturating_mul(SYMPHONIA_COMPAT_BYTES_PER_FRAGMENT))
-            .saturating_add(u128::from(init_len));
-        Some(u64::try_from(padded).unwrap_or(u64::MAX))
-    }
-}
 
 /// Parses an inclusive byte range in the DASH `@mediaRange` / `@range` and
 /// HTTP `first-last` form, such as `"0-837"`.
@@ -250,33 +236,71 @@ impl fmt::Display for Fragment {
 }
 
 /// A representation's fragments: its initialization fragment and its media
-/// fragments. A stream of them reads the initialization fragment first, then
-/// the media fragments in order.
+/// fragments, which may be timed. A stream of them reads the initialization
+/// fragment first, then the media fragments in order.
+///
+/// Fragments from a [`DashManifest`](crate::DashManifest) are timed: each media
+/// fragment carries the presentation time it covers, which time seeks, retention
+/// and buffer status need. Fragments from [`Self::new`] are untimed.
 ///
 /// # Examples
 ///
 /// ```
-/// use playdash::fragment::{Fragment, Fragments};
+/// use std::num::NonZeroU32;
+/// use std::time::Duration;
+/// use playdash::fragment::{Fragment, Fragments, MediaSegment, MediaTiming};
 ///
-/// let fragments = Fragments::new(
+/// let untimed = Fragments::new(
 ///     "https://media.example/init.mp4",
 ///     ["https://media.example/1.m4s", "https://media.example/2.m4s"],
 /// );
-/// assert_eq!(fragments.init, Fragment::new("https://media.example/init.mp4"));
-/// assert_eq!(fragments.media.len(), 2);
+/// assert_eq!(untimed.init(), &Fragment::new("https://media.example/init.mp4"));
+/// assert_eq!(untimed.media_len(), 2);
+/// assert_eq!(untimed.span(0), None);
+///
+/// let timing = MediaTiming {
+///     timescale: NonZeroU32::new(1_000).unwrap(),
+///     presentation_time_offset: 0,
+///     period_start: Duration::ZERO,
+/// };
+/// let segment = |url: &str, start| MediaSegment {
+///     fragment: Fragment::new(url),
+///     start,
+///     duration: 2_000,
+/// };
+/// let timed = Fragments::timed(
+///     "https://media.example/init.mp4",
+///     timing,
+///     [
+///         segment("https://media.example/1.m4s", 0),
+///         segment("https://media.example/2.m4s", 2_000),
+///     ],
+/// )?;
+/// let secs = Duration::from_secs;
+/// assert_eq!(timed.span(1), Some(secs(2)..secs(4)));
+/// assert_eq!(timed.segment_at(Duration::from_millis(2_500)), Some(1));
+/// # Ok::<(), playdash::Error>(())
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fragments {
-    /// Initialization segment read before media, typically containing MP4 `ftyp` and
-    /// `moov` boxes with track and codec configuration.
-    pub init: Fragment,
-    /// Media segments in playback order, one per entry of the
-    /// representation's [`MediaTimeline::media_durations`].
-    pub media: Vec<Fragment>,
+    init: Fragment,
+    index: SegmentIndex,
+}
+
+/// A representation's media fragments, with their timing when known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SegmentIndex {
+    /// Media fragments without timing, in playback order.
+    Untimed(Vec<Fragment>),
+    /// Timed media segments, in timeline order and not overlapping.
+    List {
+        timing: MediaTiming,
+        segments: Vec<MediaSegment>,
+    },
 }
 
 impl Fragments {
-    /// Creates the fragments of a representation from its initialization
+    /// Creates untimed fragments of a representation from its initialization
     /// fragment and its media fragments in playback order.
     pub fn new(
         init: impl Into<Fragment>,
@@ -284,60 +308,412 @@ impl Fragments {
     ) -> Self {
         Self {
             init: init.into(),
-            media: media.into_iter().map(Into::into).collect(),
+            index: SegmentIndex::Untimed(media.into_iter().map(Into::into).collect()),
         }
     }
+
+    /// Creates timed fragments of a representation from its initialization
+    /// fragment and its media segments in playback order, on `timing`'s clock.
+    ///
+    /// Fails with [`Error::InvalidSegmentTiming`] if a segment has a zero
+    /// duration, starts before the segment ahead of it ends, or ends past the
+    /// largest media timestamp.
+    pub fn timed(
+        init: impl Into<Fragment>,
+        timing: MediaTiming,
+        segments: impl IntoIterator<Item = MediaSegment>,
+    ) -> Result<Self, Error> {
+        let segments: Vec<MediaSegment> = segments.into_iter().collect();
+
+        // Each segment must follow the one before it.
+        let mut end = 0u64;
+        for (index, segment) in segments.iter().enumerate() {
+            let invalid = |reason: String| {
+                Error::InvalidSegmentTiming(format!(
+                    "media segment {index} ({}) {reason}",
+                    segment.fragment
+                ))
+            };
+            if segment.duration == 0 {
+                return Err(invalid("has a zero duration".to_owned()));
+            }
+            if segment.start < end {
+                return Err(invalid(format!(
+                    "starts at {} before the previous segment ends at {end}",
+                    segment.start
+                )));
+            }
+            end = segment
+                .start
+                .checked_add(segment.duration)
+                .ok_or_else(|| invalid("ends past the largest media timestamp".to_owned()))?;
+        }
+
+        Ok(Self {
+            init: init.into(),
+            index: SegmentIndex::List { timing, segments },
+        })
+    }
+
+    /// Returns the initialization fragment.
+    pub fn init(&self) -> &Fragment {
+        &self.init
+    }
+
+    /// Returns the number of media fragments.
+    pub fn media_len(&self) -> usize {
+        match &self.index {
+            SegmentIndex::Untimed(media) => media.len(),
+            SegmentIndex::List { segments, .. } => segments.len(),
+        }
+    }
+
+    /// Returns the media fragments in playback order.
+    pub fn media(&self) -> impl Iterator<Item = &Fragment> {
+        (0..self.media_len()).filter_map(|index| self.media_fragment(index))
+    }
+
+    /// The media fragment at `index` in playback order.
+    pub(crate) fn media_fragment(&self, index: usize) -> Option<&Fragment> {
+        match &self.index {
+            SegmentIndex::Untimed(media) => media.get(index),
+            SegmentIndex::List { segments, .. } => Some(&segments.get(index)?.fragment),
+        }
+    }
+
+    /// Returns the clock the media segments are timed on, or `None` for untimed
+    /// fragments.
+    pub fn timing(&self) -> Option<&MediaTiming> {
+        match &self.index {
+            SegmentIndex::Untimed(_) => None,
+            SegmentIndex::List { timing, .. } => Some(timing),
+        }
+    }
+
+    /// Returns the media segments in playback order, or `None` for untimed
+    /// fragments.
+    pub fn segments(&self) -> Option<&[MediaSegment]> {
+        match &self.index {
+            SegmentIndex::Untimed(_) => None,
+            SegmentIndex::List { segments, .. } => Some(segments),
+        }
+    }
+
+    /// Returns the presentation time covered by media fragment `index`.
+    /// Returns `None` for untimed fragments or an index past the last.
+    pub fn span(&self, index: usize) -> Option<Range<Duration>> {
+        let (timing, segments) = self.timed_segments()?;
+        segments
+            .get(index)
+            .map(|segment| segment_span(timing, segment))
+    }
+
+    /// Finds the media fragment covering presentation time `time`, as an index
+    /// into [`Self::media`].
+    ///
+    /// A time before the first segment lands in the first, and a time at or
+    /// past the end lands in the last. Returns `None` for untimed fragments or
+    /// fragments without media.
+    pub fn segment_at(&self, time: Duration) -> Option<usize> {
+        let (timing, segments) = self.timed_segments()?;
+        let last = segments.len().checked_sub(1)?;
+        let index = segments.partition_point(|segment| segment_span(timing, segment).end <= time);
+        Some(index.min(last))
+    }
+
+    /// Returns the presentation time at which the last media segment ends.
+    /// Returns `None` for untimed fragments or fragments without media.
+    pub fn end(&self) -> Option<Duration> {
+        let (timing, segments) = self.timed_segments()?;
+        segments
+            .last()
+            .map(|segment| segment_span(timing, segment).end)
+    }
+
+    /// Returns a conservative stream-length estimate for a demuxer that needs
+    /// a length before all fragments have been downloaded.
+    ///
+    /// Returns `None` for untimed fragments, fragments without media, or a
+    /// zero `bitrate_bps`.
+    pub fn estimate_len(&self, init_len: u64, bitrate_bps: u32) -> Option<u64> {
+        let (timing, segments) = self.timed_segments()?;
+        if bitrate_bps == 0 || segments.is_empty() {
+            return None;
+        }
+
+        // Advertised media bytes, padded for bitrate underestimates and box overhead.
+        let ticks: u128 = segments
+            .iter()
+            .map(|segment| u128::from(segment.duration))
+            .sum();
+        let count = u128::from(segments.len() as u64);
+        let denom = u128::from(timing.timescale.get()) * 8;
+        let media = (u128::from(bitrate_bps) * ticks).div_ceil(denom);
+        let padded = media
+            .saturating_mul(SYMPHONIA_COMPAT_MEDIA_FACTOR)
+            .saturating_add(count.saturating_mul(SYMPHONIA_COMPAT_BYTES_PER_FRAGMENT))
+            .saturating_add(u128::from(init_len));
+        Some(u64::try_from(padded).unwrap_or(u64::MAX))
+    }
+
+    /// The numbers of the media segments, from the first to just past the
+    /// last.
+    pub(crate) fn numbers(&self) -> Range<SegmentNumber> {
+        let first = SegmentNumber::default();
+        first..first.plus(self.media_len())
+    }
+
+    /// The number of the media segment covering presentation time `time`, as
+    /// [`Self::segment_at`] finds it.
+    pub(crate) fn number_at(&self, time: Duration) -> Option<SegmentNumber> {
+        self.segment_at(time)
+            .map(|position| self.numbers().start.plus(position))
+    }
+
+    /// The media fragment numbered `number`.
+    pub(crate) fn fragment_of(&self, number: SegmentNumber) -> Option<&Fragment> {
+        self.media_fragment(number.offset_from(self.numbers().start)?)
+    }
+
+    /// The presentation time the media segment numbered `number` covers.
+    /// `None` for untimed fragments.
+    pub(crate) fn span_of(&self, number: SegmentNumber) -> Option<Range<Duration>> {
+        self.span(number.offset_from(self.numbers().start)?)
+    }
+
+    /// The same fragments without the media segments numbered before `first`.
+    pub(crate) fn from(&self, first: SegmentNumber) -> Self {
+        let first = first.offset_from(self.numbers().start).unwrap_or_default();
+        let index = match &self.index {
+            SegmentIndex::Untimed(media) => {
+                SegmentIndex::Untimed(media.get(first..).unwrap_or_default().to_vec())
+            }
+            SegmentIndex::List { timing, segments } => SegmentIndex::List {
+                timing: *timing,
+                segments: segments.get(first..).unwrap_or_default().to_vec(),
+            },
+        };
+        Self {
+            init: self.init.clone(),
+            index,
+        }
+    }
+
+    /// The timing and segments of timed fragments.
+    fn timed_segments(&self) -> Option<(&MediaTiming, &[MediaSegment])> {
+        match &self.index {
+            SegmentIndex::Untimed(_) => None,
+            SegmentIndex::List { timing, segments } => Some((timing, segments)),
+        }
+    }
+}
+
+/// The presentation time `segment` covers on `timing`'s clock.
+fn segment_span(timing: &MediaTiming, segment: &MediaSegment) -> Range<Duration> {
+    let end = segment.start.saturating_add(segment.duration);
+    timing.presentation_time(segment.start)..timing.presentation_time(end)
+}
+
+/// Timed fragments for tests: `media` back to back from media time zero, each
+/// lasting the same-index entry of `durations` in `timescale` ticks.
+#[cfg(test)]
+pub(crate) fn timed_for_test(
+    init: impl Into<Fragment>,
+    media: impl IntoIterator<Item = impl Into<Fragment>>,
+    timescale: u32,
+    durations: &[u64],
+) -> Fragments {
+    let media: Vec<Fragment> = media.into_iter().map(Into::into).collect();
+    assert_eq!(
+        media.len(),
+        durations.len(),
+        "one duration per media fragment"
+    );
+    let timing = MediaTiming {
+        timescale: NonZeroU32::new(timescale).expect("a non-zero timescale"),
+        presentation_time_offset: 0,
+        period_start: Duration::ZERO,
+    };
+    let mut start = 0;
+    let segments = media
+        .into_iter()
+        .zip(durations)
+        .map(|(fragment, &duration)| {
+            let segment = MediaSegment {
+                fragment,
+                start,
+                duration,
+            };
+            start += duration;
+            segment
+        });
+    Fragments::timed(init, timing, segments.collect::<Vec<_>>()).expect("valid test timing")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn two_second_timeline() -> MediaTimeline {
-        MediaTimeline {
-            timescale: 44_100,
-            origin: 0,
-            media_durations: vec![44_100, 44_100],
+    fn timing(timescale: u32) -> MediaTiming {
+        MediaTiming {
+            timescale: NonZeroU32::new(timescale).unwrap(),
+            presentation_time_offset: 0,
+            period_start: Duration::ZERO,
         }
+    }
+
+    /// Fragments of `durations` back to back from media time `start`.
+    fn timed(timing: MediaTiming, start: u64, durations: &[u64]) -> Fragments {
+        let mut time = start;
+        let segments = durations.iter().enumerate().map(|(index, &duration)| {
+            let segment = MediaSegment {
+                fragment: Fragment::new(format!("{index}.m4s")),
+                start: time,
+                duration,
+            };
+            time += duration;
+            segment
+        });
+        Fragments::timed("init.mp4", timing, segments.collect::<Vec<_>>()).unwrap()
+    }
+
+    fn two_seconds() -> Fragments {
+        timed(timing(44_100), 0, &[44_100, 44_100])
     }
 
     #[test]
     fn estimate_len_errs_larger_than_advertised_media() {
-        let timeline = two_second_timeline();
+        let fragments = two_seconds();
         let init_len = 4;
         let bitrate = 128_000;
         let raw_media = u64::from(bitrate) * 2 / 8;
-        let estimate = timeline.estimate_len(init_len, bitrate).unwrap();
+        let estimate = fragments.estimate_len(init_len, bitrate).unwrap();
         assert!(
             estimate >= init_len + raw_media * 4 + 2 * 64 * 1024,
             "estimate {estimate} should pad raw media {raw_media}"
         );
-        assert!(timeline.estimate_len(init_len, 0).is_none());
+        assert!(fragments.estimate_len(init_len, 0).is_none());
+        let untimed = Fragments::new("init.mp4", ["0.m4s"]);
+        assert!(untimed.estimate_len(init_len, bitrate).is_none());
     }
 
     #[test]
-    fn fragment_at_indexes_media_fragments() {
-        let timeline = two_second_timeline();
-        let at = |millis| timeline.fragment_at(Duration::from_millis(millis));
+    fn segment_at_indexes_media_fragments() {
+        let fragments = two_seconds();
+        let at = |millis| fragments.segment_at(Duration::from_millis(millis));
         assert_eq!(at(0), Some(0));
         assert_eq!(at(999), Some(0));
         assert_eq!(at(1_000), Some(1));
         assert_eq!(at(2_000), Some(1));
         assert_eq!(at(60_000), Some(1));
-        assert_eq!(timeline.total_duration(), Some(Duration::from_secs(2)));
+        assert_eq!(fragments.end(), Some(Duration::from_secs(2)));
 
-        let empty = MediaTimeline {
-            timescale: 1_000,
-            origin: 0,
-            media_durations: Vec::new(),
+        let empty = timed(timing(1_000), 0, &[]);
+        assert_eq!(empty.segment_at(Duration::ZERO), None);
+        assert_eq!(empty.end(), None);
+        let untimed = Fragments::new("init.mp4", ["0.m4s"]);
+        assert_eq!(untimed.segment_at(Duration::ZERO), None);
+        assert_eq!(untimed.end(), None);
+    }
+
+    #[test]
+    fn spans_are_presentation_time() {
+        // Media starts 2 s after the offset, in a period starting at 60 s.
+        let clock = MediaTiming {
+            presentation_time_offset: 10_000,
+            period_start: Duration::from_secs(60),
+            ..timing(1_000)
         };
-        assert_eq!(empty.fragment_at(Duration::ZERO), None);
-        let unscaled = MediaTimeline {
-            timescale: 0,
-            ..two_second_timeline()
+        let fragments = timed(clock, 12_000, &[2_000, 2_000]);
+        let secs = Duration::from_secs;
+        assert_eq!(fragments.span(0), Some(secs(62)..secs(64)));
+        assert_eq!(fragments.span(1), Some(secs(64)..secs(66)));
+        assert_eq!(fragments.span(2), None);
+        assert_eq!(fragments.end(), Some(secs(66)));
+
+        // Before the first segment lands in it.
+        assert_eq!(fragments.segment_at(secs(61)), Some(0));
+        assert_eq!(fragments.segment_at(secs(64)), Some(1));
+
+        // Before the offset presents at the period start.
+        assert_eq!(clock.presentation_time(9_000), secs(60));
+    }
+
+    #[test]
+    fn timed_rejects_overlapping_and_empty_segments() {
+        let segment = |start, duration| MediaSegment {
+            fragment: Fragment::new("a.m4s"),
+            start,
+            duration,
         };
-        assert_eq!(unscaled.fragment_at(Duration::ZERO), None);
-        assert_eq!(unscaled.total_duration(), None);
+        let build = |segments: Vec<MediaSegment>| Fragments::timed("init", timing(1), segments);
+        assert!(
+            build(vec![segment(0, 2), segment(3, 2)]).is_ok(),
+            "a gap is allowed"
+        );
+        for invalid in [
+            vec![segment(0, 0)],
+            vec![segment(0, 2), segment(1, 2)],
+            vec![segment(u64::MAX, 1)],
+        ] {
+            assert!(
+                matches!(build(invalid.clone()), Err(Error::InvalidSegmentTiming(_))),
+                "{invalid:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn from_drops_leading_media() {
+        let fragments = timed(timing(1_000), 0, &[1_000, 1_000, 1_000]);
+        let tail = fragments.from(SegmentNumber(1));
+        assert_eq!(tail.media_len(), 2);
+        assert_eq!(
+            tail.span(0),
+            Some(Duration::from_secs(1)..Duration::from_secs(2))
+        );
+        assert_eq!(fragments.from(SegmentNumber(5)).media_len(), 0);
+        let untimed = Fragments::new("init.mp4", ["a", "b"]);
+        assert_eq!(
+            untimed.from(SegmentNumber(1)).media().collect::<Vec<_>>(),
+            [&Fragment::new("b")]
+        );
+    }
+
+    #[test]
+    fn segments_are_numbered_by_position() {
+        let n = SegmentNumber;
+        let fragments = timed(timing(1_000), 0, &[1_000, 1_000]);
+        assert_eq!(fragments.numbers(), n(0)..n(2));
+        assert_eq!(
+            fragments.number_at(Duration::from_millis(1_500)),
+            Some(n(1))
+        );
+        assert_eq!(
+            fragments.span_of(n(1)),
+            Some(Duration::from_secs(1)..Duration::from_secs(2))
+        );
+        assert_eq!(fragments.span_of(n(2)), None);
+        assert_eq!(fragments.fragment_of(n(1)), Some(&Fragment::new("1.m4s")));
+
+        // Untimed segments are numbered too, but have no times.
+        let untimed = Fragments::new("init.mp4", ["a", "b"]);
+        assert_eq!(untimed.numbers(), n(0)..n(2));
+        assert_eq!(untimed.fragment_of(n(1)), Some(&Fragment::new("b")));
+        assert_eq!(untimed.span_of(n(1)), None);
+        assert_eq!(untimed.number_at(Duration::ZERO), None);
+    }
+
+    #[test]
+    fn segment_numbers_step_and_offset() {
+        let n = SegmentNumber;
+        assert_eq!(n(4).next(), n(5));
+        assert_eq!(n(4).checked_prev(), Some(n(3)));
+        assert_eq!(n(0).checked_prev(), None);
+        assert_eq!(n(4).offset_from(n(2)), Some(2));
+        assert_eq!(n(1).offset_from(n(2)), None);
+        assert_eq!(n(2).plus(3), n(5));
+        assert_eq!(n(7).to_string(), "7");
     }
 
     #[test]

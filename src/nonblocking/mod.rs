@@ -33,7 +33,7 @@ pub mod packet;
 pub use decoder::{MediaStream, MediaStreamBuilder};
 
 use crate::error::Error;
-use crate::fragment::{Fragments, MediaTimeline};
+use crate::fragment::Fragments;
 use crate::manifest::{ContentKind, Representation};
 use fragment::Transport;
 use reqwest::{Client, Response};
@@ -217,14 +217,6 @@ impl DashManifest {
         self.manifest.fragments(representation_id)
     }
 
-    /// Returns the duration and timestamp scale of each resolved media segment.
-    pub fn media_timeline(
-        &self,
-        representation_id: impl AsRef<str>,
-    ) -> Result<MediaTimeline, Error> {
-        self.manifest.media_timeline(representation_id)
-    }
-
     /// Returns the representation's inherited MIME type, or `Ok(None)` if undeclared.
     pub fn mime_type(&self, representation_id: impl AsRef<str>) -> Result<Option<&str>, Error> {
         self.manifest.mime_type(representation_id)
@@ -383,15 +375,18 @@ pub(crate) mod tests {
             Some(format!("{base}/audio/manifest.mpd").as_str())
         );
         let fragments = manifest.fragments("FLAC").unwrap();
-        assert_eq!(fragments.media.len(), 2);
+        assert_eq!(fragments.media_len(), 2);
         assert_eq!(
-            fragments.init,
-            Fragment::with_range(format!("{base}/audio/track.mp4"), 0..=837)
+            fragments.init(),
+            &Fragment::with_range(format!("{base}/audio/track.mp4"), 0..=837)
         );
-        assert_eq!(
-            manifest.media_timeline("FLAC").unwrap().media_durations,
-            [4096, 1024]
-        );
+        let durations: Vec<u64> = fragments
+            .segments()
+            .unwrap()
+            .iter()
+            .map(|segment| segment.duration)
+            .collect();
+        assert_eq!(durations, [4096, 1024]);
 
         // The stream reads the init, then the media past the index.
         let (init, media) = (&file[..838], &file[838 + index_len(&index_range)..]);

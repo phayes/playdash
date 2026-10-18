@@ -2,15 +2,38 @@ use super::*;
 
 /// The init URL and the media URLs of a representation without byte ranges.
 fn urls(manifest: &DashManifest, id: &str) -> (String, Vec<String>) {
-    let url = |fragment: Fragment| {
+    let url = |fragment: &Fragment| {
         assert_eq!(fragment.range, None);
-        fragment.url
+        fragment.url.clone()
     };
     let fragments = manifest.fragments(id).unwrap();
+    (url(fragments.init()), fragments.media().map(url).collect())
+}
+
+/// The init fragment and the media fragments of `fragments`.
+fn parts(fragments: &Fragments) -> (Fragment, Vec<Fragment>) {
     (
-        url(fragments.init),
-        fragments.media.into_iter().map(url).collect(),
+        fragments.init().clone(),
+        fragments.media().cloned().collect(),
     )
+}
+
+/// The timescale of a representation's media segments.
+fn timescale(manifest: &DashManifest, id: &str) -> u32 {
+    manifest
+        .fragments(id)
+        .unwrap()
+        .timing()
+        .unwrap()
+        .timescale
+        .get()
+}
+
+/// The duration of each of a representation's media segments, in its ticks.
+fn durations(manifest: &DashManifest, id: &str) -> Vec<u64> {
+    let fragments = manifest.fragments(id).unwrap();
+    let segments = fragments.segments().unwrap();
+    segments.iter().map(|segment| segment.duration).collect()
 }
 
 #[test]
@@ -71,10 +94,6 @@ fn parses_dash_manifest_fields() {
         manifest.fragments("AACLC"),
         Err(Error::DashManifestMissingTimeline)
     ));
-    assert!(matches!(
-        manifest.media_timeline("AACLC"),
-        Err(Error::DashManifestMissingTimeline)
-    ));
 }
 
 #[test]
@@ -113,13 +132,14 @@ fn parses_segment_timeline_and_unescapes_urls() {
             "https://cdn.example/4.mp4?token=abc&info=media",
         ]
     );
+    assert_eq!(timescale(&manifest, "AACLC"), 44_100);
     assert_eq!(
-        manifest.media_timeline("AACLC").unwrap(),
-        MediaTimeline {
-            timescale: 44_100,
-            origin: 0,
-            media_durations: vec![176_128, 176_128, 176_128, 108_735],
-        }
+        durations(&manifest, "AACLC"),
+        [176_128, 176_128, 176_128, 108_735]
+    );
+    assert_eq!(
+        manifest.fragments("AACLC").unwrap().span(0).unwrap().start,
+        Duration::ZERO
     );
 }
 
@@ -153,19 +173,13 @@ fn inherits_segment_template_from_adaptation_set() {
             "https://cdn.example/track/6.mp4",
         ]
     );
-    assert_eq!(
-        manifest.media_timeline("FLAC").unwrap(),
-        MediaTimeline {
-            timescale: 1000,
-            origin: 0,
-            media_durations: vec![2000, 2000],
-        }
-    );
+    assert_eq!(timescale(&manifest, "FLAC"), 1000);
+    assert_eq!(durations(&manifest, "FLAC"), [2000, 2000]);
 }
 
 #[test]
-fn media_timeline_origin_is_the_first_segment_media_time() {
-    let manifest = |timing: &str| {
+fn segments_keep_their_media_time_and_present_from_the_offset() {
+    let fragments = |timing: &str| {
         DashManifest::new(format!(
             r#"<MPD mediaPresentationDuration="PT4S"><Period><AdaptationSet mimeType="audio/mp4">
                 <Representation id="FLAC">
@@ -174,29 +188,40 @@ fn media_timeline_origin_is_the_first_segment_media_time() {
             </AdaptationSet></Period></MPD>"#
         ))
         .unwrap()
-        .media_timeline("FLAC")
+        .with_base_url("https://cdn.example/manifest.mpd")
+        .unwrap()
+        .fragments("FLAC")
         .unwrap()
     };
+    let starts = |fragments: &Fragments| -> Vec<u64> {
+        let segments = fragments.segments().unwrap();
+        segments.iter().map(|segment| segment.start).collect()
+    };
+    let millis = Duration::from_millis;
 
-    // A timeline starting after the presentation time offset.
-    let timeline = manifest(
+    // A timeline starting after the presentation time offset presents late.
+    let late = fragments(
         r#"timescale="1000" presentationTimeOffset="500">
             <SegmentTimeline><S t="700" d="2000" r="1"/></SegmentTimeline>
         </SegmentTemplate>"#,
     );
-    assert_eq!(timeline.origin, 700);
+    assert_eq!(late.timing().unwrap().presentation_time_offset, 500);
+    assert_eq!(starts(&late), [700, 2700]);
+    assert_eq!(late.span(0), Some(millis(200)..millis(2_200)));
     // The Period ends at media time 4500, cutting the second segment short.
-    assert_eq!(timeline.media_durations, [2000, 1800]);
+    assert_eq!(late.span(1), Some(millis(2_200)..millis(4_000)));
 
-    // Fixed-duration segments start at the offset.
-    let timeline = manifest(r#"timescale="1000" presentationTimeOffset="500" duration="2000"/>"#);
-    assert_eq!(timeline.origin, 500);
+    // Fixed-duration segments start at the offset, so present from zero.
+    let fixed = fragments(r#"timescale="1000" presentationTimeOffset="500" duration="2000"/>"#);
+    assert_eq!(starts(&fixed), [500, 2500]);
+    assert_eq!(fixed.span(0), Some(Duration::ZERO..millis(2_000)));
 
     // Without either, media time starts at zero.
-    let timeline = manifest(
+    let plain = fragments(
         r#"timescale="1000"><SegmentTimeline><S d="2000"/></SegmentTimeline></SegmentTemplate>"#,
     );
-    assert_eq!(timeline.origin, 0);
+    assert_eq!(starts(&plain), [0]);
+    assert_eq!(plain.span(0), Some(Duration::ZERO..millis(2_000)));
 }
 
 #[test]
@@ -489,14 +514,8 @@ fn resolves_base_url_chain_and_duration_template() {
             "https://cdn.example/media/audio/flac/1411200/003.m4s",
         ]
     );
-    assert_eq!(
-        manifest.media_timeline("FLAC").unwrap(),
-        MediaTimeline {
-            timescale: 1000,
-            origin: 0,
-            media_durations: vec![4000, 4000, 1000],
-        }
-    );
+    assert_eq!(timescale(&manifest, "FLAC"), 1000);
+    assert_eq!(durations(&manifest, "FLAC"), [4000, 4000, 1000]);
     let (init, media) = urls(&manifest, "AACLC");
     assert_eq!(init, "https://other.example/aac/i.mp4");
     assert_eq!(media, ["https://other.example/aac/0.m4s"]);
@@ -556,14 +575,17 @@ fn period_duration_runs_to_next_period_start() {
         </MPD>
     "#;
     let manifest = DashManifest::new(xml).unwrap();
-    assert_eq!(
-        manifest.media_timeline("FIRST").unwrap().media_durations,
-        [2, 2, 1]
-    );
-    assert_eq!(
-        manifest.media_timeline("SECOND").unwrap().media_durations,
-        [10, 3]
-    );
+    assert_eq!(durations(&manifest, "FIRST"), [2, 2, 1]);
+    assert_eq!(durations(&manifest, "SECOND"), [10, 3]);
+
+    // Each period's media presents from its start.
+    let secs = Duration::from_secs;
+    let first = manifest.fragments("FIRST").unwrap();
+    assert_eq!(first.span(0), Some(secs(2)..secs(4)));
+    assert_eq!(first.end(), Some(secs(7)));
+    let second = manifest.fragments("SECOND").unwrap();
+    assert_eq!(second.span(0), Some(secs(7)..secs(17)));
+    assert_eq!(second.end(), Some(secs(20)));
 }
 
 #[test]
@@ -659,23 +681,43 @@ fn segment_list_media_ranges_address_one_file() {
         .with_base_url("https://cdn.example/audio/manifest.mpd")
         .unwrap();
     assert_eq!(
-        manifest.fragments("FLAC").unwrap(),
-        Fragments::new(
+        parts(&manifest.fragments("FLAC").unwrap()),
+        (
             ranged("https://cdn.example/audio/track.mp4", 0, 837),
-            [
+            vec![
                 ranged("https://cdn.example/audio/track.mp4", 838, 50_000),
                 ranged("https://cdn.example/audio/track.mp4", 50_001, 90_000),
             ]
         )
     );
-    assert_eq!(
-        manifest.media_timeline("FLAC").unwrap(),
-        MediaTimeline {
-            timescale: 1000,
-            origin: 0,
-            media_durations: vec![4000, 4000],
-        }
-    );
+    assert_eq!(timescale(&manifest, "FLAC"), 1000);
+    assert_eq!(durations(&manifest, "FLAC"), [4000, 4000]);
+}
+
+#[test]
+fn segment_list_presents_from_its_inherited_offset() {
+    let xml = r#"
+        <MPD>
+            <Period>
+                <AdaptationSet mimeType="audio/mp4">
+                    <SegmentList timescale="1000" presentationTimeOffset="500"/>
+                    <Representation id="FLAC" codecs="flac">
+                        <SegmentList>
+                            <Initialization sourceURL="https://cdn.example/init.mp4"/>
+                            <SegmentTimeline><S t="1500" d="2000" r="1"/></SegmentTimeline>
+                            <SegmentURL media="https://cdn.example/1.m4s"/>
+                            <SegmentURL media="https://cdn.example/2.m4s"/>
+                        </SegmentList>
+                    </Representation>
+                </AdaptationSet>
+            </Period>
+        </MPD>
+    "#;
+    let fragments = DashManifest::new(xml).unwrap().fragments("FLAC").unwrap();
+    assert_eq!(fragments.timing().unwrap().presentation_time_offset, 500);
+    let secs = Duration::from_secs;
+    assert_eq!(fragments.span(0), Some(secs(1)..secs(3)));
+    assert_eq!(fragments.span(1), Some(secs(3)..secs(5)));
 }
 
 #[test]
@@ -713,10 +755,7 @@ fn segment_list_inherits_initialization_and_timeline() {
             "https://cdn.example/aac/c.m4s",
         ]
     );
-    assert_eq!(
-        manifest.media_timeline("AACLC").unwrap().media_durations,
-        [200, 200, 50]
-    );
+    assert_eq!(durations(&manifest, "AACLC"), [200, 200, 50]);
 }
 
 #[test]
@@ -749,10 +788,7 @@ fn segment_list_drops_urls_past_the_period() {
             "https://cdn.example/3.m4s",
         ]
     );
-    assert_eq!(
-        manifest.media_timeline("FLAC").unwrap().media_durations,
-        [2, 2, 1]
-    );
+    assert_eq!(durations(&manifest, "FLAC"), [2, 2, 1]);
 }
 
 #[test]
@@ -802,10 +838,10 @@ fn segment_template_falls_back_to_initialization_element() {
     "#;
     let manifest = DashManifest::new(xml).unwrap();
     assert_eq!(
-        manifest.fragments("FLAC").unwrap(),
-        Fragments::new(
+        parts(&manifest.fragments("FLAC").unwrap()),
+        (
             ranged("https://cdn.example/track.mp4", 0, 99),
-            ["https://cdn.example/1.m4s"]
+            vec![Fragment::new("https://cdn.example/1.m4s")]
         )
     );
 }

@@ -61,7 +61,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let video = select(&manifest, args.id.as_deref(), ContentKind::Video)?;
     let audio = select(&manifest, args.audio_id.as_deref(), ContentKind::Audio)?;
     let id = video.id;
-    let total = manifest.media_timeline(id)?.total_duration();
+    let total = manifest.fragments(id)?.end();
     for representation in [&video, &audio] {
         let size = match (representation.width, representation.height) {
             (Some(width), Some(height)) => format!(", {width}x{height}"),

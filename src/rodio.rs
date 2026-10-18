@@ -2,9 +2,11 @@
 
 #[cfg(feature = "encryption")]
 use crate::ContentKeys;
-use crate::fragment::{FragmentStream, Fragments, MediaTimeline};
+use crate::fragment::schedule;
+use crate::fragment::{FragmentStream, Fragments};
 use crate::{BufferHandle, DashManifest, Error, FragmentCache};
 use ::rodio::{Decoder, Source, source::SeekError};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,8 +34,10 @@ use std::time::Duration;
 /// ```
 pub struct DashSource {
     fragments: Fragments,
+    /// Presentation time of the media's start and end. Rodio positions count
+    /// from the start.
+    media: Range<Duration>,
     cache: Arc<FragmentCache>,
-    timeline: MediaTimeline,
     mime_type: String,
     decoder: Decoder<FragmentStream>,
 }
@@ -80,20 +84,20 @@ impl DashSource {
             return Err(Error::RodioProtectedContent(scheme));
         }
         let fragments = manifest.fragments(id)?;
-        let timeline = manifest.media_timeline(id)?;
-        if timeline.timescale == 0 {
-            return Err(Error::Initialization(
-                "rodio playback requires a non-zero DASH timescale".to_owned(),
-            ));
-        }
+        let media = fragments
+            .span(0)
+            .zip(fragments.end())
+            .map(|(first, end)| first.start..end)
+            .ok_or_else(|| {
+                Error::Initialization("rodio playback requires media fragments".to_owned())
+            })?;
         let mime_type = manifest.mime_type(id)?.unwrap_or_default().to_owned();
-        let (decoder, _) =
-            Self::build_decoder(&fragments, &cache, &timeline, &mime_type, Duration::ZERO)?;
+        let (decoder, _) = Self::build_decoder(&fragments, &cache, &mime_type, media.start)?;
 
         Ok(Self {
             fragments,
+            media,
             cache,
-            timeline,
             mime_type,
             decoder,
         })
@@ -104,28 +108,25 @@ impl DashSource {
     /// Get it before handing the source to rodio; it stays usable from any
     /// thread afterwards. Plays no part in playback.
     pub fn buffer(&self) -> BufferHandle {
-        let media = self
-            .fragments
-            .media
-            .iter()
-            .map(|fragment| self.cache.data(fragment.clone()))
+        // Manifest fragments are timed, so every one has a span.
+        let first = self.fragments.numbers().start;
+        let media = schedule::media_from(&self.fragments, first)
+            .filter_map(|(fragment, span)| Some((self.cache.data(fragment.clone()), span?)))
             .collect();
-        BufferHandle::new(&self.cache.store, media, self.timeline.spans())
+        BufferHandle::new(&self.cache.store, media)
     }
 
-    /// A decoder from the media fragment covering `time`, and that
-    /// fragment's start.
+    /// A decoder from the media fragment covering presentation time `time`,
+    /// and that fragment's start.
     fn build_decoder(
         fragments: &Fragments,
         cache: &Arc<FragmentCache>,
-        timeline: &MediaTimeline,
         mime_type: &str,
         time: Duration,
     ) -> Result<(Decoder<FragmentStream>, Duration), Error> {
         // The decoder is unseekable and seeks rebuild by timeline, so byte
         // sizes from eager HEADs would go unused.
-        let (reader, start) =
-            FragmentStream::starting_at(fragments.clone(), timeline.clone(), time, cache.clone())?;
+        let (reader, start) = FragmentStream::starting_at(fragments.clone(), time, cache.clone())?;
 
         let decoder = Decoder::builder()
             .with_data(reader)
@@ -135,7 +136,7 @@ impl DashSource {
     }
 
     fn total_duration_value(&self) -> Duration {
-        self.timeline.total_duration().unwrap_or_default()
+        self.media.end - self.media.start
     }
 }
 
@@ -170,15 +171,10 @@ impl Source for DashSource {
 
     fn try_seek(&mut self, requested: Duration) -> Result<(), SeekError> {
         // Past the end, play from the end of the last fragment.
-        let target = requested.min(self.total_duration_value());
-        let (mut decoder, fragment_start) = Self::build_decoder(
-            &self.fragments,
-            &self.cache,
-            &self.timeline,
-            &self.mime_type,
-            target,
-        )
-        .map_err(|error| SeekError::Other(Arc::new(error)))?;
+        let target = self.media.start + requested.min(self.total_duration_value());
+        let (mut decoder, fragment_start) =
+            Self::build_decoder(&self.fragments, &self.cache, &self.mime_type, target)
+                .map_err(|error| SeekError::Other(Arc::new(error)))?;
 
         let frames_to_skip = target
             .saturating_sub(fragment_start)
@@ -196,7 +192,7 @@ impl Source for DashSource {
             if decoder.next().is_none() {
                 return Err(SeekError::Other(Arc::new(Error::Initialization(format!(
                     "decoder ended before requested seek position {}s",
-                    target.as_secs_f64()
+                    requested.as_secs_f64()
                 )))));
             }
         }

@@ -38,7 +38,7 @@ pub struct BufferStatus {
     pub total: BufferTotal,
     /// Media currently present in the cache, including non-contiguous ranges.
     pub downloaded: BufferAmount,
-    /// Cached ranges on the representation's media timeline.
+    /// Cached ranges of the representation, in presentation time.
     /// Ranges are ordered, non-overlapping, and merge adjacent downloaded segments.
     pub ranges: Vec<Range<Duration>>,
 }
@@ -62,16 +62,19 @@ pub struct BufferTotal {
     /// Combined byte length of all media segments, excluding initialization.
     /// `None` until every segment's size is known from a byte range, HEAD, or download.
     pub bytes: Option<u64>,
-    /// Total duration of the representation's media timeline.
-    pub time: Duration,
+    /// Presentation time at which the representation's first media segment starts.
+    pub start: Duration,
+    /// Presentation time at which the representation's last media segment ends.
+    pub end: Duration,
 }
 
 impl BufferStatus {
-    /// Media time up to which playback can continue from `position` without
-    /// waiting on the network: the end of the downloaded range holding
-    /// `position`, else `position` itself.
+    /// Presentation time up to which playback can continue from `position`
+    /// without waiting on the network: the end of the downloaded range holding
+    /// `position`, else `position` itself. A `position` outside the
+    /// representation's media is first moved to its nearer end.
     pub fn buffered_until(&self, position: Duration) -> Duration {
-        let position = position.min(self.total.time);
+        let position = position.clamp(self.total.start, self.total.end);
         self.ranges
             .iter()
             .find(|range| range.contains(&position))
@@ -91,7 +94,7 @@ impl BufferStatus {
     /// let secs = Duration::from_secs;
     /// // Ten-second streams buffered from the start to `buffered` seconds.
     /// let buffered_to = |buffered| BufferStatus {
-    ///     total: BufferTotal { fragments: 5, bytes: None, time: secs(10) },
+    ///     total: BufferTotal { fragments: 5, bytes: None, start: secs(0), end: secs(10) },
     ///     downloaded: BufferAmount::default(),
     ///     ranges: vec![secs(0)..secs(buffered)],
     /// };
@@ -106,9 +109,9 @@ impl BufferStatus {
         let mut latest_end: Option<Duration> = None;
         for status in statuses {
             let until = status.buffered_until(position);
-            latest_end = latest_end.max(Some(status.total.time));
+            latest_end = latest_end.max(Some(status.total.end));
             // Buffered to its end, a stream has nothing left to wait for.
-            if until < status.total.time {
+            if until < status.total.end {
                 limit = Some(limit.map_or(until, |limit| limit.min(until)));
             }
         }
@@ -119,10 +122,8 @@ impl BufferStatus {
     ///
     /// The result is clamped to `0.0..=100.0`; an empty stream reports `100.0`.
     pub fn buffered_percent(&self, position: Duration) -> f64 {
-        percent(
-            self.buffered_until(position).as_secs_f64(),
-            self.total.time.as_secs_f64(),
-        )
+        let until = self.buffered_until(position) - self.total.start;
+        percent(until.as_secs_f64(), self.total_time().as_secs_f64())
     }
 
     /// Returns the percentage of media time cached anywhere in the stream.
@@ -133,7 +134,7 @@ impl BufferStatus {
     pub fn downloaded_percent(&self) -> f64 {
         percent(
             self.downloaded.time.as_secs_f64(),
-            self.total.time.as_secs_f64(),
+            self.total_time().as_secs_f64(),
         )
     }
 
@@ -151,21 +152,26 @@ impl BufferStatus {
         self.downloaded.fragments == self.total.fragments
     }
 
-    /// Measures `media` fragments, each spanning the same-index entry of
-    /// `spans`.
-    fn measure(media: &[Arc<FragmentData>], spans: &[Range<Duration>]) -> Self {
+    /// The duration of the representation's media, from its start to its end.
+    fn total_time(&self) -> Duration {
+        self.total.end.saturating_sub(self.total.start)
+    }
+
+    /// Measures media fragments, each with the presentation time it spans.
+    fn measure(media: &[(Arc<FragmentData>, Range<Duration>)]) -> Self {
         let mut status = Self {
             total: BufferTotal {
                 fragments: media.len(),
                 bytes: Some(0),
-                time: spans.last().map_or(Duration::ZERO, |span| span.end),
+                start: media.first().map_or(Duration::ZERO, |(_, span)| span.start),
+                end: media.last().map_or(Duration::ZERO, |(_, span)| span.end),
             },
             downloaded: BufferAmount::default(),
             ranges: Vec::new(),
         };
 
         let mut previous_downloaded = false;
-        for (data, span) in media.iter().zip(spans) {
+        for (data, span) in media {
             status.total.bytes = status
                 .total
                 .bytes
@@ -208,27 +214,17 @@ pub struct BufferHandle(Arc<BufferShared>);
 type ChangeCallback = dyn Fn(&BufferStatus) + Send + Sync;
 
 struct BufferShared {
-    media: Vec<Arc<FragmentData>>,
-    /// Media time spanned by each of `media`.
-    spans: Vec<Range<Duration>>,
+    /// Media fragments, each with the presentation time it spans.
+    media: Vec<(Arc<FragmentData>, Range<Duration>)>,
     callbacks: Mutex<Vec<Arc<ChangeCallback>>>,
 }
 
 impl BufferHandle {
-    /// Tracks `media` fragments of `cache`, each spanning the same-index
-    /// entry of `spans`.
-    pub(crate) fn new(
-        cache: &Store,
-        media: Vec<Arc<FragmentData>>,
-        mut spans: Vec<Range<Duration>>,
-    ) -> Self {
-        // Fragments the timeline lacks take no time, at its end.
-        let end = spans.last().map_or(Duration::ZERO, |span| span.end);
-        spans.resize(media.len(), end..end);
-
+    /// Tracks media fragments of `cache`, each with the presentation time it
+    /// spans.
+    pub(crate) fn new(cache: &Store, media: Vec<(Arc<FragmentData>, Range<Duration>)>) -> Self {
         let shared = Arc::new(BufferShared {
             media,
-            spans,
             callbacks: Mutex::default(),
         });
         // Held weakly, so the subscription lasts as long as a handle does.
@@ -265,7 +261,7 @@ impl BufferHandle {
 
 impl BufferShared {
     fn status(&self) -> BufferStatus {
-        BufferStatus::measure(&self.media, &self.spans)
+        BufferStatus::measure(&self.media)
     }
 
     fn changed(&self) {
@@ -286,7 +282,11 @@ impl BufferShared {
 
 impl CacheListener for BufferShared {
     fn fragment_changed(&self, data: &FragmentData) {
-        if self.media.iter().any(|media| std::ptr::eq(&**media, data)) {
+        if self
+            .media
+            .iter()
+            .any(|(media, _)| std::ptr::eq(&**media, data))
+        {
             self.changed();
         }
     }
@@ -301,33 +301,37 @@ impl fmt::Debug for BufferHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fragment::{Fragment, MediaTimeline};
+    use crate::fragment::Fragment;
 
-    /// Three two-second fragments.
-    fn spans() -> Vec<Range<Duration>> {
-        MediaTimeline {
-            timescale: 10,
-            origin: 0,
-            media_durations: vec![20, 20, 20],
-        }
-        .spans()
-    }
+    type Media = Vec<(Arc<FragmentData>, Range<Duration>)>;
 
-    fn media(fragments: [Fragment; 3], bodies: [Option<usize>; 3]) -> Vec<Arc<FragmentData>> {
+    /// Two-second fragments from `start` seconds, with bodies of `bodies` bytes.
+    fn media_from<const N: usize>(
+        start: u64,
+        fragments: [Fragment; N],
+        bodies: [Option<usize>; N],
+    ) -> Media {
         fragments
             .into_iter()
             .zip(bodies)
-            .map(|(fragment, body)| {
+            .enumerate()
+            .map(|(index, (fragment, body))| {
                 let data = FragmentData::new(fragment);
                 if let Some(len) = body {
                     data.set_body(&vec![0; len]);
                 }
-                Arc::new(data)
+                let begin = Duration::from_secs(start + 2 * index as u64);
+                (Arc::new(data), begin..begin + Duration::from_secs(2))
             })
             .collect()
     }
 
-    fn unranged(bodies: [Option<usize>; 3]) -> Vec<Arc<FragmentData>> {
+    /// Three two-second fragments from time zero.
+    fn media(fragments: [Fragment; 3], bodies: [Option<usize>; 3]) -> Media {
+        media_from(0, fragments, bodies)
+    }
+
+    fn unranged(bodies: [Option<usize>; 3]) -> Media {
         media(["a".into(), "b".into(), "c".into()], bodies)
     }
 
@@ -337,10 +341,11 @@ mod tests {
 
     #[test]
     fn nothing_downloaded_buffers_nothing() {
-        let status = BufferStatus::measure(&unranged([None; 3]), &spans());
+        let status = BufferStatus::measure(&unranged([None; 3]));
         assert_eq!(status.total.fragments, 3);
         assert_eq!(status.total.bytes, None);
-        assert_eq!(status.total.time, secs(6.0));
+        assert_eq!(status.total.start, secs(0.0));
+        assert_eq!(status.total.end, secs(6.0));
         assert_eq!(status.downloaded, BufferAmount::default());
         assert!(status.ranges.is_empty());
         assert_eq!(status.buffered_until(secs(3.0)), secs(3.0));
@@ -351,7 +356,7 @@ mod tests {
 
     #[test]
     fn buffered_until_runs_to_the_end_of_the_range_holding_the_position() {
-        let status = BufferStatus::measure(&unranged([Some(100), None, Some(300)]), &spans());
+        let status = BufferStatus::measure(&unranged([Some(100), None, Some(300)]));
         assert_eq!(
             status.downloaded,
             BufferAmount {
@@ -375,7 +380,7 @@ mod tests {
 
     #[test]
     fn adjacent_fragments_merge_into_one_range() {
-        let status = BufferStatus::measure(&unranged([Some(10), Some(10), Some(10)]), &spans());
+        let status = BufferStatus::measure(&unranged([Some(10), Some(10), Some(10)]));
         assert_eq!(status.ranges, [secs(0.0)..secs(6.0)]);
         assert_eq!(status.buffered_until(Duration::ZERO), secs(6.0));
         assert_eq!(status.total.bytes, Some(30));
@@ -393,22 +398,42 @@ mod tests {
             ],
             [Some(100), None, None],
         );
-        let status = BufferStatus::measure(&media, &spans());
+        let status = BufferStatus::measure(&media);
         assert_eq!(status.total.bytes, Some(500));
         assert_eq!(status.downloaded_bytes_percent(), Some(20.0));
     }
 
     #[test]
     fn position_past_the_end_is_clamped() {
-        let status = BufferStatus::measure(&unranged([None; 3]), &spans());
+        let status = BufferStatus::measure(&unranged([None; 3]));
         assert_eq!(status.buffered_until(secs(60.0)), secs(6.0));
         assert_eq!(status.buffered_percent(secs(60.0)), 100.0);
     }
 
     #[test]
+    fn media_starting_after_zero_measures_from_its_start() {
+        // Three two-second fragments from 10 seconds, the first downloaded.
+        let media = media_from(
+            10,
+            ["a".into(), "b".into(), "c".into()],
+            [Some(1), None, None],
+        );
+        let status = BufferStatus::measure(&media);
+        assert_eq!(
+            (status.total.start, status.total.end),
+            (secs(10.0), secs(16.0))
+        );
+        assert_eq!(status.ranges, [secs(10.0)..secs(12.0)]);
+        assert!((status.buffered_percent(secs(11.0)) - 100.0 / 3.0).abs() < 1e-9);
+        assert!((status.downloaded_percent() - 100.0 / 3.0).abs() < 1e-9);
+        // Before the media, the position moves to its start.
+        assert_eq!(status.buffered_until(secs(1.0)), secs(12.0));
+    }
+
+    #[test]
     fn buffered_until_all_waits_on_the_least_buffered_stream() {
-        let video = BufferStatus::measure(&unranged([Some(1), Some(1), None]), &spans());
-        let audio = BufferStatus::measure(&unranged([Some(1), None, None]), &spans());
+        let video = BufferStatus::measure(&unranged([Some(1), Some(1), None]));
+        let audio = BufferStatus::measure(&unranged([Some(1), None, None]));
         let until = |statuses: &[&BufferStatus], position| {
             BufferStatus::buffered_until_all(statuses.iter().copied(), position)
         };
@@ -422,14 +447,8 @@ mod tests {
     #[test]
     fn buffered_until_all_ignores_streams_buffered_to_their_end() {
         // Audio ends at 4 seconds and is fully buffered; video runs to 6.
-        let short = MediaTimeline {
-            timescale: 10,
-            origin: 0,
-            media_durations: vec![20, 20],
-        }
-        .spans();
-        let audio = BufferStatus::measure(&unranged([Some(1), Some(1), None])[..2], &short);
-        let video = BufferStatus::measure(&unranged([Some(1), Some(1), None]), &spans());
+        let audio = BufferStatus::measure(&unranged([Some(1), Some(1), None])[..2]);
+        let video = BufferStatus::measure(&unranged([Some(1), Some(1), None]));
         assert_eq!(
             BufferStatus::buffered_until_all([&audio, &video], secs(4.5)),
             secs(4.5)
@@ -440,7 +459,7 @@ mod tests {
         );
 
         // Everything buffered to its end: the latest end.
-        let complete = BufferStatus::measure(&unranged([Some(1); 3]), &spans());
+        let complete = BufferStatus::measure(&unranged([Some(1); 3]));
         assert_eq!(
             BufferStatus::buffered_until_all([&audio, &complete], secs(1.0)),
             secs(6.0)

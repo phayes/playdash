@@ -394,7 +394,7 @@ fn adts_puts_a_header_on_every_aac_access_unit() {
 #[test]
 fn both_tracks_of_a_muxed_representation_convert() {
     let cache = Arc::new(FragmentCache::new(Arc::new(Fixtures::default())));
-    let stream = || FragmentStream::new_with_cache(muxed(), None, cache.clone()).unwrap();
+    let stream = || FragmentStream::new_with_cache(muxed(), cache.clone()).unwrap();
     for (track, format) in [(1, DecoderFormat::H264AnnexB), (2, DecoderFormat::AacRaw)] {
         let converted = PacketStream::with_track(stream(), track)
             .unwrap()
@@ -639,7 +639,7 @@ fn the_manifest_builder_sets_the_preroll() {
 fn the_manifest_builder_reads_a_muxed_track_by_kind_or_id() {
     let cache = fixtures_cache();
     let track_stream = |track| {
-        let fragments = FragmentStream::new_with_cache(muxed(), None, cache.clone()).unwrap();
+        let fragments = FragmentStream::new_with_cache(muxed(), cache.clone()).unwrap();
         PacketStream::with_track(fragments, track)
             .unwrap()
             .into_media_stream()

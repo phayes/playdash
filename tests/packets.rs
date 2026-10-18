@@ -434,8 +434,8 @@ fn muxed_tracks_are_listed_and_read_one_stream_each() {
     let transport = Arc::new(Fixtures::default());
     let cache = Arc::new(FragmentCache::new(transport.clone()));
     let fragments = muxed();
-    let media = fragments.media.len();
-    let stream = || FragmentStream::new_with_cache(fragments.clone(), None, cache.clone()).unwrap();
+    let media = fragments.media_len();
+    let stream = || FragmentStream::new_with_cache(fragments.clone(), cache.clone()).unwrap();
 
     // The tracks, read from the initialization fragment the stream already holds.
     let video_stream = stream();
@@ -498,7 +498,7 @@ fn decrypted_packets_are_the_plain_packets() {
 
     let url = format!("{BASE}encryption/plain.mp4");
     let fragments = split_fragments(&url, &fixture("encryption/plain.mp4"));
-    let plain = data(FragmentStream::new_with_cache(fragments, None, cache()).unwrap());
+    let plain = data(FragmentStream::new_with_cache(fragments, cache()).unwrap());
     assert!(plain.len() > 10);
 
     for name in ["shaka_cenc", "shaka_cbcs"] {
@@ -516,7 +516,7 @@ fn decrypted_packets_are_the_plain_packets() {
     let url = format!("{BASE}encryption/ffmpeg_cenc.mp4");
     let fragments = split_fragments(&url, &fixture("encryption/ffmpeg_cenc.mp4"));
     assert_eq!(
-        data(FragmentStream::new_with_cache(fragments, None, cache()).unwrap()),
+        data(FragmentStream::new_with_cache(fragments, cache()).unwrap()),
         plain,
         "ffmpeg_cenc"
     );
@@ -580,10 +580,9 @@ mod nonblocking {
             Fixtures::default(),
         )));
         let stream =
-            || nonblocking::fragment::FragmentStream::new_with_cache(muxed(), None, cache.clone());
+            || nonblocking::fragment::FragmentStream::new_with_cache(muxed(), cache.clone());
         let blocking = FragmentStream::new_with_cache(
             muxed(),
-            None,
             Arc::new(FragmentCache::new(Arc::new(Fixtures::default()))),
         )
         .unwrap();

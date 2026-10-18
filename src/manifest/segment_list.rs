@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use crate::vendor::dash_mpd_core::{SegmentList, SegmentURL};
 
-use super::segments::{Addressing, Segments, Timing, initialization_fragment};
+use super::segments::{Addressing, SegmentUrls, Segments, Timing, initialization_fragment};
 use crate::error::Error;
-use crate::fragment::{Fragment, Fragments, parse_byte_range};
+use crate::fragment::{Fragment, parse_byte_range};
 
 /// `SegmentList` elements a representation inherits from, most specific first
 /// (Representation, AdaptationSet, Period).
@@ -53,7 +53,7 @@ impl<'a> ListChain<'a> {
             timescale: self.get(|list| list.timescale),
             start_number: None,
             end_number: Some(count),
-            presentation_time_offset: None,
+            presentation_time_offset: self.get(|list| list.presentationTimeOffset),
             // Timeline and @duration are exclusive; the most specific level that sets either wins.
             addressing: self.lists().find_map(|list| {
                 list.SegmentTimeline
@@ -78,7 +78,7 @@ impl<'a> ListChain<'a> {
 
     /// Initialization fragment and one media fragment per timed segment, with
     /// unresolved URLs. A missing `@media` means the BaseURL itself.
-    pub fn fragments(self, segments: &Segments) -> Result<Fragments, Error> {
+    pub fn fragments(self, segments: &Segments) -> Result<SegmentUrls, Error> {
         let initialization = self
             .get(|list| list.Initialization.as_ref())
             .ok_or(Error::DashManifestMissingUrls)?;
@@ -99,6 +99,6 @@ impl<'a> ListChain<'a> {
                 })
             })
             .collect::<Result<_, Error>>()?;
-        Ok(Fragments { init, media })
+        Ok(SegmentUrls { init, media })
     }
 }

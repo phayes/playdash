@@ -299,10 +299,10 @@ impl Store {
     /// cleared body of `init`. Fails before any media GET if a protected
     /// track's KID has no key.
     #[cfg(feature = "encryption")]
-    pub(crate) fn assign_media_roles(
+    pub(crate) fn assign_media_roles<'a>(
         &self,
         init: &FragmentData,
-        media: &[Arc<FragmentData>],
+        media: impl IntoIterator<Item = &'a FragmentData>,
     ) -> Result<(), Error> {
         let Some(keys) = self.keys() else {
             return Ok(());

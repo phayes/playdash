@@ -4,11 +4,10 @@ use super::{FragmentCache, Transport};
 use crate::error::Error;
 use crate::fragment::buffer::BufferHandle;
 use crate::fragment::schedule::{
-    self, Cursor, Part, PartBody, Position, Retention, Schedule, StreamTimeline, TimeAccuracy,
-    WindowChange,
+    self, Cursor, Part, PartBody, Position, Retention, Schedule, TimeAccuracy, WindowChange,
 };
 use crate::fragment::store::FragmentData;
-use crate::fragment::{Fragments, MediaTimeline};
+use crate::fragment::{Fragments, SegmentNumber};
 use crate::mp4::track::{self, Track};
 use bytes::Bytes;
 use futures_util::Stream;
@@ -90,7 +89,9 @@ type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + 
 pub struct FragmentStream {
     shared: Arc<StreamShared>,
     cursor: Cursor,
-    timeline: Option<Arc<StreamTimeline>>,
+    /// The representation's whole fragments, of which the stream reads those
+    /// from its schedule's first media segment on.
+    fragments: Arc<Fragments>,
     /// Estimated stream length. When set, [`SeekFrom::End`]`(0)` may report it
     /// instead of waiting for every fragment size.
     length_estimate: Option<u64>,
@@ -124,32 +125,29 @@ impl FragmentStream {
     /// [`reqwest::Client`]. The initialization fragment is fetched before
     /// this returns. Must run on a tokio runtime.
     ///
-    /// `timeline`, when given, must have one duration per media fragment.
     /// Call [`Self::start_eager_head`] to discover unknown fragment sizes in
     /// the background for faster byte seeking.
-    pub async fn new(fragments: Fragments, timeline: Option<MediaTimeline>) -> Result<Self, Error> {
-        Self::new_with_cache(fragments, timeline, Arc::default()).await
+    pub async fn new(fragments: Fragments) -> Result<Self, Error> {
+        Self::new_with_cache(fragments, Arc::default()).await
     }
 
     /// Like [`Self::new`], but fetches through `transport` with a new
     /// [`FragmentCache`] dedicated to this stream.
     pub async fn new_with_transport(
         fragments: Fragments,
-        timeline: Option<MediaTimeline>,
         transport: Arc<dyn Transport>,
     ) -> Result<Self, Error> {
         let cache = FragmentCache::new(transport);
-        Self::new_with_cache(fragments, timeline, Arc::new(cache)).await
+        Self::new_with_cache(fragments, Arc::new(cache)).await
     }
 
     /// Like [`Self::new`], but reuses data from `cache`.
     pub async fn new_with_cache(
         fragments: Fragments,
-        timeline: Option<MediaTimeline>,
         cache: Arc<FragmentCache>,
     ) -> Result<Self, Error> {
-        let timeline = timeline.map(|timeline| StreamTimeline::new(timeline, 0));
-        Self::open(fragments, timeline, cache).await
+        let first = fragments.numbers().start;
+        Self::open(Arc::new(fragments), first, cache).await
     }
 
     /// Creates a stream that reads the initialization fragment of
@@ -158,49 +156,44 @@ impl FragmentStream {
     /// or before `time`. The initialization fragment is fetched before this
     /// returns. Must run on a tokio runtime.
     ///
-    /// The stream reports and seeks by `timeline`'s media time, as a stream
-    /// of every fragment would; seeking to a time before its start fails. A
-    /// `time` at or past the end starts at the last media fragment.
-    /// `timeline` must have one duration per media fragment.
+    /// The stream reports and seeks by the presentation time of `fragments`,
+    /// as a stream of every fragment would; seeking to a time before its start
+    /// fails. A `time` before the first media fragment starts at the first,
+    /// and a `time` at or past the end starts at the last.
     ///
-    /// Fails with [`Error::Initialization`] if `timeline` has no media
-    /// durations or a zero timescale, or there are fewer media fragments than
-    /// the timeline puts before `time`.
+    /// Fails with [`Error::Initialization`] if `fragments` are untimed or have
+    /// no media fragments.
     pub async fn starting_at(
         fragments: Fragments,
-        timeline: MediaTimeline,
         time: Duration,
         cache: Arc<FragmentCache>,
     ) -> Result<(Self, Duration), Error> {
-        let (fragments, timeline, start) = schedule::start_at(fragments, timeline, time)?;
-        Ok((Self::open(fragments, Some(timeline), cache).await?, start))
+        let (first, start) = schedule::start_at(&fragments, time)?;
+        Ok((Self::open(Arc::new(fragments), first, cache).await?, start))
     }
 
-    /// A stream of `fragments`, timed by `timeline`, fetching through `cache`.
+    /// A stream of `fragments` from the media segment numbered `first`,
+    /// fetching through `cache`.
     async fn open(
-        fragments: Fragments,
-        timeline: Option<StreamTimeline>,
+        fragments: Arc<Fragments>,
+        first: SegmentNumber,
         cache: Arc<FragmentCache>,
     ) -> Result<Self, Error> {
         // Fetch the initialization fragment, which tells how to decrypt the media.
-        let init = cache.data(fragments.init);
-        let media: Vec<_> = fragments
-            .media
-            .into_iter()
-            .map(|fragment| cache.data(fragment))
+        let init = cache.data(fragments.init().clone());
+        let media: Vec<_> = schedule::media_from(&fragments, first)
+            .map(|(fragment, span)| (cache.data(fragment.clone()), span))
             .collect();
         #[cfg(feature = "encryption")]
         cache.store.assign_init_role(&init);
         cache.get(&init).await?;
         #[cfg(feature = "encryption")]
-        cache.store.assign_media_roles(&init, &media)?;
+        cache
+            .store
+            .assign_media_roles(&init, media.iter().map(|(data, _)| &**data))?;
 
         // Keep everything until a retention says otherwise.
-        let spans = timeline
-            .as_ref()
-            .map(StreamTimeline::spans)
-            .unwrap_or_default();
-        let schedule = Schedule::new(init, media, spans);
+        let schedule = Schedule::new(init, first, media);
         cache.store.acquire(&schedule.kept());
         let shared = Arc::new(StreamShared {
             schedule: Mutex::new(schedule),
@@ -215,9 +208,8 @@ impl FragmentStream {
 
         Ok(Self {
             shared,
-            cursor: Cursor::start(),
-            timeline: timeline.map(Arc::new),
-
+            cursor: Cursor::start(first),
+            fragments,
             length_estimate: None,
             failed: false,
             seeking: None,
@@ -237,7 +229,7 @@ impl FragmentStream {
     /// stream's position or retention window.
     ///
     /// `index` counts the representation's media fragments, as
-    /// [`MediaTimeline::fragment_at`] does, also for a stream from
+    /// [`Fragments::segment_at`] does, also for a stream from
     /// [`Self::starting_at`]. A fragment outside the retention window is not
     /// kept once returned, unless another stream sharing the cache keeps it.
     ///
@@ -245,7 +237,10 @@ impl FragmentStream {
     /// first or past its last, and with the download's error if it fails. A
     /// failed fetch does not end the stream.
     pub async fn media_fragment(&self, index: usize) -> Result<Bytes, Error> {
-        Ok(self.media_part_body(index).await?.body)
+        Ok(self
+            .media_part_body(SegmentNumber(index as u64))
+            .await?
+            .body)
     }
 
     /// The tracks of the representation's initialization fragment, as a
@@ -264,17 +259,13 @@ impl FragmentStream {
     }
 
     /// [`Self::media_fragment`], with where the fragment sits.
-    pub(crate) async fn media_part_body(&self, index: usize) -> Result<PartBody, Error> {
-        let (part, data) = {
-            let part = schedule::media_part(self.timeline.as_deref(), index);
-            let schedule = self.shared.lock();
-            part.and_then(|part| Some((part, schedule.fragment(part)?.clone())))
-                .ok_or_else(|| {
-                    Error::Initialization(format!(
-                        "MPEG stream has no media fragment {index} of its representation"
-                    ))
-                })?
-        };
+    pub(crate) async fn media_part_body(&self, number: SegmentNumber) -> Result<PartBody, Error> {
+        let part = Part::Media(number);
+        let data = self.shared.lock().fragment(part).cloned().ok_or_else(|| {
+            Error::Initialization(format!(
+                "MPEG stream has no media fragment {number} of its representation"
+            ))
+        })?;
 
         // Fetch in this task; the stream's own downloads carry on meanwhile.
         let body = self.shared.cache.get(&data).await?;
@@ -289,18 +280,18 @@ impl FragmentStream {
         self.shared.changed();
         Ok(PartBody {
             part,
-            index: Some(index),
+            number: Some(number),
             fragment: data.fragment.clone(),
             body,
         })
     }
 
     /// A handle reporting how much of this stream's media its cache holds.
-    /// `None` if the stream has no timeline.
+    /// `None` if the stream's fragments are untimed.
     pub fn buffer(&self) -> Option<BufferHandle> {
-        let spans = self.timeline.as_deref()?.spans();
-        let media = self.shared.lock().media.clone();
-        Some(BufferHandle::new(&self.shared.cache.store, media, spans))
+        self.fragments.timing()?;
+        let media = self.shared.lock().timed_media()?;
+        Some(BufferHandle::new(&self.shared.cache.store, media))
     }
 
     /// Starts background HEAD prefetch of unknown fragment sizes.
@@ -337,14 +328,18 @@ impl FragmentStream {
     /// Once all sizes are known, the exact length is returned. Other
     /// [`SeekFrom::End`] offsets always wait for exact sizes.
     ///
-    /// Requires a [`MediaTimeline`] and a non-zero bitrate.
+    /// Fails with [`Error::Initialization`] if the stream's fragments are
+    /// untimed or have no media, or `bitrate_bps` is zero.
     pub fn set_symphonia_compat(&mut self, enabled: bool, bitrate_bps: u32) -> Result<(), Error> {
         if !enabled {
             self.length_estimate = None;
             return Ok(());
         }
-        let init_len = self.shared.lock().init.size().unwrap_or(0);
-        let estimate = schedule::compat_estimate(self.timeline.as_deref(), init_len, bitrate_bps)?;
+        let (init_len, first) = {
+            let schedule = self.shared.lock();
+            (schedule.init.size().unwrap_or(0), schedule.first())
+        };
+        let estimate = schedule::compat_estimate(&self.fragments, first, init_len, bitrate_bps)?;
         self.length_estimate = Some(estimate);
         Ok(())
     }
@@ -358,13 +353,13 @@ impl FragmentStream {
     ///
     /// The returned byte offset is exact, except [`SeekFrom::End`]`(0)` under
     /// [`Self::set_symphonia_compat`], which may report an oversized estimate.
-    /// When a timeline is available, the returned time is [`TimeAccuracy::Packet`]
-    /// at a fragment boundary, and otherwise the containing fragment's start as
+    /// For timed fragments, the returned time is [`TimeAccuracy::Packet`] at a
+    /// fragment boundary, and otherwise the containing fragment's start as
     /// [`TimeAccuracy::Fragment`].
     pub async fn seek_bytes(&mut self, from: SeekFrom) -> io::Result<Position> {
         let seek = seek_bytes(
             self.shared.clone(),
-            self.timeline.clone(),
+            self.fragments.clone(),
             self.cursor,
             self.length_estimate,
             from,
@@ -374,11 +369,11 @@ impl FragmentStream {
         Ok(position)
     }
 
-    /// Seeks to the start of the media fragment containing `time`, using the
-    /// DASH `SegmentTimeline`.
+    /// Seeks to the start of the media fragment containing presentation time
+    /// `time`.
     ///
-    /// Time `0` is the start of the first media fragment, after the
-    /// initialization segment. The seek lands at byte `0` of the fragment
+    /// A `time` before the first media fragment lands on the first. The seek
+    /// lands at byte `0` of the fragment
     /// containing `time`, so an fMP4 consumer receives the fragment's `moof`
     /// rather than an arbitrary position inside `mdat`. The target fragment is
     /// prioritized and loaded before this returns.
@@ -391,7 +386,7 @@ impl FragmentStream {
     /// size is known.
     pub async fn seek_time(&mut self, time: Duration) -> io::Result<Position> {
         let (cursor, position) =
-            seek_time(self.shared.clone(), self.timeline.clone(), time).await?;
+            seek_time(self.shared.clone(), self.fragments.clone(), time).await?;
         self.cursor = cursor;
         Ok(position)
     }
@@ -569,6 +564,8 @@ async fn probe_task(shared: Arc<StreamShared>) {
             next
         };
         let Some((part, data)) = next else {
+            // Wake anyone waiting for this task to stop.
+            shared.changed();
             return;
         };
         // After a failure, `next_head` is `None` and the task ends.
@@ -618,7 +615,7 @@ async fn ensure_sizes(
 /// [`AsyncSeek`] can keep it while it runs.
 async fn seek_bytes(
     shared: Arc<StreamShared>,
-    timeline: Option<Arc<StreamTimeline>>,
+    fragments: Arc<Fragments>,
     mut cursor: Cursor,
     length_estimate: Option<u64>,
     from: SeekFrom,
@@ -632,7 +629,7 @@ async fn seek_bytes(
     if let Some(len) = reported_end {
         let end = shared.lock().end();
         cursor.place(end, 0, Some(len));
-        let time = schedule::time_at_end(timeline.as_deref());
+        let time = schedule::time_at_end(&fragments);
         return Ok((
             cursor,
             Position {
@@ -660,11 +657,8 @@ async fn seek_bytes(
     cursor.place(part, offset_in_fragment, Some(target));
     shared.publish_cursor(part);
     shared.request(part);
-    let time = schedule::time_at_fragment(
-        timeline.as_deref(),
-        part,
-        schedule::accuracy_at(offset_in_fragment),
-    );
+    let time =
+        schedule::time_at_fragment(&fragments, part, schedule::accuracy_at(offset_in_fragment));
     Ok((
         cursor,
         Position {
@@ -677,10 +671,11 @@ async fn seek_bytes(
 /// [`FragmentStream::seek_time`], on owned state.
 async fn seek_time(
     shared: Arc<StreamShared>,
-    timeline: Option<Arc<StreamTimeline>>,
+    fragments: Arc<Fragments>,
     time: Duration,
 ) -> io::Result<(Cursor, Position)> {
-    let target = Part::Media(schedule::time_target(timeline.as_deref(), time)?);
+    let first = shared.lock().first();
+    let target = Part::Media(schedule::time_target(&fragments, first, time)?);
     let change = {
         let mut schedule = shared.lock();
         if schedule.past_end(target) {
@@ -706,9 +701,9 @@ async fn seek_time(
         ));
     }
 
-    let mut cursor = Cursor::start();
+    let mut cursor = Cursor::start(first);
     cursor.place(target, 0, byte_position);
-    let time = schedule::time_at_fragment(timeline.as_deref(), target, TimeAccuracy::Packet);
+    let time = schedule::time_at_fragment(&fragments, target, TimeAccuracy::Packet);
     Ok((
         cursor,
         Position {
@@ -758,7 +753,7 @@ impl FragmentStream {
             if let Some(body) = rest {
                 return Poll::Ready(Some(Ok(PartBody {
                     part,
-                    index: schedule::representation_index(self.timeline.as_deref(), part),
+                    number: part.number(),
                     fragment,
                     body,
                 })));
@@ -774,14 +769,14 @@ impl FragmentStream {
             && self.seeking.is_none()
     }
 
-    /// The representation's timeline, if the stream has one.
-    pub(crate) fn representation_timeline(&self) -> Option<&MediaTimeline> {
-        self.timeline.as_deref().map(StreamTimeline::timeline)
+    /// The representation's whole fragments.
+    pub(crate) fn representation_fragments(&self) -> &Arc<Fragments> {
+        &self.fragments
     }
 
-    /// Index in the representation of the stream's first media fragment.
-    pub(crate) fn first_index(&self) -> usize {
-        self.timeline.as_deref().map_or(0, StreamTimeline::first)
+    /// Number of the stream's first media segment in its representation.
+    pub(crate) fn first_number(&self) -> SegmentNumber {
+        self.shared.lock().first()
     }
 }
 
@@ -848,7 +843,7 @@ impl AsyncSeek for FragmentStream {
         }
         this.seeking = Some(Box::pin(seek_bytes(
             this.shared.clone(),
-            this.timeline.clone(),
+            this.fragments.clone(),
             this.cursor,
             this.length_estimate,
             position,
@@ -904,7 +899,7 @@ impl fmt::Debug for FragmentStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fragment::Fragment;
+    use crate::fragment::{Fragment, timed_for_test};
     use crate::nonblocking::tests::{Counts, named, serve, texts};
     use futures_util::StreamExt;
     use reqwest::Client;
@@ -914,16 +909,13 @@ mod tests {
     /// The init and five one-second media fragments named "1" to "5" at
     /// `base`, whose bodies are their names.
     async fn one_second_stream(base: &str, cache: Arc<FragmentCache>) -> FragmentStream {
-        let fragments = Fragments::new(
+        let fragments = timed_for_test(
             format!("{base}/init"),
             (1..=5).map(|name| format!("{base}/{name}")),
+            1,
+            &[1; 5],
         );
-        let timeline = MediaTimeline {
-            timescale: 1,
-            origin: 0,
-            media_durations: vec![1; 5],
-        };
-        FragmentStream::new_with_cache(fragments, Some(timeline), cache)
+        FragmentStream::new_with_cache(fragments, cache)
             .await
             .unwrap()
     }
@@ -1028,11 +1020,11 @@ mod tests {
             ranged("/ranged", 0..=3),
             [ranged("/plain", 8..=13), ranged("/ranged", 14..=15)],
         );
-        let mut stream = FragmentStream::new(fragments, None).await.unwrap();
+        let mut stream = FragmentStream::new(fragments).await.unwrap();
         assert_eq!(texts(&mut stream).await, ["INIT", "BBBBBB", "cc"]);
 
         let short = Fragments::new(ranged("/short", 0..=3), Vec::<Fragment>::new());
-        let short = FragmentStream::new(short, None).await;
+        let short = FragmentStream::new(short).await;
         assert!(matches!(
             short,
             Err(Error::FragmentLength {

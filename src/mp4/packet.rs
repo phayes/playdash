@@ -6,9 +6,9 @@ use std::time::Duration;
 
 /// One coded frame of a track, with its timing.
 ///
-/// Timestamps count `timescale` ticks on the same media clock as
-/// [`MediaTimeline`](crate::fragment::MediaTimeline) and `seek_time`: zero is the start of the
-/// representation's first media fragment. Packets come in decode order.
+/// Timestamps count `timescale` ticks of presentation time, the clock of
+/// [`Fragments::span`](crate::fragment::Fragments::span) and `seek_time`, shared by every
+/// representation of a manifest. Packets come in decode order.
 ///
 /// `duration` is the packet's duration as the container records it. Of that, the first
 /// `trim_start` and last `trim_end` ticks are encoder priming and padding to drop from
@@ -21,7 +21,7 @@ pub struct Packet {
     /// It shares memory with its source fragment, which remains allocated with the packet.
     pub data: Bytes,
     /// When decoded output should be presented, in [`Self::timescale`] ticks.
-    /// This can be negative for codec priming before time zero.
+    /// This can be negative for codec priming before presentation time zero.
     pub pts: i64,
     /// When this sample should be decoded, in [`Self::timescale`] ticks.
     /// Packets are yielded in this order.
@@ -40,7 +40,7 @@ pub struct Packet {
 }
 
 impl Packet {
-    /// Converts [`Self::pts`] to a duration from the representation's time zero.
+    /// Converts [`Self::pts`] to presentation time.
     /// Returns `None` for a negative timestamp or zero timescale.
     pub fn presentation_time(&self) -> Option<Duration> {
         ticks_to_duration(self.pts, self.timescale)
@@ -75,13 +75,13 @@ pub struct PacketSeeked {
 }
 
 impl PacketSeeked {
-    /// Converts [`Self::landed`] to a duration from the representation's time zero.
+    /// Converts [`Self::landed`] to presentation time.
     /// Returns `None` for a negative timestamp or zero timescale.
     pub fn landed_time(&self) -> Option<Duration> {
         ticks_to_duration(self.landed, self.timescale)
     }
 
-    /// Converts [`Self::discard_before`] to a duration from time zero.
+    /// Converts [`Self::discard_before`] to presentation time.
     /// Returns `None` for a negative timestamp or zero timescale.
     pub fn discard_before_time(&self) -> Option<Duration> {
         ticks_to_duration(self.discard_before, self.timescale)

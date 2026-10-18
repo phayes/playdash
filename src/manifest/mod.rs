@@ -14,7 +14,7 @@ pub(crate) mod tests;
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::fragment::{Fragment, Fragments, MediaTimeline};
+use crate::fragment::{Fragment, Fragments, MediaSegment, MediaTiming};
 use crate::vendor::dash_mpd_core::{
     AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation as CoreRepresentation,
 };
@@ -60,7 +60,7 @@ use url::Url;
 ///     .with_base_url("https://media.example/stream.mpd")?;
 /// let audio = manifest.representation("audio").unwrap();
 /// assert_eq!(audio.bandwidth, Some(128_000));
-/// assert_eq!(manifest.fragments("audio")?.media.len(), 2);
+/// assert_eq!(manifest.fragments("audio")?.media_len(), 2);
 /// # Ok::<(), playdash::Error>(())
 /// ```
 #[derive(Clone, Default, Debug, PartialEq)]
@@ -215,7 +215,7 @@ impl<'a> Selected<'a> {
         manifest_url: Option<&Url>,
         segments: &Segments,
     ) -> Result<Fragments, Error> {
-        let fragments = if self.uses_segment_list() {
+        let urls = if self.uses_segment_list() {
             self.lists().fragments(segments)?
         } else {
             let values = TemplateValues {
@@ -234,14 +234,28 @@ impl<'a> Selected<'a> {
                 ..fragment
             })
         };
-        Ok(Fragments {
-            init: resolve(fragments.init)?,
-            media: fragments
-                .media
-                .into_iter()
-                .map(resolve)
-                .collect::<Result<_, _>>()?,
-        })
+
+        let init = resolve(urls.init)?;
+
+        // Time each media fragment by its segment, on the Period's clock.
+        let timing = MediaTiming {
+            timescale: segments.timescale,
+            presentation_time_offset: segments.presentation_time_offset,
+            period_start: self.period.start.unwrap_or_default(),
+        };
+        let media = urls
+            .media
+            .into_iter()
+            .zip(&segments.segments)
+            .map(|(fragment, segment)| {
+                Ok(MediaSegment {
+                    fragment: resolve(fragment)?,
+                    start: segment.time,
+                    duration: segment.duration,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Fragments::timed(init, timing, media)
     }
 
     /// Resolves the first `BaseURL` of each level (MPD, Period, AdaptationSet,
@@ -384,42 +398,18 @@ impl DashManifest {
             })
     }
 
-    /// Resolves the initialization segment and ordered media segments for a representation.
+    /// Resolves the initialization segment and the timed media segments of a
+    /// representation.
     ///
     /// This is a lower-level query; use `media_stream` for decoder-ready playback.
     ///
     /// Fragments come from the representation's `SegmentTemplate` or
     /// `SegmentList` (whose entries may carry byte ranges), with URLs resolved
-    /// against the `BaseURL` chain and [`DashManifest::base_url`]. The media
-    /// fragments line up with [`DashManifest::media_timeline`].
+    /// against the `BaseURL` chain and [`DashManifest::base_url`]. Their spans
+    /// are presentation time, shared by every representation of the manifest.
     pub fn fragments(&self, representation_id: impl AsRef<str>) -> Result<Fragments, Error> {
         let (selected, segments) = self.select_segments(representation_id.as_ref())?;
         selected.fragments(self.base_url.as_ref(), &segments)
-    }
-
-    /// Returns the duration and timestamp scale of each media segment.
-    ///
-    /// Entry `n` describes `fragments(representation_id).media[n]`. This is mainly useful
-    /// with the lower-level fragment APIs.
-    pub fn media_timeline(
-        &self,
-        representation_id: impl AsRef<str>,
-    ) -> Result<MediaTimeline, Error> {
-        Ok(self
-            .select_segments(representation_id.as_ref())?
-            .1
-            .media_timeline())
-    }
-
-    /// A representation's fragments and media timeline, from one selection.
-    #[cfg(any(feature = "sync", feature = "async"))]
-    pub(crate) fn stream_parts(
-        &self,
-        representation_id: &str,
-    ) -> Result<(Fragments, MediaTimeline), Error> {
-        let (selected, segments) = self.select_segments(representation_id)?;
-        let fragments = selected.fragments(self.base_url.as_ref(), &segments)?;
-        Ok((fragments, segments.media_timeline()))
     }
 
     /// Returns a representation's MIME type, inherited from its adaptation set.

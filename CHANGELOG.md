@@ -66,8 +66,12 @@
   content keys to a cache that already decrypts, or to one no stream has used yet.
 - `FragmentStream::media_fragment` (blocking and async): fetches any of the stream's media
   fragments without moving its position or retention window.
-- `MediaTimeline::origin`: the media time at the start of the first media fragment, from
-  `S@t`, `@presentationTimeOffset` or a `sidx` earliest presentation time.
+- Timed `Fragments`: `Fragments::timed` builds them from `MediaSegment`s, each a
+  fragment with its start and duration in media ticks, on a `MediaTiming` clock
+  (timescale, `@presentationTimeOffset` and `Period@start`). `DashManifest::fragments`
+  returns timed fragments. `span`, `segment_at`, `end`, `estimate_len`, `timing` and
+  `segments` read them.
+- `Error::InvalidSegmentTiming`, for media segments with a zero duration or that overlap.
 - `Error::MalformedMedia` and `Error::UnsupportedMedia`.
 - `list_packets`, `list_tracks` and `save_flac` examples.
 
@@ -78,9 +82,23 @@
   reports `Packet` even when it lands before the time asked for. Compare the timestamp with
   the requested time to see how far back it landed.
 - `FragmentStream::seek_time_coarse` is now `seek_time` (blocking and async).
-- `MediaTimeline` has a new public field, `origin`.
+- Every reported media time is now presentation time, shared by all representations of
+  a manifest: a media timestamp equal to `@presentationTimeOffset` presents at
+  `Period@start`. This covers fragment spans, stream `Position`s, `seek_time`, the start
+  `fragment_stream_at` returns, `BufferStatus` ranges, and packet timestamps. Times
+  change only for media whose first segment does not start at the offset, such as a
+  `SegmentTimeline` starting late or a `sidx` with a non-zero earliest presentation
+  time, or in a period starting after zero.
+- `MediaTimeline` is removed, with `DashManifest::media_timeline` (blocking and async).
+  Its timing is part of `Fragments`, so `FragmentStream::new`, `new_with_transport`,
+  `new_with_cache` and `starting_at` (blocking and async) no longer take a timeline.
+- `Fragments` fields are private, read with `init()`, `media()` and `media_len()`, and
+  `Fragments` is no longer `Serialize` or `Deserialize`.
+- `BufferTotal::time` is replaced by `start` and `end`, the presentation times the
+  representation's media spans. `BufferStatus` percentages count from `start`.
+- `DashSource` positions count from the start of the representation's media.
 - The crate root now holds the `MediaStream` API and what it takes. Fragment streaming
-  moves to `playdash::fragment`: `Fragment`, `Fragments`, `MediaTimeline`,
+  moves to `playdash::fragment`: `Fragment`, `Fragments`, `MediaSegment`, `MediaTiming`,
   `FragmentStream`, `Position` and `TimePosition`, with `FragmentCache` and `Transport`
   there and at the root. Packets move to `playdash::packet`: `PacketStream`, `Packet`,
   `PacketSeeked` and `Track`.
@@ -95,6 +113,11 @@
 
 - Decryption of a fragment whose `tfhd` gives an explicit base data offset now counts it from
   the start of the file, not of the fragment, as `SegmentBase` byte ranges need.
+- `SegmentList@presentationTimeOffset` and `SegmentBase@presentationTimeOffset` are honoured;
+  they were ignored before. A `SegmentBase` offset counts `SegmentBase@timescale` ticks, even
+  when the `sidx` uses another timescale.
+- A `FragmentStream` with a `Retention` (blocking and async) no longer sometimes downloads a
+  fragment again just after reading past it.
 
 ## [0.2.0] - 2026-10-16
 

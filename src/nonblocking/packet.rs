@@ -91,8 +91,8 @@ impl PacketStream {
                 ));
             }
         };
-        let timeline = fragments.representation_timeline().cloned();
-        let demuxer = Demuxer::new(init.body, &init.fragment, timeline, track_id)?;
+        let representation = fragments.representation_fragments().clone();
+        let demuxer = Demuxer::new(init.body, &init.fragment, Some(representation), track_id)?;
         Ok(Self {
             fragments,
             demuxer,
@@ -168,7 +168,7 @@ impl PacketStream {
     /// Seeks to `time`, landing as `landing` says.
     async fn seek(&mut self, time: Duration, landing: Landing) -> Result<PacketSeeked, Error> {
         let range = self.demuxer.seek_range(time)?;
-        let first = self.fragments.first_index();
+        let first = self.fragments.first_number();
 
         // The fragment containing `time`, where the stream then carries on.
         self.fragments.seek_time(time).await?;
@@ -184,16 +184,18 @@ impl PacketStream {
 
         // Earlier fragments, fetched without moving the stream.
         let mut loaded = Vec::new();
-        for index in (*range.start()).max(first)..*range.end() {
-            let earlier = self.fragments.media_part_body(index).await?;
+        let mut number = (*range.start()).max(first);
+        while number < *range.end() {
+            let earlier = self.fragments.media_part_body(number).await?;
             loaded.push(self.load(earlier)?);
+            number = number.next();
         }
         loaded.push(self.load(target)?);
 
         // Back further until decoding can start, and on until a packet presents at the time.
         let mut at_last = false;
         loop {
-            let earliest = loaded[0].index();
+            let earliest = loaded[0].number();
             let at_first = earliest <= first;
             match self.demuxer.seek(time, landing, &loaded, at_first, at_last) {
                 Split::Done(seeked) => {
@@ -201,7 +203,12 @@ impl PacketStream {
                     return Ok(seeked);
                 }
                 Split::Earlier => {
-                    let earlier = self.fragments.media_part_body(earliest - 1).await?;
+                    let before = earliest.checked_prev().ok_or_else(|| {
+                        Error::Initialization(format!(
+                            "MPEG stream has no media fragment before {earliest}"
+                        ))
+                    })?;
+                    let earlier = self.fragments.media_part_body(before).await?;
                     loaded.insert(0, self.load(earlier)?);
                 }
                 // The stream's next fragment, where it then carries on.
@@ -244,8 +251,8 @@ impl PacketStream {
 
     /// The packets of a media fragment `part`.
     fn load(&mut self, part: PartBody) -> Result<Loaded, Error> {
-        let index = part.index.expect("a media fragment");
-        self.demuxer.load(index, &part.body, &part.fragment)
+        let number = part.number.expect("a media fragment");
+        self.demuxer.load(number, &part.body, &part.fragment)
     }
 }
 

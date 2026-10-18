@@ -90,6 +90,12 @@ pub enum Error {
     #[error("Invalid byte range: {0}")]
     InvalidByteRange(String),
 
+    /// Media segments from a manifest or passed to
+    /// [`Fragments::timed`](crate::fragment::Fragments::timed) had a zero duration, or
+    /// started before the previous segment ended
+    #[error("Invalid segment timing: {0}")]
+    InvalidSegmentTiming(String),
+
     /// A ranged fragment's body did not match the length of its range
     #[error("Fragment {fragment} returned {actual} bytes, expected {expected}")]
     FragmentLength {

@@ -194,8 +194,20 @@ impl<'a> BaseChain<'a> {
             None => return Err(Error::DashManifestMissingUrls),
         };
 
+        // @presentationTimeOffset counts SegmentBase@timescale ticks; the list counts the index's.
+        let base_timescale = self
+            .get(|base| base.timescale)
+            .filter(|&timescale| timescale > 0)
+            .unwrap_or(1);
+        let presentation_time_offset = self.get(|base| base.presentationTimeOffset).map(|offset| {
+            let ticks =
+                u128::from(offset) * u128::from(index.timescale) / u128::from(base_timescale);
+            u64::try_from(ticks).unwrap_or(u64::MAX)
+        });
+
         Ok(SegmentList {
             timescale: Some(u64::from(index.timescale)),
+            presentationTimeOffset: presentation_time_offset,
             Initialization: Some(initialization),
             SegmentTimeline: Some(SegmentTimeline {
                 segments: index
@@ -412,9 +424,10 @@ pub(crate) mod tests {
     #[test]
     #[cfg(feature = "sync")]
     fn segment_base_index_becomes_ranged_fragments() {
-        use crate::fragment::{FragmentCache, Fragments, MediaTimeline};
+        use crate::fragment::FragmentCache;
         use std::io::Read;
         use std::sync::Arc;
+        use std::time::Duration;
 
         let (body, index_range) = segment_base_file();
         let index_start = *parse_range(&index_range).start();
@@ -434,24 +447,30 @@ pub(crate) mod tests {
             [ranged(url, index_start, index_end)]
         );
         // Without an Initialization element, everything before the index is the init.
+        let fragments = manifest.fragments("FLAC").unwrap();
+        assert_eq!(fragments.init(), &ranged(url, 0, 837));
         assert_eq!(
-            manifest.fragments("FLAC").unwrap(),
-            Fragments::new(
-                ranged(url, 0, 837),
-                [
-                    ranged(url, index_end + 1, index_end + 100),
-                    ranged(url, index_end + 101, index_end + 150),
-                ]
-            )
+            fragments.media().cloned().collect::<Vec<_>>(),
+            [
+                ranged(url, index_end + 1, index_end + 100),
+                ranged(url, index_end + 101, index_end + 150),
+            ]
         );
-        assert_eq!(
-            manifest.media_timeline("FLAC").unwrap(),
-            MediaTimeline {
-                timescale: 44_100,
-                origin: 2048,
-                media_durations: vec![4096, 1024],
-            }
-        );
+
+        // Subsegments follow the index's earliest presentation time.
+        let timing = fragments.timing().unwrap();
+        assert_eq!(timing.timescale.get(), 44_100);
+        assert_eq!(timing.presentation_time_offset, 0);
+        let segments: Vec<(u64, u64)> = fragments
+            .segments()
+            .unwrap()
+            .iter()
+            .map(|segment| (segment.start, segment.duration))
+            .collect();
+        assert_eq!(segments, [(2048, 4096), (6144, 1024)]);
+        let ticks = |ticks: u64| Duration::from_secs_f64(ticks as f64 / 44_100.0);
+        let start = fragments.span(0).unwrap().start;
+        assert!(start.abs_diff(ticks(2048)) < Duration::from_micros(1));
 
         let mut reader = manifest
             .fragment_stream_with_cache("FLAC", Arc::new(FragmentCache::new(transport)))
@@ -480,9 +499,36 @@ pub(crate) mod tests {
         );
         assert!(manifest.index_requests().is_empty());
         assert_eq!(
-            manifest.fragments("FLAC").unwrap().init,
-            ranged("https://cdn.example/track.mp4", 0, 99)
+            manifest.fragments("FLAC").unwrap().init(),
+            &ranged("https://cdn.example/track.mp4", 0, 99)
         );
+    }
+
+    #[test]
+    fn segment_base_presentation_time_offset_counts_its_own_timescale() {
+        // The index's media starts at 2048 ticks of 44.1 kHz; each offset names that time.
+        let (body, index_range) = segment_base_file();
+        for attributes in [
+            r#"timescale="44100" presentationTimeOffset="2048""#,
+            r#"timescale="22050" presentationTimeOffset="1024""#,
+        ] {
+            let mut manifest = segment_base_manifest(&format!(
+                r#"<SegmentBase indexRange="{index_range}" {attributes}/>"#
+            ));
+            manifest.base_url = Some(Url::parse("https://cdn.example/").unwrap());
+            let request = manifest.index_requests()[0].clone();
+            let index = request.fragment().range.clone().unwrap();
+            manifest.apply_index(
+                &request,
+                &body[*index.start() as usize..=*index.end() as usize],
+            );
+
+            let fragments = manifest.fragments("FLAC").unwrap();
+            let timing = fragments.timing().unwrap();
+            assert_eq!(timing.presentation_time_offset, 2048, "{attributes}");
+            let span = fragments.span(0).unwrap();
+            assert_eq!(span.start, std::time::Duration::ZERO, "{attributes}");
+        }
     }
 
     #[test]
@@ -514,12 +560,8 @@ pub(crate) mod tests {
             Error::DashManifestSegmentIndex { representation, reason }
                 if representation == "FLAC" && reason.contains("no sidx box")
         ));
-        assert!(matches!(
-            manifest.media_timeline("FLAC"),
-            Err(Error::DashManifestSegmentIndex { .. })
-        ));
         assert_eq!(manifest.mime_type("FLAC").unwrap(), Some("audio/mp4"));
-        assert_eq!(manifest.fragments("AACLC").unwrap().media.len(), 1);
+        assert_eq!(manifest.fragments("AACLC").unwrap().media_len(), 1);
 
         // A later successful load clears the failure.
         let (body, index_range) = segment_base_file();
@@ -532,7 +574,7 @@ pub(crate) mod tests {
             body,
             requests: Default::default(),
         });
-        assert_eq!(manifest.fragments("FLAC").unwrap().media.len(), 2);
+        assert_eq!(manifest.fragments("FLAC").unwrap().media_len(), 2);
     }
 
     #[cfg(feature = "sync")]

@@ -255,7 +255,7 @@ pub struct MediaPacket {
     /// The bytes share storage where possible and remain valid as long as this packet.
     pub data: Bytes,
     /// When the decoded output should be presented, in [`Self::timescale`] ticks.
-    /// This can be negative for codec priming before the representation's time zero.
+    /// This can be negative for codec priming before presentation time zero.
     pub pts: i64,
     /// When this packet should be decoded, in [`Self::timescale`] ticks.
     /// Packets are yielded in this order; presentation order may differ for B-frames.
@@ -274,7 +274,7 @@ pub struct MediaPacket {
 }
 
 impl MediaPacket {
-    /// Converts [`Self::pts`] to a duration from the representation's time zero.
+    /// Converts [`Self::pts`] to presentation time.
     ///
     /// Returns `None` for negative priming timestamps or a zero timescale.
     pub fn presentation_time(&self) -> Option<Duration> {
@@ -411,13 +411,13 @@ pub struct Seeked {
 }
 
 impl Seeked {
-    /// Converts [`Self::landed`] to a duration from the representation's time zero.
+    /// Converts [`Self::landed`] to presentation time.
     /// Returns `None` for a negative timestamp or zero timescale.
     pub fn landed_time(&self) -> Option<Duration> {
         ticks_to_duration(self.landed, self.timescale)
     }
 
-    /// Converts [`Self::discard_before`] to a duration from time zero.
+    /// Converts [`Self::discard_before`] to presentation time.
     /// Returns `None` for a negative timestamp or zero timescale.
     pub fn discard_before_time(&self) -> Option<Duration> {
         ticks_to_duration(self.discard_before, self.timescale)

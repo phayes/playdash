@@ -210,7 +210,7 @@ fn split_fragments(url: &str, file: &[u8]) -> Fragments {
 
 fn ranged_reader(name: &str, cache: Arc<FragmentCache>) -> FragmentStream {
     let fragments = split_fragments(&format!("{BASE}{name}"), &fixture(name));
-    FragmentStream::new_with_cache(fragments, None, cache).unwrap()
+    FragmentStream::new_with_cache(fragments, cache).unwrap()
 }
 
 #[test]
@@ -243,7 +243,7 @@ fn iterates_decrypted_fragments() {
         .unwrap();
     assert_eq!(
         fragments.len(),
-        1 + manifest.fragments("0").unwrap().media.len()
+        1 + manifest.fragments("0").unwrap().media_len()
     );
     let joined: Vec<u8> = fragments.iter().flatten().copied().collect();
     assert_eq!(decode(Cursor::new(joined)), plain_samples());
@@ -284,7 +284,7 @@ fn buffer_reports_downloads() {
     // The last of three half-second fragments is held back.
     let status = buffer.status();
     assert_eq!(status.total.fragments, 3);
-    assert_eq!(status.total.time, Duration::from_millis(1500));
+    assert_eq!(status.total.end, Duration::from_millis(1500));
     assert!(!status.is_complete());
 
     gated.open();
@@ -308,13 +308,13 @@ fn cache_holds_same_length_plaintext() {
     assert!(source.count() > 0);
 
     let fragments = manifest.fragments("0").unwrap();
-    for fragment in std::iter::once(&fragments.init).chain(&fragments.media) {
+    for fragment in std::iter::once(fragments.init()).chain(fragments.media()) {
         let raw = Fixtures.get(fragment, None).unwrap();
         let cached = cache.cached(fragment).expect("fetched during playback");
         assert_eq!(cached.len(), raw.len(), "{fragment}");
         assert_ne!(cached, raw, "{fragment} was not decrypted");
     }
-    let init = cache.cached(&fragments.init).unwrap();
+    let init = cache.cached(fragments.init()).unwrap();
     assert!(!init.windows(4).any(|window| window == b"enca"));
 }
 
@@ -479,7 +479,7 @@ mod nonblocking {
         let base = serve_fixtures();
         for name in ["ffmpeg_cenc.mp4", "plain.mp4"] {
             let fragments = split_fragments(&format!("{base}/{name}"), &fixture(name));
-            let stream = FragmentStream::new_with_cache(fragments, None, keyed_cache(keys()))
+            let stream = FragmentStream::new_with_cache(fragments, keyed_cache(keys()))
                 .await
                 .unwrap();
             assert_eq!(

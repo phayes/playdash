@@ -2,12 +2,13 @@
 //! addressing: media segments from either a `SegmentTimeline` or a fixed
 //! `@duration`, and `Initialization` elements as fragments.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use crate::vendor::dash_mpd_core::{Initialization, S, SegmentTimeline};
 
 use crate::error::Error;
-use crate::fragment::{Fragment, MediaTimeline, parse_byte_range};
+use crate::fragment::{Fragment, parse_byte_range};
 
 /// One media segment generated from a template.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,22 +24,17 @@ pub(crate) struct Segment {
 /// Media segments of a representation, in timeline order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Segments {
-    pub timescale: u32,
+    pub timescale: NonZeroU32,
+    /// `@presentationTimeOffset`: media time at the start of the Period.
+    pub presentation_time_offset: u64,
     pub segments: Vec<Segment>,
 }
 
-impl Segments {
-    pub fn media_timeline(&self) -> MediaTimeline {
-        MediaTimeline {
-            timescale: self.timescale,
-            origin: self.segments.first().map_or(0, |segment| segment.time),
-            media_durations: self
-                .segments
-                .iter()
-                .map(|segment| segment.duration)
-                .collect(),
-        }
-    }
+/// A representation's fragments with unresolved URLs: its initialization
+/// fragment and one media fragment per segment, in timeline order.
+pub(crate) struct SegmentUrls {
+    pub init: Fragment,
+    pub media: Vec<Fragment>,
 }
 
 /// Segment timing: an explicit timeline, or a fixed segment duration.
@@ -65,13 +61,13 @@ impl Timing<'_> {
     pub fn segments(self, period_duration: Option<Duration>) -> Result<Segments, Error> {
         let timescale = u32::try_from(self.timescale.unwrap_or(1))
             .ok()
-            .filter(|&timescale| timescale > 0)
+            .and_then(NonZeroU32::new)
             .ok_or(Error::DashManifestMissingTimescale)?;
         let bounds = Bounds {
             start_number: self.start_number.unwrap_or(1),
             end_number: self.end_number,
             offset: self.presentation_time_offset.unwrap_or(0),
-            period_ticks: period_duration.map(|duration| to_ticks(duration, timescale)),
+            period_ticks: period_duration.map(|duration| to_ticks(duration, timescale.get())),
         };
 
         let mut segments = match self.addressing.ok_or(Error::DashManifestMissingTimeline)? {
@@ -84,6 +80,7 @@ impl Timing<'_> {
 
         Ok(Segments {
             timescale,
+            presentation_time_offset: bounds.offset,
             segments,
         })
     }

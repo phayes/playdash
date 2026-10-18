@@ -1,7 +1,8 @@
 // Vendored from dash-mpd-core 0.1.0 (https://github.com/emarsden/dash-mpd-core, commit c052cc1),
 // Copyright Eric Marsden, MIT licensed; see LICENSE-MIT in this directory. Local changes: the
-// `scte35` and `warn_ignored_elements` features and the unit tests were removed, and logging
-// goes through playdash's `log` feature instead of `tracing`.
+// `scte35` and `warn_ignored_elements` features and the unit tests were removed, logging
+// goes through playdash's `log` feature instead of `tracing`, and `SegmentList` parses
+// `@presentationTimeOffset`.
 
 //! A Rust library for parsing and serializing DASH MPD manifests, as used for media streaming
 //! services such as on-demand replay of TV content and live media broadcasts. Allows both parsing
@@ -937,6 +938,8 @@ pub struct SegmentList {
     pub duration: Option<u64>,
     #[serde(rename = "@timescale")]
     pub timescale: Option<u64>,
+    #[serde(rename = "@presentationTimeOffset")]
+    pub presentationTimeOffset: Option<u64>,
     #[serde(rename = "@indexRange")]
     pub indexRange: Option<String>,
     #[serde(rename = "@indexRangeExact")]
