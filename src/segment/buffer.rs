@@ -214,9 +214,34 @@ pub struct BufferHandle(Arc<BufferShared>);
 type ChangeCallback = dyn Fn(&BufferStatus) + Send + Sync;
 
 struct BufferShared {
-    /// Media segments, each with the presentation time it spans.
-    media: Vec<(Arc<SegmentData>, Range<Duration>)>,
+    /// Buffered media and its presentation spans; live streams append to this list.
+    media: Mutex<Vec<(Arc<SegmentData>, Range<Duration>)>>,
     callbacks: Mutex<Vec<Arc<ChangeCallback>>>,
+}
+
+/// Weak producer handle used to append newly available live segments.
+#[derive(Debug)]
+pub(crate) struct BufferFeed(Weak<BufferShared>);
+
+impl BufferFeed {
+    /// Appends `media` and reports the updated range.
+    ///
+    /// Returns `false` after the corresponding [`BufferHandle`] is dropped.
+    pub(crate) fn push(&self, media: Vec<(Arc<SegmentData>, Range<Duration>)>) -> bool {
+        let Some(shared) = self.0.upgrade() else {
+            return false;
+        };
+        if !media.is_empty() {
+            shared.lock_media().extend(media);
+            shared.changed();
+        }
+        true
+    }
+
+    /// Returns whether the corresponding [`BufferHandle`] still exists.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
 }
 
 impl BufferHandle {
@@ -224,12 +249,22 @@ impl BufferHandle {
     /// spans.
     pub(crate) fn new(cache: &Store, media: Vec<(Arc<SegmentData>, Range<Duration>)>) -> Self {
         let shared = Arc::new(BufferShared {
-            media,
+            media: Mutex::new(media),
             callbacks: Mutex::default(),
         });
         // Held weakly, so the subscription lasts as long as a handle does.
         cache.subscribe(Arc::downgrade(&shared) as Weak<dyn CacheListener>);
         Self(shared)
+    }
+
+    /// Creates an empty handle that can receive segments through [`Self::feed`].
+    pub(crate) fn empty(cache: &Store) -> Self {
+        Self::new(cache, Vec::new())
+    }
+
+    /// Returns a weak producer handle for appending segments.
+    pub(crate) fn feed(&self) -> BufferFeed {
+        BufferFeed(Arc::downgrade(&self.0))
     }
 
     /// Takes a snapshot of the stream's current download progress.
@@ -260,8 +295,12 @@ impl BufferHandle {
 }
 
 impl BufferShared {
+    fn lock_media(&self) -> std::sync::MutexGuard<'_, Vec<(Arc<SegmentData>, Range<Duration>)>> {
+        self.media.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     fn status(&self) -> BufferStatus {
-        BufferStatus::measure(&self.media)
+        BufferStatus::measure(&self.lock_media())
     }
 
     fn changed(&self) {
@@ -282,11 +321,11 @@ impl BufferShared {
 
 impl CacheListener for BufferShared {
     fn segment_changed(&self, data: &SegmentData) {
-        if self
-            .media
+        let tracked = self
+            .lock_media()
             .iter()
-            .any(|(media, _)| std::ptr::eq(&**media, data))
-        {
+            .any(|(media, _)| std::ptr::eq(&**media, data));
+        if tracked {
             self.changed();
         }
     }

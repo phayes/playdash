@@ -74,8 +74,40 @@
 - `Error::InvalidSegmentTiming`, for media segments with a zero duration or that overlap.
 - `Error::MalformedMedia` and `Error::UnsupportedMedia`.
 - `list_packets`, `list_tracks` and `save_flac` examples.
+- Live (`MPD@type="dynamic"`) manifests addressed by `SegmentTemplate`, with `@duration`
+  or a `SegmentTimeline`, play from `DashManifest::media_stream` and `segment_stream`
+  (blocking and async):
+  - A stream starts behind the live edge: `MediaStreamBuilder::live_delay` takes a
+    `LiveDelay` (`LiveEdge`, `Time` or `Segments`); without one, the manifest's
+    `@suggestedPresentationDelay`, else four segments.
+  - Segments become available as the wall clock passes their end, less
+    `@availabilityTimeOffset`, and leave after `@timeShiftBufferDepth`. Reading waits at
+    the newest segment for the next instead of ending.
+  - Every stream opened from one `DashManifest` shares one refresh of the manifest, made
+    when `@minimumUpdatePeriod` has passed (five seconds when it is zero), or a second
+    after the last when a `SegmentTimeline` has run out. Refreshes follow `Location`, and
+    keep segment numbers aligned by start time. A refresh older than the current
+    manifest, by `@publishTime`, is retried three times and then fails with
+    `Error::DashManifestStale`. A manifest turning static ends its streams after their
+    last segment.
+  - `DashManifest::is_live`, `Segments::is_live` and `Segments::available`, and
+    `is_live`, `available` and `live_edge` on `SegmentStream`, `PacketStream` and
+    `MediaStream` (blocking and async).
+  - `Error::DashManifestMissingAvailabilityStart`, `DashManifestUnsupportedLive`,
+    `DashManifestStale` and `DashManifestLiveGap`.
+- `Transport::fetch_manifest` (blocking and async), returning a `FetchedManifest`: the
+  manifest and the URL it came from after redirects. `DashManifest::new_from_url` and
+  live refreshes fetch through it.
 
 ### Changed
+
+- `DashManifest` is no longer `PartialEq` or `Default`.
+- A `SegmentTemplate`'s media URLs are checked once, by their pattern: `$Number$` and
+  `$Time$` may not appear in the scheme, host or port.
+- `SegmentStream::new`, `new_with_transport`, `new_with_cache` and `starting_at`
+  (blocking and async) refuse live `Segments` with `Error::DashManifestUnsupportedLive`;
+  live streams open from their `DashManifest`, which keeps them refreshed.
+- The async API's tokio dependency enables its `time` feature, for live streams' waits.
 
 - What DASH calls a segment is now named a segment throughout; "fragment" is left to the
   `moof`+`mdat` movie fragments inside a media segment. From 0.2.0:

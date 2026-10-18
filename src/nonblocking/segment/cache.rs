@@ -34,7 +34,7 @@ use std::sync::Arc;
 /// # }
 /// ```
 pub struct SegmentCache {
-    transport: Arc<dyn Transport>,
+    pub(crate) transport: Arc<dyn Transport>,
     pub(crate) store: Store,
 }
 

@@ -11,7 +11,7 @@ pub enum Error {
     #[error("DASH manifest base64 decoding failed: {0}")]
     DataUrlBase64(#[from] base64::DecodeError),
 
-    /// Decoded data URL payload was not valid UTF-8
+    /// The fetched or decoded manifest contains invalid UTF-8 text.
     #[error("DASH manifest UTF-8 decoding failed: {0}")]
     DataUrlUtf8(#[from] std::string::FromUtf8Error),
 
@@ -51,6 +51,30 @@ pub enum Error {
     /// A MPEG-DASH SegmentTemplate or SegmentList could not be expanded into segments
     #[error("Invalid MPEG-DASH segment addressing: {0}")]
     DashManifestInvalidSegments(String),
+
+    /// A live manifest omits `MPD@availabilityStartTime`, so segment
+    /// availability cannot be mapped to wall-clock time.
+    #[error("Live MPEG-DASH manifest is missing MPD@availabilityStartTime")]
+    DashManifestMissingAvailabilityStart,
+
+    /// The live manifest uses a feature that this crate cannot play, or its
+    /// segments were opened somewhere that cannot keep them refreshed, such as
+    /// `SegmentStream::new` or rodio's `DashSource`.
+    #[error("Unsupported live MPEG-DASH manifest: {0}")]
+    DashManifestUnsupportedLive(String),
+
+    /// Repeated refreshes returned an MPD with an older `MPD@publishTime` than
+    /// the version already in use.
+    #[error("Live MPEG-DASH manifest stayed stale after {attempts} refreshes")]
+    DashManifestStale {
+        /// Number of consecutive refreshes that returned an older MPD.
+        attempts: u32,
+    },
+
+    /// A refreshed manifest has a gap after the previous segment timeline,
+    /// so playback cannot continue seamlessly.
+    #[error("Refreshed live MPEG-DASH manifest no longer reaches the segments before it: {0}")]
+    DashManifestLiveGap(String),
 
     /// A representation's `SegmentBase` index could not be fetched or parsed
     /// when the manifest was loaded

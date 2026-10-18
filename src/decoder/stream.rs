@@ -8,12 +8,13 @@ use super::{
 #[cfg(feature = "encryption")]
 use crate::cenc::ContentKeys;
 use crate::error::Error;
-use crate::manifest::{ContentKind, DashManifest};
+use crate::manifest::{ContentKind, DashManifest, LiveDelay};
 use crate::mp4::codec::Codec;
 use crate::packet::{PacketSeeked, PacketStream};
 use crate::segment::SegmentCache;
 use crate::segment::buffer::BufferHandle;
 use crate::segment::schedule::Retention;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -114,6 +115,30 @@ impl MediaStream {
     /// stream that has no DASH media timeline.
     pub fn buffer(&self) -> Option<BufferHandle> {
         self.packets.buffer()
+    }
+
+    /// Returns `true` if this stream is playing a live presentation.
+    ///
+    /// At the live edge, reads wait for newly produced media instead of
+    /// reporting end of stream.
+    pub fn is_live(&self) -> bool {
+        self.packets.is_live()
+    }
+
+    /// Returns the currently available range in presentation time.
+    ///
+    /// For live media this is the current time-shift window; for static media
+    /// it is the full presentation. Returns `None` if timing is unavailable
+    /// or a live stream has no available segment yet.
+    pub fn available(&self) -> Option<Range<Duration>> {
+        self.packets.available()
+    }
+
+    /// Returns the end time of the newest available live segment.
+    ///
+    /// Returns `None` for static streams or before any live segment is available.
+    pub fn live_edge(&self) -> Option<Duration> {
+        self.packets.live_edge()
     }
 
     /// Seeks to the packet playing at `time`.
@@ -357,6 +382,7 @@ pub struct MediaStreamBuilder<'a> {
     #[cfg(feature = "encryption")]
     keys: Option<ContentKeys>,
     retention: Option<Retention>,
+    live_delay: Option<LiveDelay>,
     track: Option<TrackChoice>,
     preroll: Option<Duration>,
     choice: Choice,
@@ -373,6 +399,7 @@ impl<'a> MediaStreamBuilder<'a> {
             #[cfg(feature = "encryption")]
             keys: None,
             retention: None,
+            live_delay: None,
             track: None,
             preroll: None,
             choice: Choice::Style(DecoderStyle::Elementary),
@@ -408,6 +435,16 @@ impl<'a> MediaStreamBuilder<'a> {
     /// See [`Retention`] for the meaning of its forward and backward windows.
     pub fn retention(mut self, retention: Retention) -> Self {
         self.retention = Some(retention);
+        self
+    }
+
+    /// Sets how far behind the live edge playback starts.
+    ///
+    /// This overrides `MPD@suggestedPresentationDelay`. Without either value,
+    /// playback starts four segments behind the edge. See [`LiveDelay`]. This
+    /// setting has no effect on static manifests.
+    pub fn live_delay(mut self, delay: LiveDelay) -> Self {
+        self.live_delay = Some(delay);
         self
     }
 
@@ -485,9 +522,12 @@ impl<'a> MediaStreamBuilder<'a> {
         // The representation's segments.
         let cache = self.take_cache()?;
         let retention = self.retention.unwrap_or_default();
-        let segments =
-            self.manifest
-                .segment_stream_retained(&self.representation_id, cache, retention)?;
+        let segments = self.manifest.segment_stream_retained(
+            &self.representation_id,
+            cache,
+            retention,
+            self.live_delay,
+        )?;
 
         // The packets of the chosen track.
         let mut packets = match self.track {

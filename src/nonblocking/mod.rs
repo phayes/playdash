@@ -35,7 +35,7 @@ pub use decoder::{MediaStream, MediaStreamBuilder};
 use crate::error::Error;
 use crate::manifest::{ContentKind, Representation};
 use crate::segment::Segments;
-use reqwest::{Client, Response};
+use reqwest::Client;
 use segment::Transport;
 use std::sync::OnceLock;
 
@@ -94,15 +94,8 @@ impl DashManifest {
         let parsed = match url.trim_start().starts_with("data:") {
             true => crate::DashManifest::new_from_data_url(url.trim())?,
             false => {
-                let response = client
-                    .get(url)
-                    .send()
-                    .await
-                    .and_then(Response::error_for_status)
-                    .map_err(Error::DashManifestRequest)?;
-                let final_url = response.url().to_string();
-                let dash_xml = response.text().await.map_err(Error::DashManifestRequest)?;
-                crate::DashManifest::new(dash_xml)?.with_base_url(&final_url)?
+                let fetched = Transport::fetch_manifest(&client, url).await?;
+                crate::DashManifest::new(fetched.body)?.with_base_url(&fetched.url)?
             }
         };
         let mut manifest = Self::from(parsed).with_client(client);

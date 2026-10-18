@@ -11,6 +11,7 @@ use crate::segment::buffer::BufferHandle;
 use crate::segment::schedule::{Part, PartBody};
 use futures_util::Stream;
 use std::future::poll_fn;
+use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
@@ -91,8 +92,8 @@ impl PacketStream {
                 ));
             }
         };
-        let representation = segments.representation_index();
-        let demuxer = Demuxer::new(init.body, &init.location, Some(representation), track_id)?;
+        let timing = segments.representation_index().timing().copied();
+        let demuxer = Demuxer::new(init.body, &init.location, timing, track_id)?;
         Ok(Self {
             segments,
             demuxer,
@@ -136,6 +137,24 @@ impl PacketStream {
         self.segments.buffer()
     }
 
+    /// Returns whether this stream plays a live presentation; see
+    /// [`SegmentStream::is_live`].
+    pub fn is_live(&self) -> bool {
+        self.segments.is_live()
+    }
+
+    /// Returns the currently available range in presentation time; see
+    /// [`SegmentStream::available`].
+    pub fn available(&self) -> Option<Range<Duration>> {
+        self.segments.available()
+    }
+
+    /// Returns the end time of the newest available live segment; see
+    /// [`SegmentStream::live_edge`].
+    pub fn live_edge(&self) -> Option<Duration> {
+        self.segments.live_edge()
+    }
+
     /// Seeks to `time` on the representation's media timeline, and returns the
     /// packets to decode before the stream's next one.
     ///
@@ -167,7 +186,8 @@ impl PacketStream {
 
     /// Seeks to `time`, landing as `landing` says.
     async fn seek(&mut self, time: Duration, landing: Landing) -> Result<PacketSeeked, Error> {
-        let range = self.demuxer.seek_range(time)?;
+        let index = self.segments.representation_index();
+        let range = self.demuxer.seek_range(time, &index)?;
         let first = self.segments.first_number();
 
         // The segment containing `time`, where the stream then carries on.
@@ -252,7 +272,8 @@ impl PacketStream {
     /// The packets of a media segment `part`.
     fn load(&mut self, part: PartBody) -> Result<Loaded, Error> {
         let number = part.number.expect("a media segment");
-        self.demuxer.load(number, &part.body, &part.location)
+        let start = part.span.map(|span| span.start);
+        self.demuxer.load(number, start, &part.body, &part.location)
     }
 }
 

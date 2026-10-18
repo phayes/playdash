@@ -2,6 +2,7 @@
 
 use super::{SegmentCache, Transport};
 use crate::error::Error;
+use crate::manifest::live::{LiveLink, Plan};
 use crate::mp4::track::{self, Track};
 use crate::segment::buffer::BufferHandle;
 use crate::segment::clock::{Clock, SystemClock};
@@ -12,12 +13,13 @@ use crate::segment::schedule::{
     self, Cursor, Part, PartBody, Position, Retention, Schedule, SizeStep, Supply, WindowChange,
 };
 use crate::segment::store::SegmentData;
-use crate::segment::{SegmentNumber, Segments};
+use crate::segment::{SegmentNumber, Segments, refuse_live};
 use bytes::Bytes;
 use futures_util::Stream;
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io::{self, SeekFrom};
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -117,6 +119,9 @@ struct StreamShared {
     cache: Arc<SegmentCache>,
     /// The time the schedule adds segments at.
     clock: Arc<dyn Clock>,
+    /// The live presentation whose refreshes keep the schedule's index
+    /// current; `None` when static.
+    live: Option<LiveLink>,
     /// The runtime the stream was created on, which runs its tasks.
     runtime: Handle,
     /// The GET and HEAD tasks, aborted when the stream is dropped.
@@ -159,8 +164,21 @@ impl SegmentStream {
         cache: Arc<SegmentCache>,
         retention: Retention,
     ) -> Result<Self, Error> {
-        let first = segments.index().numbers().start;
-        Self::open(&segments, first, cache, retention).await
+        refuse_live(&segments)?;
+        let first = segments.index().first();
+        Self::open(&segments, first, cache, retention, None).await
+    }
+
+    /// Opens live `segments` at segment `first` and follows refreshes through `live`.
+    /// Retention and cache behavior match [`Self::new_retained`].
+    pub(crate) async fn new_live(
+        segments: &Segments,
+        live: LiveLink,
+        first: SegmentNumber,
+        cache: Arc<SegmentCache>,
+        retention: Retention,
+    ) -> Result<Self, Error> {
+        Self::open(segments, first, cache, retention, Some(live)).await
     }
 
     /// Creates a stream that reads the initialization segment of
@@ -175,24 +193,29 @@ impl SegmentStream {
     /// and a `time` at or past the end starts at the last.
     ///
     /// Fails with [`Error::Initialization`] if `segments` are untimed or have
-    /// no media segments.
+    /// no media segments, and with [`Error::DashManifestUnsupportedLive`] for
+    /// live segments, which stream from
+    /// [`DashManifest::segment_stream_at`](crate::nonblocking::DashManifest::segment_stream_at).
     pub async fn starting_at(
         segments: Segments,
         time: Duration,
         cache: Arc<SegmentCache>,
     ) -> Result<(Self, Duration), Error> {
+        refuse_live(&segments)?;
         let (first, start) = schedule::start_at(segments.index(), time)?;
-        let stream = Self::open(&segments, first, cache, Retention::default()).await?;
+        let stream = Self::open(&segments, first, cache, Retention::default(), None).await?;
         Ok((stream, start))
     }
 
     /// A stream of `segments` from the media segment numbered `first`,
-    /// fetching through `cache` and keeping as much as `retention` says.
+    /// fetching through `cache` and keeping as much as `retention` says, and
+    /// kept current by `live`'s refreshes when live.
     async fn open(
         segments: &Segments,
         first: SegmentNumber,
         cache: Arc<SegmentCache>,
         retention: Retention,
+        live: Option<LiveLink>,
     ) -> Result<Self, Error> {
         // Fetch the initialization segment, which tells how to decrypt the media.
         let init = cache.data(segments.init().clone());
@@ -201,8 +224,11 @@ impl SegmentStream {
         cache.get(&init).await?;
         let role = cache.store.media_role(&init)?;
 
-        // Schedule the media segments the retention keeps.
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        // Schedule the media segments the retention keeps, on the presentation's clock.
+        let clock: Arc<dyn Clock> = match &live {
+            Some(live) => live.live.clock().clone(),
+            None => Arc::new(SystemClock),
+        };
         let supply = Supply {
             store: &cache.store,
             now: clock.now(),
@@ -217,6 +243,7 @@ impl SegmentStream {
             cancelled: AtomicBool::new(false),
             cache,
             clock,
+            live,
             runtime: Handle::current(),
             tasks: Mutex::default(),
         });
@@ -279,16 +306,18 @@ impl SegmentStream {
     /// [`Self::fetch_segment`], with where the segment sits.
     pub(crate) async fn media_part_body(&self, number: SegmentNumber) -> Result<PartBody, Error> {
         let part = Part::Media(number);
-        let data = self
-            .shared
-            .lock()
-            .materialise(part, self.shared.supply())
-            .cloned()
-            .ok_or_else(|| {
-                Error::Initialization(format!(
-                    "MPEG stream has no media segment {number} of its representation"
-                ))
-            })?;
+        let (data, span) = {
+            let mut schedule = self.shared.lock();
+            let data = schedule
+                .materialise(part, self.shared.supply())
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Initialization(format!(
+                        "MPEG stream has no media segment {number} of its representation"
+                    ))
+                })?;
+            (data, schedule.span(part))
+        };
 
         // Fetch in this task; the stream's own downloads carry on meanwhile.
         let body = self.shared.cache.get(&data).await?;
@@ -300,6 +329,7 @@ impl SegmentStream {
         Ok(PartBody {
             part,
             number: Some(number),
+            span,
             location: data.location.clone(),
             body,
         })
@@ -308,12 +338,37 @@ impl SegmentStream {
     /// A handle reporting how much of this stream's media its cache holds.
     /// `None` if the stream's segments are untimed.
     pub fn buffer(&self) -> Option<BufferHandle> {
-        let store = &self.shared.cache.store;
-        let schedule = self.shared.lock();
+        let handle = BufferHandle::empty(&self.shared.cache.store);
+        let mut schedule = self.shared.lock();
         schedule.index().timing()?;
-        let media = schedule.timed_media(store);
-        drop(schedule);
-        Some(BufferHandle::new(store, media))
+        schedule.subscribe_buffer(handle.feed(), self.shared.supply());
+        Some(handle)
+    }
+
+    /// Returns `true` while the stream follows a live presentation.
+    ///
+    /// At the live edge, reads wait for the next segment instead of ending.
+    ///
+    /// A live presentation whose manifest turns static stops being live.
+    pub fn is_live(&self) -> bool {
+        self.shared.lock().index().is_live()
+    }
+
+    /// Returns the currently available range in presentation time.
+    ///
+    /// Live streams report their current time-shift window; static streams
+    /// report their full timed range.
+    ///
+    /// Returns `None` for untimed segments, and while no live segment is
+    /// available.
+    pub fn available(&self) -> Option<Range<Duration>> {
+        self.shared.lock().available_time(self.shared.clock.now())
+    }
+
+    /// Returns the end time of the newest available live segment.
+    /// Returns `None` for static streams or before live media is available.
+    pub fn live_edge(&self) -> Option<Duration> {
+        self.shared.lock().live_edge(self.shared.clock.now())
     }
 
     /// Starts background HEAD prefetch of unknown segment sizes.
@@ -514,36 +569,90 @@ impl StreamShared {
     }
 }
 
-/// Downloads the stream's segments one at a time, in the order its schedule
-/// says, waiting whenever the window holds everything it should, until the
-/// stream is dropped or a download fails.
+/// Downloads scheduled segments until the stream is dropped or a request fails.
 async fn fetch_task(shared: Arc<StreamShared>) {
-    loop {
-        // Wait for something to fetch.
-        let (part, data) = loop {
-            let work = {
-                let mut schedule = shared.lock();
-                if shared.cancelled.load(Ordering::SeqCst) || schedule.error.is_some() {
-                    return;
-                }
-                schedule.take_get()
-            };
-            match work {
-                Some(work) => break work,
-                None => {
-                    shared.changed();
-                    shared.work.notified().await;
-                }
-            }
-        };
-
-        // Fetch it, and drop it again if it was only wanted for its size.
+    while let Some((part, data)) = next_get(&shared).await {
+        // Release data fetched only to discover its size once the request completes.
         let result = shared.cache.get(&data).await.map(drop);
         let kept = shared.lock().finish_get(part, result);
         if !kept {
             shared.cache.store.forget_if_unheld(&data);
         }
         shared.changed();
+    }
+}
+
+/// Waits for and returns the next scheduled GET.
+///
+/// For live streams this also adopts refreshed indexes, refreshes the MPD when
+/// due, and advances availability. Returns `None` after cancellation or failure.
+async fn next_get(shared: &StreamShared) -> Option<(Part, Arc<SegmentData>)> {
+    loop {
+        let plan = {
+            let mut schedule = shared.lock();
+            if shared.cancelled.load(Ordering::SeqCst) || schedule.error.is_some() {
+                return None;
+            }
+
+            // Adopt an index refreshed by any stream sharing this presentation.
+            let refreshed = shared.live.as_ref().map(LiveLink::refreshed);
+            let change = match refreshed {
+                Some(Ok(Some(index))) => schedule.replace_index(index, shared.supply()),
+                Some(Err(reason)) => {
+                    schedule.error = Some(reason);
+                    drop(schedule);
+                    shared.changed();
+                    return None;
+                }
+                Some(Ok(None)) | None => WindowChange::default(),
+            };
+            if !change.is_empty() {
+                drop(schedule);
+                shared.window_moved(change);
+                continue;
+            }
+
+            if let Some(work) = schedule.take_get() {
+                return Some(work);
+            }
+
+            // Nothing to fetch: take what has become available since.
+            let (change, idle) = schedule.advance(shared.supply());
+            if !change.is_empty() {
+                drop(schedule);
+                shared.window_moved(change);
+                continue;
+            }
+            match &shared.live {
+                Some(live) => live.plan(idle, shared.clock.now()),
+                None => Plan::Wait(None),
+            }
+        };
+
+        // Refresh, finish, or wait for a reader, the next segment or the next refresh.
+        shared.changed();
+        match plan {
+            Plan::Refresh { ran_out } => {
+                let live = shared.live.as_ref()?;
+                let transport = &*shared.cache.transport;
+                if let Err(error) = live.live.refresh(transport, live.seen(), ran_out).await {
+                    shared.lock().error = Some(error.to_string());
+                    shared.changed();
+                    return None;
+                }
+            }
+            Plan::Finish => {
+                shared.lock().finish_index();
+                shared.changed();
+                shared.work.notified().await;
+            }
+            Plan::Wait(None) => shared.work.notified().await,
+            Plan::Wait(Some(until)) => {
+                let timeout = until.duration_since(shared.clock.now()).unwrap_or_default();
+                // Either the time comes or something wakes the task; both look again.
+                let _ = tokio::time::timeout(timeout, shared.work.notified()).await;
+            }
+        }
     }
 }
 
@@ -668,20 +777,15 @@ impl SegmentStream {
                     return Poll::Ready(Some(Err(error.into())));
                 }
             };
-            let Some((body, location)) = found else {
+            let Some(found) = found else {
                 return Poll::Ready(None);
             };
 
             // Hand over what is left of it and move on to the next.
-            let rest = self.cursor.take_rest(body);
+            let rest = self.cursor.take_rest(found.body.clone());
             self.shared.publish_cursor(self.cursor.part);
             if let Some(body) = rest {
-                return Poll::Ready(Some(Ok(PartBody {
-                    part,
-                    number: part.number(),
-                    location,
-                    body,
-                })));
+                return Poll::Ready(Some(Ok(PartBody { body, ..found })));
             }
         }
     }
@@ -702,6 +806,12 @@ impl SegmentStream {
     /// Number of the stream's first media segment in its representation.
     pub(crate) fn first_number(&self) -> SegmentNumber {
         self.shared.lock().first()
+    }
+
+    /// Wakes the test task so it rechecks the manual clock.
+    #[cfg(test)]
+    pub(crate) fn wake_worker(&self) {
+        self.shared.work.notify_one();
     }
 }
 

@@ -242,19 +242,41 @@ impl MediaUrls {
         Self { template, base }
     }
 
-    /// The location of the segment with `$Number$` `number` and `$Time$`
-    /// `time`. Fails with [`Error::DashManifestUrl`] if its URL does not
-    /// resolve.
-    pub(crate) fn try_location(&self, number: u64, time: u64) -> Result<SegmentLocation, Error> {
-        let url = resolve_url(self.base.as_ref(), &self.template.render(number, time))?;
-        Ok(SegmentLocation::new(url))
+    /// The URL of the segment with `$Number$` `number` and `$Time$` `time`.
+    /// Fails with [`Error::DashManifestUrl`] if it does not resolve.
+    fn resolve(&self, number: u64, time: u64) -> Result<Url, Error> {
+        resolve_url(self.base.as_ref(), &self.template.render(number, time))
     }
 
-    /// [`Self::try_location`] for a segment whose URL is known to resolve, as
-    /// every segment of an index is checked to when the index is built.
+    /// Validates that all substitutions produce resolvable URLs on one origin.
+    ///
+    /// Fails with [`Error::DashManifestUrl`] if a URL does not resolve, and
+    /// with [`Error::DashManifestInvalidSegments`] if the template puts
+    /// `$Number$` or `$Time$` in the scheme, host or port.
+    pub(crate) fn check(&self) -> Result<(), Error> {
+        // Two numeric substitutions are sufficient to detect placeholders in the origin.
+        let (zero, one) = (self.resolve(0, 0)?, self.resolve(1, 1)?);
+        let server = |url: &Url| {
+            (
+                url.scheme().to_owned(),
+                url.host().map(|host| host.to_owned()),
+                url.port(),
+            )
+        };
+        if server(&zero) != server(&one) {
+            return Err(Error::DashManifestInvalidSegments(format!(
+                "media template {zero} puts $Number$ or $Time$ in its scheme, host or port"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns a segment location after [`Self::check`] has validated the template.
     pub(crate) fn location(&self, number: u64, time: u64) -> SegmentLocation {
-        self.try_location(number, time)
-            .expect("media segment URLs are checked when their index is built")
+        let url = self
+            .resolve(number, time)
+            .expect("media templates are checked when their index is built");
+        SegmentLocation::new(url)
     }
 }
 
@@ -301,9 +323,14 @@ impl<'a> TemplateChain<'a> {
         UrlTemplate::parse(media, &values)
     }
 
-    /// The media segments' timing; see [`Timing::addressed`].
-    pub fn addressed(self, period_duration: Option<Duration>) -> Result<Addressed, Error> {
+    /// Builds segment timing, allowing an open-ended timeline when `live` is `true`.
+    pub fn addressed(
+        self,
+        period_duration: Option<Duration>,
+        live: bool,
+    ) -> Result<Addressed, Error> {
         Timing {
+            live,
             timescale: self.get(|template| template.timescale),
             start_number: self.get(|template| template.startNumber),
             end_number: self.get(|template| template.endNumber),
@@ -443,10 +470,35 @@ mod tests {
 
         let template = UrlTemplate::parse("$Number$.m4s", &values()).unwrap();
         let relative = MediaUrls::new(template, None);
-        assert!(matches!(
-            relative.try_location(7, 0),
-            Err(Error::DashManifestUrl(..))
-        ));
+        assert!(matches!(relative.check(), Err(Error::DashManifestUrl(..))));
+    }
+
+    #[test]
+    fn media_urls_keep_numbers_and_times_out_of_the_server() {
+        let urls = |template: &str| {
+            let template = UrlTemplate::parse(template, &values()).unwrap();
+            MediaUrls::new(template, Some(Url::parse("https://cdn.example/").unwrap()))
+        };
+        for allowed in [
+            "$Number$.m4s",
+            "https://other.example/$Time$/a.m4s?n=$Number$#t=$Time$",
+            "https://user$Number$@other.example/a.m4s",
+        ] {
+            assert!(urls(allowed).check().is_ok(), "{allowed}");
+        }
+        for server in [
+            "https://cdn$Number$.example/a.m4s",
+            "https://cdn.example:$Number%04d$/a.m4s",
+            "//$Time$.example/a.m4s",
+        ] {
+            assert!(
+                matches!(
+                    urls(server).check(),
+                    Err(Error::DashManifestInvalidSegments(_))
+                ),
+                "{server}"
+            );
+        }
     }
 
     fn template(timeline: Option<Vec<S>>) -> SegmentTemplate {
@@ -481,7 +533,7 @@ mod tests {
             entry(Some(3000), 400, None),
         ]));
         let segments = TemplateChain::new([Some(&template), None, None])
-            .addressed(None)
+            .addressed(None, false)
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -496,7 +548,7 @@ mod tests {
             entry(Some(2500), 500, None),
         ]));
         let segments = TemplateChain::new([Some(&template), None, None])
-            .addressed(None)
+            .addressed(None, false)
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -515,7 +567,7 @@ mod tests {
         template.presentationTimeOffset = Some(10_000);
         template.SegmentTimeline.as_mut().unwrap().segments[0].t = Some(10_000);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .addressed(Some(Duration::from_millis(2500)))
+            .addressed(Some(Duration::from_millis(2500)), false)
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -528,7 +580,7 @@ mod tests {
         let mut template = template(Some(vec![entry(Some(10_000), 1000, Some(49))]));
         template.presentationTimeOffset = Some(10_000);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .addressed(Some(Duration::from_millis(2500)))
+            .addressed(Some(Duration::from_millis(2500)), false)
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -540,7 +592,7 @@ mod tests {
     fn open_ended_repeat_needs_a_bound() {
         let template = template(Some(vec![entry(None, 1000, Some(-1))]));
         assert!(matches!(
-            TemplateChain::new([Some(&template), None, None]).addressed(None),
+            TemplateChain::new([Some(&template), None, None]).addressed(None, false),
             Err(Error::DashManifestMissingDuration)
         ));
     }
@@ -551,7 +603,7 @@ mod tests {
         template.startNumber = Some(5);
         template.endNumber = Some(7);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .addressed(None)
+            .addressed(None, false)
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -565,7 +617,7 @@ mod tests {
         template.duration = Some(4000.0);
         template.startNumber = Some(0);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .addressed(Some(Duration::from_millis(10_500)))
+            .addressed(Some(Duration::from_millis(10_500)), false)
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -578,7 +630,7 @@ mod tests {
         let mut template = template(None);
         template.duration = Some(1001.5);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .addressed(Some(Duration::from_millis(3004)))
+            .addressed(Some(Duration::from_millis(3004)), false)
             .unwrap();
         assert_eq!(
             summarize(&segments),
@@ -593,7 +645,7 @@ mod tests {
         template.startNumber = Some(3);
         template.endNumber = Some(4);
         let segments = TemplateChain::new([Some(&template), None, None])
-            .addressed(None)
+            .addressed(None, false)
             .unwrap();
         assert_eq!(summarize(&segments), [(3, 0, 2000), (4, 2000, 2000)]);
     }
@@ -603,7 +655,7 @@ mod tests {
         let mut template = template(None);
         template.duration = Some(2000.0);
         assert!(matches!(
-            TemplateChain::new([Some(&template), None, None]).addressed(None),
+            TemplateChain::new([Some(&template), None, None]).addressed(None, false),
             Err(Error::DashManifestMissingDuration)
         ));
     }
@@ -615,7 +667,7 @@ mod tests {
         representation.endNumber = Some(2);
         let adaptation = template(Some(vec![entry(None, 1000, Some(3))]));
         let segments = TemplateChain::new([Some(&representation), Some(&adaptation), None])
-            .addressed(None)
+            .addressed(None, false)
             .unwrap();
         assert_eq!(summarize(&segments), [(1, 0, 500), (2, 500, 500)]);
     }
@@ -625,7 +677,7 @@ mod tests {
         let mut template = template(Some(vec![entry(None, 1000, None)]));
         template.timescale = Some(0);
         assert!(matches!(
-            TemplateChain::new([Some(&template), None, None]).addressed(None),
+            TemplateChain::new([Some(&template), None, None]).addressed(None, false),
             Err(Error::DashManifestMissingTimescale)
         ));
     }

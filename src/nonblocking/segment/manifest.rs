@@ -1,9 +1,10 @@
 //! Opening a manifest's representations as async [`SegmentStream`]s.
 
 use super::{SegmentCache, SegmentStream};
-use crate::Retention;
 use crate::error::Error;
+use crate::manifest::live::{LiveSource, LiveStart};
 use crate::nonblocking::DashManifest;
+use crate::{LiveDelay, Retention};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,19 +35,36 @@ impl DashManifest {
         representation_id: impl AsRef<str>,
         cache: Arc<SegmentCache>,
     ) -> Result<SegmentStream, Error> {
-        SegmentStream::new_with_cache(self.manifest.segments(representation_id)?, cache).await
+        self.segment_stream_retained(representation_id, cache, Retention::default(), None)
+            .await
     }
 
     /// Like [`Self::segment_stream_with_cache`], keeping as much as
-    /// `retention` says from the start.
+    /// `retention` specifies how much media to keep. For live manifests,
+    /// `delay` overrides the manifest's suggested distance behind the live edge.
     pub(crate) async fn segment_stream_retained(
         &self,
         representation_id: impl AsRef<str>,
         cache: Arc<SegmentCache>,
         retention: Retention,
+        delay: Option<LiveDelay>,
     ) -> Result<SegmentStream, Error> {
-        let segments = self.manifest.segments(representation_id)?;
-        SegmentStream::new_retained(segments, cache, retention).await
+        let id = representation_id.as_ref();
+        match self.manifest.live_source(id, LiveStart::Delay(delay))? {
+            Some(source) => {
+                let LiveSource {
+                    segments,
+                    link,
+                    first,
+                    ..
+                } = source;
+                SegmentStream::new_live(&segments, link, first, cache, retention).await
+            }
+            None => {
+                let segments = self.manifest.segments(id)?;
+                SegmentStream::new_retained(segments, cache, retention).await
+            }
+        }
     }
 
     /// Opens a representation as a [`SegmentStream`] that reads its
@@ -72,8 +90,25 @@ impl DashManifest {
         time: Duration,
         cache: Arc<SegmentCache>,
     ) -> Result<(SegmentStream, Duration), Error> {
-        let segments = self.manifest.segments(representation_id)?;
-        SegmentStream::starting_at(segments, time, cache).await
+        let id = representation_id.as_ref();
+        match self.manifest.live_source(id, LiveStart::At(time))? {
+            Some(source) => {
+                let LiveSource {
+                    segments,
+                    link,
+                    first,
+                    start,
+                } = source;
+                let retention = Retention::default();
+                let stream =
+                    SegmentStream::new_live(&segments, link, first, cache, retention).await?;
+                Ok((stream, start))
+            }
+            None => {
+                let segments = self.manifest.segments(id)?;
+                SegmentStream::starting_at(segments, time, cache).await
+            }
+        }
     }
 
     /// A new, empty cache that fetches through this manifest's client.

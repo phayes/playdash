@@ -1,7 +1,5 @@
 //! Loading manifests and opening decoder-ready media with the blocking API.
 
-use ureq::ResponseExt;
-
 use super::DashManifest;
 use crate::decoder::MediaStreamBuilder;
 use crate::error::Error;
@@ -15,19 +13,15 @@ impl DashManifest {
     /// that relative `BaseURL` and segment references resolve against. `data:`
     /// URLs are decoded as with [`DashManifest::new_from_data_url`].
     pub fn new_from_url(url: &str) -> Result<Self, Error> {
+        let agent = ureq_agent();
         let mut manifest = match url.trim_start().starts_with("data:") {
             true => Self::new_from_data_url(url.trim())?,
             false => {
-                let response = ureq::get(url).call().map_err(Error::DashManifestFetch)?;
-                let final_url = response.get_uri().to_string();
-                let dash_xml = response
-                    .into_body()
-                    .read_to_string()
-                    .map_err(Error::DashManifestFetch)?;
-                Self::new(dash_xml)?.with_base_url(&final_url)?
+                let fetched = agent.fetch_manifest(url)?;
+                Self::new(fetched.body)?.with_base_url(&fetched.url)?
             }
         };
-        manifest.load_segment_indexes(&ureq_agent());
+        manifest.load_segment_indexes(&agent);
         Ok(manifest)
     }
 

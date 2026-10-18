@@ -78,6 +78,11 @@ impl DashSource {
         cache: Arc<SegmentCache>,
     ) -> Result<Self, Error> {
         let id = id.as_ref();
+        if manifest.is_live() {
+            return Err(Error::DashManifestUnsupportedLive(
+                "DashSource does not play live manifests".to_owned(),
+            ));
+        }
         if let Some(scheme) = manifest.protection_scheme(id)?
             && !cache.decrypts()
         {
@@ -109,7 +114,8 @@ impl DashSource {
     /// thread afterwards. Plays no part in playback.
     pub fn buffer(&self) -> BufferHandle {
         let index = self.segments.index();
-        let media = schedule::timed_media(index, index.numbers().start, &self.cache.store);
+        let numbers = index.first()..index.end().unwrap_or(index.first());
+        let media = schedule::timed_media(index, numbers, &self.cache.store);
         BufferHandle::new(&self.cache.store, media)
     }
 

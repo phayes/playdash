@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::vendor::dash_mpd_core::{Initialization, S, SegmentTimeline};
 
 use crate::error::Error;
-use crate::segment::{SegmentLocation, parse_byte_range};
+use crate::segment::{SegmentLocation, check_segment, parse_byte_range};
 
 /// One media segment's number and timing, generated from a template or list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,13 +45,17 @@ pub(crate) struct Timing<'a> {
     pub end_number: Option<u64>,
     pub presentation_time_offset: Option<u64>,
     pub addressing: Option<Addressing<'a>>,
+    /// Whether an otherwise unbounded segment sequence may continue live.
+    pub live: bool,
 }
 
 impl Timing<'_> {
     /// The media segments' timing.
     ///
     /// `period_duration` bounds open-ended `S@r="-1"` repeats and `@duration`
-    /// addressing; it may be omitted when `end_number` provides the bound instead.
+    /// addressing; it may be omitted when `end_number` provides the bound
+    /// instead. Without either, a live manifest's segments go on without end,
+    /// and a static one fails with [`Error::DashManifestMissingDuration`].
     pub fn addressed(self, period_duration: Option<Duration>) -> Result<Addressed, Error> {
         let timescale = u32::try_from(self.timescale.unwrap_or(1))
             .ok()
@@ -62,6 +66,7 @@ impl Timing<'_> {
             end_number: self.end_number,
             offset: self.presentation_time_offset.unwrap_or(0),
             period_ticks: period_duration.map(|duration| to_ticks(duration, timescale.get())),
+            live: self.live,
         };
 
         let segments = match self.addressing.ok_or(Error::DashManifestMissingTimeline)? {
@@ -103,6 +108,8 @@ struct Bounds {
     offset: u64,
     /// Period duration in timescale units.
     period_ticks: Option<u64>,
+    /// Whether segments may go on without end when nothing else bounds them.
+    live: bool,
 }
 
 impl Bounds {
@@ -122,8 +129,8 @@ pub(crate) enum SegmentClock {
 }
 
 impl SegmentClock {
-    /// The number of media segments.
-    pub(crate) fn len(&self) -> u64 {
+    /// Returns the segment count, or `None` for an open-ended sequence.
+    pub(crate) fn len(&self) -> Option<u64> {
         match self {
             SegmentClock::Fixed(segments) => segments.len(),
             SegmentClock::Timeline(segments) => segments.len(),
@@ -147,9 +154,24 @@ impl SegmentClock {
         }
     }
 
-    /// Every segment's number and timing, in timeline order.
+    /// Validates that segments have positive duration and do not overlap.
+    ///
+    /// Fails with [`Error::InvalidSegmentTiming`], naming the first segment
+    /// out of order by its position and the location `location` gives its
+    /// `$Number$` and `$Time$`.
+    pub(crate) fn check_order(
+        &self,
+        location: impl Fn(u64, u64) -> SegmentLocation,
+    ) -> Result<(), Error> {
+        match self {
+            SegmentClock::Fixed(segments) => segments.check_order(location),
+            SegmentClock::Timeline(segments) => segments.check_order(location),
+        }
+    }
+
+    /// Iterates over segment number, start time, and duration in timeline order.
     pub(crate) fn times(&self) -> impl Iterator<Item = SegmentTime> + '_ {
-        (0..self.len()).filter_map(|index| {
+        (0..self.len().unwrap_or(u64::MAX)).map_while(|index| {
             let (time, duration) = self.ticks(index)?;
             Some(SegmentTime {
                 number: self.number(index)?,
@@ -196,12 +218,14 @@ pub(crate) struct FixedSegments {
     offset: u64,
     /// Period duration in timescale units.
     period_ticks: Option<u64>,
-    len: u64,
+    /// `None` when the segments go on without end.
+    len: Option<u64>,
 }
 
 impl FixedSegments {
     /// Segments of `duration` ticks, bounded by the end of the Period or
-    /// `@endNumber`, whichever comes first.
+    /// `@endNumber`, whichever comes first, or without end when live and
+    /// neither is known.
     fn new(bounds: &Bounds, duration: f64) -> Result<Self, Error> {
         let duration = SegmentDuration::new(duration)?;
 
@@ -215,14 +239,17 @@ impl FixedSegments {
             .end_number
             .map(|end| end.saturating_add(1).saturating_sub(bounds.start_number));
         let len = match (in_period, to_end_number) {
-            (Some(in_period), Some(to_end)) => in_period.min(to_end),
-            (Some(len), None) | (None, Some(len)) => len,
+            (Some(in_period), Some(to_end)) => Some(in_period.min(to_end)),
+            (Some(len), None) | (None, Some(len)) => Some(len),
+            (None, None) if bounds.live => None,
             (None, None) => return Err(Error::DashManifestMissingDuration),
         };
 
-        // Every number and time must fit.
-        let fits = bounds.start_number.checked_add(len).is_some()
-            && bounds.offset.checked_add(duration.boundary(len)).is_some();
+        // In an open-ended sequence, overflow is checked lazily for each requested segment.
+        let fits = len.is_none_or(|len| {
+            bounds.start_number.checked_add(len).is_some()
+                && bounds.offset.checked_add(duration.boundary(len)).is_some()
+        });
         if !fits {
             return Err(Error::DashManifestInvalidSegments(
                 "segment numbers or times overflow".to_owned(),
@@ -237,31 +264,80 @@ impl FixedSegments {
         })
     }
 
-    /// The number of media segments.
-    pub(crate) fn len(&self) -> u64 {
+    /// The number of media segments, or `None` when they go on without end.
+    pub(crate) fn len(&self) -> Option<u64> {
         self.len
     }
 
+    /// Each segment's duration in ticks, possibly fractional. The last one
+    /// may be cut short.
+    #[cfg(any(feature = "sync", feature = "async"))]
+    pub(crate) fn duration(&self) -> f64 {
+        self.duration.0
+    }
+
+    /// Returns whether overlapping segments in `other` have identical timing.
+    #[cfg(any(feature = "sync", feature = "async"))]
+    pub(crate) fn same_times(&self, other: &Self) -> bool {
+        self.duration == other.duration && self.offset == other.offset
+    }
+
+    /// The `$Number$` of the first segment, `@startNumber`.
+    pub(crate) fn start_number(&self) -> u64 {
+        self.start_number
+    }
+
+    /// Returns whether `index` is at or beyond the finite end.
+    fn past_end(&self, index: u64) -> bool {
+        self.len.is_some_and(|len| index >= len)
+    }
+
     /// The media start and duration, in ticks, of segment `index`. `None`
-    /// past the last.
+    /// past the last, or where its time no longer fits.
     pub(crate) fn ticks(&self, index: u64) -> Option<(u64, u64)> {
-        if index >= self.len {
+        if self.past_end(index) {
             return None;
         }
         let start = self.duration.boundary(index);
-        let end = self.duration.boundary(index + 1);
+        let end = self.duration.boundary(index.checked_add(1)?);
         let end = self.period_ticks.map_or(end, |ticks| end.min(ticks));
-        Some((self.offset + start, end - start))
+        Some((self.offset.checked_add(start)?, end - start))
     }
 
-    /// The `$Number$` of segment `index`. `None` past the last.
+    /// The `$Number$` of segment `index`. `None` past the last, or where it
+    /// no longer fits.
     pub(crate) fn number(&self, index: u64) -> Option<u64> {
-        (index < self.len).then(|| self.start_number + index)
+        match self.past_end(index) {
+            true => None,
+            false => self.start_number.checked_add(index),
+        }
+    }
+
+    /// Checks that every segment lasts at least a tick; see
+    /// [`SegmentClock::check_order`]. A `@duration` shorter than a tick
+    /// rounds some segments to nothing.
+    fn check_order(&self, location: impl Fn(u64, u64) -> SegmentLocation) -> Result<(), Error> {
+        if self.duration.0 >= 1.0 {
+            return Ok(());
+        }
+
+        // A few segments in, one rounds to nothing.
+        let empty = (0..self.len.unwrap_or(u64::MAX)).find_map(|index| {
+            let (start, duration) = self.ticks(index)?;
+            (duration == 0).then_some((index, start))
+        });
+        match empty {
+            Some((index, start)) => {
+                let number = self.start_number + index;
+                check_segment(index, || location(number, start), start, 0, &mut 0)
+            }
+            None => Ok(()),
+        }
     }
 
     /// The summed durations, in ticks, of the segments indexed in `range`.
     pub(crate) fn media_ticks(&self, range: std::ops::Range<u64>) -> u128 {
-        let end = range.end.min(self.len);
+        let end = self.len.map_or(range.end, |len| range.end.min(len));
         if range.start >= end {
             return 0;
         }
@@ -269,16 +345,16 @@ impl FixedSegments {
         // The segments are back to back.
         let (first, _) = self.ticks(range.start).unwrap_or_default();
         let (last, duration) = self.ticks(end - 1).unwrap_or_default();
-        u128::from(last + duration - first)
+        (u128::from(last) + u128::from(duration)).saturating_sub(u128::from(first))
     }
 }
 
 /// Media segments of a `SegmentTimeline`, as runs of equal durations.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TimelineSegments {
-    /// Runs in timeline order, none empty.
+    /// Non-empty timeline runs in order; the final run is endless when `len` is `None`.
     runs: Vec<Run>,
-    len: u64,
+    len: Option<u64>,
 }
 
 /// Consecutive media segments of one duration: an `S` entry and its repeats.
@@ -296,15 +372,18 @@ struct Run {
 }
 
 impl Run {
-    /// Media time at which segment `offset` of the run starts.
-    fn start_of(&self, offset: u64) -> u64 {
-        self.start + offset * self.duration
+    /// Media time at which segment `offset` of the run starts, or `None`
+    /// where it no longer fits.
+    fn start_of(&self, offset: u64) -> Option<u64> {
+        self.start.checked_add(offset.checked_mul(self.duration)?)
     }
 }
 
 impl TimelineSegments {
     /// The segments of timeline `entries`. Repeats stop at the end of the
-    /// Period, which cuts the last segment short, and at `@endNumber`.
+    /// Period, which cuts the last segment short, and at `@endNumber`. When
+    /// live and neither is known, a last entry with a negative `@r` repeats
+    /// without end.
     fn new(bounds: &Bounds, entries: &[S]) -> Result<Self, Error> {
         if entries.is_empty() {
             return Err(Error::DashManifestMissingTimeline);
@@ -314,6 +393,7 @@ impl TimelineSegments {
         let mut runs = Vec::with_capacity(entries.len());
         let mut number = bounds.start_number;
         let mut time = 0u64;
+        let mut endless = false;
         for (index, entry) in entries.iter().enumerate() {
             if entry.d == 0 {
                 return Err(Error::DashManifestInvalidSegments(
@@ -336,6 +416,11 @@ impl TimelineSegments {
                         (Some(end), _) => end.saturating_sub(time).div_ceil(entry.d),
                         (None, Some(end_number)) => {
                             end_number.saturating_add(1).saturating_sub(number)
+                        }
+                        // In live media, the final negative repeat continues as segments appear.
+                        (None, None) if bounds.live && index + 1 == entries.len() => {
+                            endless = true;
+                            1
                         }
                         (None, None) => return Err(Error::DashManifestMissingDuration),
                     }
@@ -362,7 +447,8 @@ impl TimelineSegments {
             }
             if let Some(last) = runs.iter().rposition(|run| run.count > 0) {
                 let run = runs[last];
-                let start = run.start_of(run.count - 1);
+                // This segment starts within the Period; trim only a segment crossing its end.
+                let start = run.start + (run.count - 1) * run.duration;
                 if start + run.duration > end {
                     runs[last].count -= 1;
                     let cut = Run {
@@ -405,12 +491,45 @@ impl TimelineSegments {
             run.position = len;
             len = next;
         }
-        Ok(Self { runs, len })
+
+        // Represent the endless final run without allowing its position range to overflow.
+        if endless && let Some(last) = runs.last_mut() {
+            last.count = u64::MAX - last.position;
+            return Ok(Self { runs, len: None });
+        }
+        Ok(Self {
+            runs,
+            len: Some(len),
+        })
     }
 
-    /// The number of media segments.
-    pub(crate) fn len(&self) -> u64 {
+    /// Returns the segment count, or `None` when the final run repeats indefinitely.
+    pub(crate) fn len(&self) -> Option<u64> {
         self.len
+    }
+
+    /// The longest segment duration, in ticks.
+    #[cfg(any(feature = "sync", feature = "async"))]
+    pub(crate) fn max_duration(&self) -> u64 {
+        self.runs.iter().map(|run| run.duration).max().unwrap_or(0)
+    }
+
+    /// Checks that each run starts no earlier than the one before it ends;
+    /// see [`SegmentClock::check_order`]. Every run's segments have a
+    /// duration and follow one another by construction.
+    fn check_order(&self, location: impl Fn(u64, u64) -> SegmentLocation) -> Result<(), Error> {
+        let mut end = 0;
+        for (slot, run) in self.runs.iter().enumerate() {
+            // The first segment proves the ordering of a uniform endless run.
+            let endless = self.len.is_none() && slot + 1 == self.runs.len();
+            let length = match endless {
+                true => run.duration,
+                false => run.count * run.duration,
+            };
+            let start = || location(run.number, run.start);
+            check_segment(run.position, start, run.start, length, &mut end)?;
+        }
+        Ok(())
     }
 
     /// The run holding segment `index`, and the segment's offset in it.
@@ -423,16 +542,19 @@ impl TimelineSegments {
     }
 
     /// The media start and duration, in ticks, of segment `index`. `None`
-    /// past the last.
+    /// past the last, or where its time no longer fits.
     pub(crate) fn ticks(&self, index: u64) -> Option<(u64, u64)> {
         let (run, offset) = self.run(index)?;
-        Some((run.start_of(offset), run.duration))
+        let start = run.start_of(offset)?;
+        start.checked_add(run.duration)?;
+        Some((start, run.duration))
     }
 
-    /// The `$Number$` of segment `index`. `None` past the last.
+    /// The `$Number$` of segment `index`. `None` past the last, or where it
+    /// no longer fits.
     pub(crate) fn number(&self, index: u64) -> Option<u64> {
         let (run, offset) = self.run(index)?;
-        Some(run.number + offset)
+        run.number.checked_add(offset)
     }
 
     /// The summed durations, in ticks, of the segments indexed in `range`.
@@ -487,6 +609,7 @@ mod tests {
             end_number,
             offset: 0,
             period_ticks,
+            live: false,
         }
     }
 
@@ -546,7 +669,7 @@ mod tests {
             entry(None, 1_000, Some(20), None),
         ];
         let clock = timeline(&bounds(1, None, Some(5_000)), &entries);
-        assert_eq!(clock.len(), 9);
+        assert_eq!(clock.len(), Some(9));
         assert_eq!(clock.ticks(8), Some((4_000, 1_000)));
     }
 

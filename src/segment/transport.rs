@@ -1,10 +1,11 @@
 //! The blocking API's segment transport: the source of segment bodies and sizes.
 
-use super::{SegmentLocation, slice_range};
+use super::{FetchedManifest, SegmentLocation, slice_range};
 use crate::error::Error;
 use bytes::Bytes;
 use std::io::Read;
 use std::time::Duration;
+use ureq::ResponseExt;
 
 /// Fetches segment bodies and sizes for a [`SegmentCache`](super::SegmentCache).
 ///
@@ -52,6 +53,15 @@ pub trait Transport: Send + Sync {
             "transport cannot HEAD {segment}"
         )))
     }
+
+    /// Fetches the manifest at `url` and returns its text and final URL.
+    ///
+    /// The default uses [`Self::get`] and cannot discover redirects, so it
+    /// reports `url` unchanged. It fails on transport errors or invalid UTF-8.
+    fn fetch_manifest(&self, url: &str) -> Result<FetchedManifest, Error> {
+        let body = self.get(&SegmentLocation::new(url), None)?;
+        FetchedManifest::from_bytes(body, url)
+    }
 }
 
 impl Transport for ureq::Agent {
@@ -95,6 +105,19 @@ impl Transport for ureq::Agent {
             .ok_or_else(|| {
                 Error::Initialization(format!("HEAD for {url} did not return Content-Length"))
             })
+    }
+
+    /// Fetches a manifest, following redirects and preserving the final URL.
+    fn fetch_manifest(&self, url: &str) -> Result<FetchedManifest, Error> {
+        let response = ureq::Agent::get(self, url)
+            .call()
+            .map_err(Error::DashManifestFetch)?;
+        let url = response.get_uri().to_string();
+        let body = response
+            .into_body()
+            .read_to_string()
+            .map_err(Error::DashManifestFetch)?;
+        Ok(FetchedManifest { body, url })
     }
 }
 

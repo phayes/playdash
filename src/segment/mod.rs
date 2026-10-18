@@ -8,9 +8,10 @@
 pub(crate) mod buffer;
 #[cfg(feature = "sync")]
 mod cache;
-#[cfg(any(feature = "sync", feature = "async"))]
 pub(crate) mod clock;
 pub(crate) mod index;
+#[cfg(all(test, feature = "sync"))]
+mod live_tests;
 #[cfg(feature = "sync")]
 mod manifest;
 #[cfg(any(feature = "sync", feature = "async"))]
@@ -38,7 +39,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// A representation's media clock: how the media timestamps of its segments map onto
 /// presentation time.
@@ -86,7 +87,7 @@ impl MediaTiming {
     }
 
     /// `ticks` as a duration.
-    fn duration(&self, ticks: u64) -> Duration {
+    pub(crate) fn duration(&self, ticks: u64) -> Duration {
         let timescale = u64::from(self.timescale.get());
         let nanos = u128::from(ticks % timescale) * 1_000_000_000 / u128::from(timescale);
         Duration::new(ticks / timescale, nanos as u32)
@@ -145,6 +146,30 @@ pub struct MediaSegment {
     pub start: u64,
     /// Length of the segment's media, in ticks.
     pub duration: u64,
+}
+
+/// A fetched manifest and its final URL after redirects.
+#[cfg(any(feature = "sync", feature = "async"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedManifest {
+    /// UTF-8 XML text of the manifest.
+    pub body: String,
+    /// The URL the manifest was served from, after any redirects. Relative
+    /// URLs in the manifest resolve against it.
+    pub url: String,
+}
+
+#[cfg(any(feature = "sync", feature = "async"))]
+impl FetchedManifest {
+    /// Decodes manifest bytes fetched from `url` as UTF-8.
+    ///
+    /// Fails with [`Error::DataUrlUtf8`] if `body` is not UTF-8.
+    pub(crate) fn from_bytes(body: bytes::Bytes, url: &str) -> Result<Self, Error> {
+        Ok(Self {
+            body: String::from_utf8(body.to_vec())?,
+            url: url.to_owned(),
+        })
+    }
 }
 
 /// Parses an inclusive byte range in the DASH `@mediaRange` / `@range` and
@@ -304,10 +329,12 @@ impl Segments {
     /// Segments of a representation from its initialization segment's
     /// location and the index of its media segments.
     pub(crate) fn indexed(init: SegmentLocation, index: MediaIndex) -> Self {
-        Self {
-            init,
-            index: Arc::new(index),
-        }
+        Self::from_index(init, Arc::new(index))
+    }
+
+    /// [`Self::indexed`], sharing `index`.
+    pub(crate) fn from_index(init: SegmentLocation, index: Arc<MediaIndex>) -> Self {
+        Self { init, index }
     }
 
     /// Creates timed segments of a representation from its initialization
@@ -347,14 +374,44 @@ impl Segments {
         &self.init
     }
 
-    /// Returns the number of media segments.
-    pub fn media_len(&self) -> usize {
-        usize::try_from(self.index.numbers().end.0).unwrap_or(usize::MAX)
+    /// Returns `true` if these segments belong to a live representation.
+    ///
+    /// Live segment numbers need not start at zero; see [`Self::available`].
+    /// This snapshot does not refresh itself. Streams opened from the parent
+    /// [`DashManifest`](crate::DashManifest) share automatic refreshes.
+    pub fn is_live(&self) -> bool {
+        self.index.is_live()
     }
 
-    /// Returns the media segments' locations in playback order.
+    /// Returns the segment-number range available according to the system clock.
+    ///
+    /// Static media returns its full range. Live media returns segments that
+    /// have been produced and remain inside the time-shift window.
+    ///
+    /// Use these indexes with [`Self::span`]. The range is empty when no live
+    /// segment is available yet.
+    pub fn available(&self) -> Range<usize> {
+        self.available_when(SystemTime::now())
+    }
+
+    /// [`Self::available`] at wall-clock time `now`.
+    pub(crate) fn available_when(&self, now: SystemTime) -> Range<usize> {
+        let numbers = self.index.available(now);
+        let index = |number: SegmentNumber| usize::try_from(number.0).unwrap_or(usize::MAX);
+        index(numbers.start)..index(numbers.end)
+    }
+
+    /// Returns the current media-segment count.
+    ///
+    /// For live media, this is the number just past the newest available segment.
+    pub fn media_len(&self) -> usize {
+        self.available().end
+    }
+
+    /// Returns currently available media locations in playback order.
     pub fn media(&self) -> impl Iterator<Item = SegmentLocation> + '_ {
-        each(self.index.numbers()).filter_map(|number| self.index.location(number))
+        each(self.index.available(SystemTime::now()))
+            .filter_map(|number| self.index.location(number))
     }
 
     /// Returns the clock the media segments are timed on, or `None` for untimed
@@ -370,29 +427,42 @@ impl Segments {
     }
 
     /// Finds the media segment covering presentation time `time`, as an index
-    /// into [`Self::media`].
+    /// usable with [`Self::span`].
     ///
     /// A time before the first segment lands in the first, and a time at or
-    /// past the end lands in the last. Returns `None` for untimed segments or
-    /// segments without media.
+    /// past the end lands in the last; for live segments, the first and last
+    /// available now. Returns `None` for untimed segments, segments without
+    /// media, and live segments while none is available.
     pub fn segment_at(&self, time: Duration) -> Option<usize> {
         let number = self.index.number_at(time)?;
-        usize::try_from(number.0).ok()
+        let available = self.index.available(SystemTime::now());
+        let last = available.end.checked_prev()?;
+        if last < available.start {
+            return None;
+        }
+        usize::try_from(number.clamp(available.start, last).0).ok()
     }
 
     /// Returns the presentation time at which the last media segment ends.
-    /// Returns `None` for untimed segments or segments without media.
+    /// Returns `None` for untimed segments, segments without media, and live
+    /// segments.
     pub fn end(&self) -> Option<Duration> {
-        self.index.end_time()
+        match self.is_live() {
+            true => None,
+            false => self.index.end_time(),
+        }
     }
 
     /// Returns a conservative stream-length estimate for a demuxer that needs
     /// a length before all segments have been downloaded.
     ///
-    /// Returns `None` for untimed segments, segments without media, or a
-    /// zero `bitrate_bps`.
+    /// Returns `None` for untimed segments, segments without media, live
+    /// segments, or a zero `bitrate_bps`.
     pub fn estimate_len(&self, init_len: u64, bitrate_bps: u32) -> Option<u64> {
-        let first = self.index.numbers().start;
+        if self.is_live() {
+            return None;
+        }
+        let first = self.index.first();
         self.index.estimate_len(first, init_len, bitrate_bps)
     }
 
@@ -400,6 +470,19 @@ impl Segments {
     #[cfg(any(feature = "sync", feature = "async"))]
     pub(crate) fn index(&self) -> &Arc<MediaIndex> {
         &self.index
+    }
+}
+
+/// Fails with [`Error::DashManifestUnsupportedLive`] for live `segments`,
+/// which only a stream opened from their manifest keeps refreshed.
+#[cfg(any(feature = "sync", feature = "async"))]
+pub(crate) fn refuse_live(segments: &Segments) -> Result<(), Error> {
+    match segments.is_live() {
+        true => Err(Error::DashManifestUnsupportedLive(
+            "live segments stream only from their DashManifest, which keeps them refreshed"
+                .to_owned(),
+        )),
+        false => Ok(()),
     }
 }
 

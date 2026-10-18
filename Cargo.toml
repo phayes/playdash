@@ -25,8 +25,8 @@ rodio = { version = "0.22", optional = true, default-features = false, features 
     "symphonia-isomp4",
 ] }
 thiserror = "^2.0"
-# The async stream's download tasks, and its `AsyncRead` and `AsyncSeek`.
-tokio = { version = "1", optional = true, default-features = false, features = ["rt", "sync"] }
+# Runs asynchronous downloads and live-segment timers, and provides `AsyncRead` and `AsyncSeek`.
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "sync", "time"] }
 ureq = { version = "3.1", optional = true, default-features = false, features = ["rustls"] }
 url = "2.5"
 serde = { version = "1", features = ["derive"] }

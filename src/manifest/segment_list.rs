@@ -54,6 +54,7 @@ impl<'a> ListChain<'a> {
             ));
         }
         let addressed = Timing {
+            live: false,
             timescale: self.get(|list| list.timescale),
             start_number: None,
             end_number: Some(count),
@@ -70,11 +71,13 @@ impl<'a> ListChain<'a> {
         }
         .addressed(period_duration)?;
 
+        // A SegmentList is finite; its entry count supplies the missing end number.
         #[cfg(feature = "log")]
-        if addressed.segments.len() < count {
+        if let Some(timed) = addressed.segments.len()
+            && timed < count
+        {
             log::warn!(
-                "SegmentList timing covers {} of {count} SegmentURL elements; ignoring the rest",
-                addressed.segments.len()
+                "SegmentList timing covers {timed} of {count} SegmentURL elements; ignoring the rest"
             );
         }
         let initialization = self

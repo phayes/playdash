@@ -1,7 +1,7 @@
 //! The async API's segment transport: the source of segment bodies and sizes.
 
 use crate::error::Error;
-use crate::segment::{SegmentLocation, slice_range};
+use crate::segment::{FetchedManifest, SegmentLocation, slice_range};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use reqwest::header::{CONTENT_LENGTH, RANGE};
@@ -63,6 +63,17 @@ pub trait Transport: Send + Sync {
             )))
         })
     }
+
+    /// Fetches the manifest at `url` and returns its text and final URL.
+    ///
+    /// The default uses [`Self::get`] and cannot discover redirects, so it
+    /// reports `url` unchanged. It fails on transport errors or invalid UTF-8.
+    fn fetch_manifest<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<FetchedManifest, Error>> {
+        Box::pin(async move {
+            let body = self.get(&SegmentLocation::new(url), None).await?;
+            FetchedManifest::from_bytes(body, url)
+        })
+    }
 }
 
 impl Transport for Client {
@@ -122,6 +133,20 @@ impl Transport for Client {
                 .ok_or_else(|| {
                     Error::Initialization(format!("HEAD for {url} did not return Content-Length"))
                 })
+        })
+    }
+
+    /// Fetches a manifest, following redirects and preserving the final URL.
+    fn fetch_manifest<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<FetchedManifest, Error>> {
+        Box::pin(async move {
+            let response = Client::get(self, url)
+                .send()
+                .await
+                .and_then(Response::error_for_status)
+                .map_err(Error::DashManifestRequest)?;
+            let url = response.url().to_string();
+            let body = response.text().await.map_err(Error::DashManifestRequest)?;
+            Ok(FetchedManifest { body, url })
         })
     }
 }
