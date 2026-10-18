@@ -1,6 +1,7 @@
-//! The async counterparts of [`playdash::fragment`](crate::fragment): the
-//! [`FragmentStream`] that downloads a representation's fragments, and the
-//! [`FragmentCache`] and [`Transport`] it fetches through.
+//! Async, lower-level access to DASH segments, caching, and transport.
+//!
+//! Most applications should use [`MediaStream`](crate::nonblocking::MediaStream). Use
+//! this module for complete segment bodies or a seekable async byte stream.
 
 mod cache;
 mod manifest;

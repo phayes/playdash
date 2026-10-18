@@ -1,4 +1,4 @@
-//! Progressive in-memory streaming of MPEG-DASH fragments: the blocking `FragmentStream`.
+//! Blocking, lower-level access to downloaded DASH segments and bytes.
 
 use super::buffer::BufferHandle;
 use super::cache::FragmentCache;
@@ -17,26 +17,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// A representation's fragments, downloaded in the background and read in
-/// order: an [`Iterator`] of whole fragments, and a progressive [`Read`] and
-/// [`Seek`] view of the same bytes. The blocking counterpart of the `async`
-/// feature's `nonblocking::fragment::FragmentStream`.
+/// Downloads a representation's segments and exposes them as fragments or bytes.
 ///
-/// The initialization segment comes first, then the media segments. Iterating
-/// and reading share one position: [`Iterator::next`] yields everything from
-/// the current position to the end of its fragment, which is a whole fragment
-/// unless [`Read`] or [`Self::seek_bytes`] left the position inside one. Use
-/// [`Self::seek_bytes`] for byte offsets or [`Self::seek_time`] to seek
-/// to the start of the fragment containing a timestamp. Both iterating and
-/// reading block while the fragment they need downloads.
+/// This is a lower-level API. Use [`MediaStream`](crate::MediaStream) when you want
+/// packets ready for a codec decoder.
 ///
-/// It downloads on a background thread, one fragment at a time. By default it
-/// keeps the whole representation; [`Self::with_retention`] bounds how much it
-/// keeps behind its position and how far ahead it downloads, as long video
-/// needs.
+/// The stream starts with the MP4 initialization segment, followed by the media
+/// segments. Iterate to receive segment bodies, or use [`Read`] and [`Seek`] to treat
+/// their concatenated bytes as one file. These views share a position: after a partial
+/// byte read, the next iterator item contains only the rest of that segment.
 ///
-/// After a download fails, iteration yields the error once and then ends, and
-/// [`Read`] keeps returning it.
+/// Downloads run on a background thread. Reading blocks until the required segment is
+/// available. By default all segments are retained; [`Self::with_retention`] can bound
+/// memory and forward downloading.
 ///
 /// **N.B.** [`Read`] and [`Iterator`] both define `take`, `chain` and
 /// `by_ref`, and `&mut FragmentStream` implements both traits too. With

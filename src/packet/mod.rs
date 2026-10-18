@@ -1,6 +1,8 @@
-//! A representation's packets as MP4 stores them: [`Packet`]s and the [`Track`]s they
-//! belong to, and with the `sync` feature, the `PacketStream` that demuxes them from a
-//! `FragmentStream`.
+//! Lower-level access to compressed packets exactly as MP4 stores them.
+//!
+//! Most applications should use [`MediaStream`](crate::MediaStream), which converts
+//! these packets into decoder-friendly formats. Use [`PacketStream`] when you need the
+//! original MP4 samples or want to perform codec conversion yourself.
 
 #[cfg(feature = "sync")]
 mod stream;

@@ -34,35 +34,35 @@ use std::time::Duration;
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferStatus {
-    /// The whole stream.
+    /// Total size and duration of the representation's media segments.
     pub total: BufferTotal,
-    /// Downloaded fragments anywhere in the stream.
+    /// Media currently present in the cache, including non-contiguous ranges.
     pub downloaded: BufferAmount,
-    /// Downloaded spans of media time, in order, with adjacent fragments
-    /// merged into one span.
+    /// Cached ranges on the representation's media timeline.
+    /// Ranges are ordered, non-overlapping, and merge adjacent downloaded segments.
     pub ranges: Vec<Range<Duration>>,
 }
 
 /// An amount of downloaded media.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferAmount {
-    /// Media fragments.
+    /// Number of media segments represented by this amount.
     pub fragments: usize,
-    /// Bytes of fragment bodies.
+    /// Bytes in those media-segment bodies. The initialization segment is not counted.
     pub bytes: u64,
-    /// Media time.
+    /// Sum of the media durations covered by those segments.
     pub time: Duration,
 }
 
 /// The size of a whole stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferTotal {
-    /// Media fragments.
+    /// Total number of media segments in the representation.
     pub fragments: usize,
-    /// Bytes of all media fragments, once every fragment's size is known
-    /// from its byte range, a HEAD or its download.
+    /// Combined byte length of all media segments, excluding initialization.
+    /// `None` until every segment's size is known from a byte range, HEAD, or download.
     pub bytes: Option<u64>,
-    /// Media time.
+    /// Total duration of the representation's media timeline.
     pub time: Duration,
 }
 
@@ -115,8 +115,9 @@ impl BufferStatus {
         limit.or(latest_end).unwrap_or(position)
     }
 
-    /// [`Self::buffered_until`] as a percentage (0 to 100) of the stream's
-    /// duration, as drawn by a player's buffer bar.
+    /// Returns [`Self::buffered_until`] as a percentage of the whole duration.
+    ///
+    /// The result is clamped to `0.0..=100.0`; an empty stream reports `100.0`.
     pub fn buffered_percent(&self, position: Duration) -> f64 {
         percent(
             self.buffered_until(position).as_secs_f64(),
@@ -124,8 +125,11 @@ impl BufferStatus {
         )
     }
 
-    /// Percentage (0 to 100) of the stream's media time downloaded,
-    /// anywhere in the stream.
+    /// Returns the percentage of media time cached anywhere in the stream.
+    ///
+    /// Unlike [`Self::buffered_percent`], this includes downloaded ranges that are not
+    /// contiguous with the playback position. The result is clamped to `0.0..=100.0`;
+    /// an empty stream reports `100.0`.
     pub fn downloaded_percent(&self) -> f64 {
         percent(
             self.downloaded.time.as_secs_f64(),
@@ -133,14 +137,16 @@ impl BufferStatus {
         )
     }
 
-    /// Percentage (0 to 100) of the stream's bytes downloaded, once
-    /// [`BufferTotal::bytes`] is known.
+    /// Returns the percentage of the stream's media bytes currently cached.
+    ///
+    /// Returns `None` until every media segment's byte length is known. The result is
+    /// clamped to `0.0..=100.0`; a known total of zero bytes reports `100.0`.
     pub fn downloaded_bytes_percent(&self) -> Option<f64> {
         let total = self.total.bytes?;
         Some(percent(self.downloaded.bytes as f64, total as f64))
     }
 
-    /// Whether every media fragment is downloaded.
+    /// Returns whether every media segment is currently present in the cache.
     pub fn is_complete(&self) -> bool {
         self.downloaded.fragments == self.total.fragments
     }
@@ -192,8 +198,9 @@ fn percent(part: f64, whole: f64) -> f64 {
 
 /// Live report of how much of a stream's representation its cache holds.
 ///
-/// Get one from `FragmentStream::buffer`, blocking or async, or from
-/// `DashSource::buffer` (with the `rodio` feature). It reads only the cache,
+/// Get one from [`FragmentStream::buffer`](crate::fragment::FragmentStream::buffer),
+/// its [async counterpart](crate::nonblocking::fragment::FragmentStream::buffer), or from
+/// [`DashSource::buffer`](crate::DashSource::buffer). It reads only the cache,
 /// so it plays no part in playback and stays usable from any thread.
 #[derive(Clone)]
 pub struct BufferHandle(Arc<BufferShared>);
@@ -229,18 +236,24 @@ impl BufferHandle {
         Self(shared)
     }
 
-    /// The stream's current download progress: the portion the cache holds now.
+    /// Takes a snapshot of the stream's current download progress.
+    ///
+    /// This reads shared cache state without performing network I/O. Call it again to see
+    /// later progress, or register [`Self::on_change`] for notifications.
     pub fn status(&self) -> BufferStatus {
         self.0.status()
     }
 
-    /// Calls `callback` with fresh progress after each change to the cache:
-    /// one of the stream's fragments downloads, or has its size learned by a
-    /// HEAD request.
+    /// Registers a callback for subsequent changes to this stream's cached data.
     ///
-    /// It runs on the download thread that changed the cache, so keep it
-    /// quick. It is not called for changes before it was added; call
-    /// [`Self::status`] for the current progress.
+    /// The callback receives a fresh [`BufferStatus`] after one of the stream's segments
+    /// downloads, is released, or has its size learned by a HEAD request. Registering it
+    /// does not immediately invoke it; call [`Self::status`] for the initial value.
+    ///
+    /// It runs on the download thread that changed the cache, so it should return quickly
+    /// and must not assume a particular thread. Every registered callback remains active
+    /// for as long as the shared buffer state exists; this method does not return an
+    /// unsubscribe handle.
     pub fn on_change(&self, callback: impl Fn(&BufferStatus) + Send + Sync + 'static) {
         self.0
             .callbacks

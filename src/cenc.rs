@@ -54,38 +54,48 @@ pub struct ContentKeys {
 }
 
 impl ContentKeys {
-    /// An empty key set.
+    /// Creates an empty key set.
+    ///
+    /// Add keys with [`Self::insert`] when they are already decoded into 16-byte
+    /// arrays, or [`Self::insert_hex`] when they come from a manifest or command line.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Adds `key` for `kid`, replacing any earlier key for that KID.
+    /// Associates the 128-bit content key `key` with the 128-bit key ID `kid`.
+    ///
+    /// A later insertion with the same key ID replaces the earlier key. The returned
+    /// mutable reference makes several insertions easy to chain.
     pub fn insert(&mut self, kid: [u8; 16], key: [u8; 16]) -> &mut Self {
         self.keys.insert(kid, key);
         self
     }
 
-    /// Adds a key given as hexadecimal, like mp4decrypt's `--key kid:key`.
+    /// Parses and adds a hexadecimal key ID and content key.
     ///
-    /// Each is 32 hex digits. Dashes are ignored, so a manifest's UUID-form
-    /// `cenc:default_KID` works as is.
+    /// Each value must contain exactly 32 hexadecimal digits. Dashes are ignored, so a
+    /// UUID-form `cenc:default_KID` can be passed directly. The key ID and key follow the
+    /// same order as mp4decrypt's `--key kid:key` option.
+    ///
+    /// Returns [`Error::InvalidContentKey`] without including the supplied key text in
+    /// the error message when either value is malformed.
     pub fn insert_hex(&mut self, kid: &str, key: &str) -> Result<&mut Self, Error> {
         let kid = parse_hex_128(kid)?;
         let key = parse_hex_128(key)?;
         Ok(self.insert(kid, key))
     }
 
-    /// Whether a key for `kid` is present.
+    /// Returns whether this set contains a content key for `kid`.
     pub fn contains(&self, kid: &[u8; 16]) -> bool {
         self.keys.contains_key(kid)
     }
 
-    /// Number of keys.
+    /// Returns the number of distinct key IDs in the set.
     pub fn len(&self) -> usize {
         self.keys.len()
     }
 
-    /// Whether there are no keys.
+    /// Returns `true` when the set contains no content keys.
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }

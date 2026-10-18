@@ -36,7 +36,10 @@ pub struct FragmentCache {
 }
 
 impl FragmentCache {
-    /// An empty cache that fetches through `transport`.
+    /// Creates an empty shared cache that fetches missing fragments through `transport`.
+    ///
+    /// Wrap the result in an [`Arc`] to give several streams the same cache. A fragment
+    /// downloaded by any of those streams is then reused by the others.
     pub fn new(transport: Arc<dyn Transport>) -> Self {
         Self {
             transport,
@@ -67,20 +70,27 @@ impl FragmentCache {
         self.store.add_keys(keys)
     }
 
-    /// Whether this cache decrypts Common Encryption; see `with_keys`
-    /// (requires the `encryption` feature).
+    /// Returns whether content keys have configured this cache to decrypt Common
+    /// Encryption.
+    ///
+    /// This can only return `true` when the crate was built with the `encryption` feature.
     pub fn decrypts(&self) -> bool {
         self.store.decrypts()
     }
 
-    /// The body of `fragment`, if it is held. On a cache with content keys,
-    /// this is the decrypted body.
+    /// Returns the cached body of `fragment` without downloading it.
+    ///
+    /// Returns `None` when the fragment has not been downloaded or has been released by
+    /// every stream retaining it. On a cache with content keys, the returned bytes are
+    /// plaintext.
     pub fn cached(&self, fragment: &Fragment) -> Option<Bytes> {
         self.store.cached(fragment)
     }
 
-    /// The byte length of `fragment`, if its range, a HEAD or a GET has
-    /// established it.
+    /// Returns the byte length of `fragment` when it is already known.
+    ///
+    /// A byte range in the manifest, a completed HEAD request, or a completed download
+    /// can establish the size. This method does not perform network I/O.
     pub fn known_size(&self, fragment: &Fragment) -> Option<u64> {
         self.store.known_size(fragment)
     }

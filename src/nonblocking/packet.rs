@@ -1,5 +1,4 @@
-//! The async counterpart of [`playdash::packet`](crate::packet): the [`PacketStream`]
-//! that demuxes a representation's packets from an async `FragmentStream`.
+//! Async, lower-level access to packets stored in fragmented MP4.
 
 use super::MediaStream;
 use super::fragment::FragmentStream;
@@ -16,15 +15,15 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-/// A representation's coded frames, demuxed from the fragmented MP4 a
-/// [`FragmentStream`] downloads: a [`Stream`] of [`Packet`]s in decode order, with
-/// time seeking. The async counterpart of the blocking `playdash::packet::PacketStream`.
+/// Demultiplexes one track from a [`FragmentStream`] into MP4 [`Packet`] values.
 ///
-/// It reads one track: a representation's only one, or one chosen from
-/// [`FragmentStream::tracks`]. Protected media must come through a
-/// [`FragmentCache`](super::fragment::FragmentCache) with the content keys.
+/// This is a lower-level API. Packets retain the byte layout used inside MP4, which is
+/// not accepted directly by every decoder. Use [`MediaStream`] for
+/// decoder-ready input.
 ///
-/// After an error, the stream yields it once and then ends, until a seek succeeds.
+/// Packets arrive in decode order and include timestamps, duration, and keyframe
+/// information. The stream reads the representation's only track unless you choose one
+/// with [`Self::with_track`].
 ///
 /// # Examples
 ///

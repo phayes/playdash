@@ -1,5 +1,4 @@
-//! A representation's fragments, downloaded by tokio tasks and read as a
-//! `Stream` of whole fragments or as `AsyncRead` and `AsyncSeek` bytes.
+//! Async, lower-level access to downloaded DASH segments and bytes.
 
 use super::{FragmentCache, Transport};
 use crate::error::Error;
@@ -30,23 +29,16 @@ use tokio::task::JoinHandle;
 /// position it lands on.
 type SeekFuture = Pin<Box<dyn Future<Output = io::Result<(Cursor, Position)>> + Send>>;
 
-/// A representation's fragments, downloaded in the background and read in
-/// order: a [`Stream`] of whole fragments, and a progressive [`AsyncRead`] and
-/// [`AsyncSeek`] view of the same bytes. The async counterpart of the `sync`
-/// feature's `playdash::fragment::FragmentStream`.
+/// Downloads a representation's segments and exposes them as fragments or bytes.
 ///
-/// The initialization segment comes first, then the media segments. Streaming
-/// and reading share one position: each item is everything from the current
-/// position to the end of its fragment, which is a whole fragment unless
-/// reading or [`Self::seek_bytes`] left the position inside one. Use
-/// [`Self::seek_bytes`] for byte offsets or [`Self::seek_time`] to seek
-/// to the start of the fragment containing a timestamp. Both streaming and
-/// reading wait while the fragment they need downloads.
+/// This is a lower-level API. Use [`MediaStream`](crate::nonblocking::MediaStream) for
+/// packets ready for a codec decoder. This type implements [`Stream`] for segment bodies
+/// and [`AsyncRead`] plus [`AsyncSeek`] for their concatenated bytes. All views share one
+/// position.
 ///
-/// It downloads on the tokio runtime it was created on, one fragment at a
-/// time, and dropping it cancels the download in flight. By default it keeps
-/// the whole representation; [`Self::with_retention`] bounds how much it keeps
-/// behind its position and how far ahead it downloads, as long video needs.
+/// Downloads run on the Tokio runtime where the stream was created. By default all
+/// segments are retained; [`Self::with_retention`] can bound memory and forward
+/// downloading. Dropping the stream cancels its in-flight work.
 ///
 /// After a download fails, the stream yields the error once and then ends,
 /// and reading keeps returning it.

@@ -1,4 +1,4 @@
-//! Parsed MPEG-DASH manifests.
+//! MPEG-DASH manifests: loading a stream and choosing its audio or video.
 
 #[cfg(feature = "sync")]
 mod fetch;
@@ -26,15 +26,16 @@ use std::collections::HashMap;
 use template::{TemplateChain, TemplateValues};
 use url::Url;
 
-/// A parsed MPEG-DASH manifest and the entry point for selecting and streaming
-/// its representations.
+/// A parsed MPEG-DASH manifest and the starting point for playback.
 ///
-/// Load remote manifests with `DashManifest::new_from_url` (the `sync`
-/// feature). When parsing XML obtained another way, use [`DashManifest::new`]
-/// and set its source URL with [`DashManifest::with_base_url`] if it contains
-/// relative URLs. Parsing never touches the network. With the `async`
-/// feature, `nonblocking::DashManifest` mirrors this type and streams
-/// asynchronously.
+/// A manifest is the small XML document that describes the audio and video choices in a
+/// DASH stream. Load one with [`DashManifest::new_from_url`], inspect its
+/// [`representations`](Self::representations), then open a representation with
+/// `media_stream` when the `sync` or `async` feature is enabled.
+///
+/// Use [`Self::new`] when you already have the XML. If that XML contains relative URLs,
+/// also call [`Self::with_base_url`] with the URL it came from. The `async` feature
+/// provides the matching [`nonblocking::DashManifest`](crate::nonblocking::DashManifest).
 ///
 /// # Examples
 ///
@@ -272,7 +273,7 @@ fn resolve_url(base: Option<&Url>, reference: &str) -> Result<Url, Error> {
 }
 
 impl DashManifest {
-    /// Parses MPEG-DASH XML. Parsing never touches the network.
+    /// Parses MPEG-DASH manifest XML without making a network request.
     ///
     /// Relative segment and `BaseURL` references cannot be resolved without
     /// knowing where the manifest came from; set it with
@@ -280,8 +281,10 @@ impl DashManifest {
     ///
     /// A representation addressed only by `SegmentBase` keeps its segments in
     /// a `sidx` index inside the media file. It becomes streamable once that
-    /// index is loaded, with `load_segment_indexes` on this type (the `sync`
-    /// feature) or on `nonblocking::DashManifest` (the `async` feature).
+    /// index is loaded, with [`load_segment_indexes`](Self::load_segment_indexes) on this
+    /// type (the `sync` feature) or on
+    /// [`nonblocking::DashManifest`](crate::nonblocking::DashManifest) (the `async`
+    /// feature).
     /// Failure to load one representation's index does not prevent callers
     /// from using other representations.
     pub fn new(dash_xml: impl AsRef<str>) -> Result<Self, Error> {
@@ -303,35 +306,39 @@ impl DashManifest {
         Ok(manifest)
     }
 
-    /// Decodes a base64 `data:` URL and parses the embedded MPEG-DASH XML.
+    /// Parses a manifest embedded in a base64-encoded `data:` URL.
+    ///
+    /// This performs no network request. Relative media URLs still need a base URL set
+    /// with [`Self::with_base_url`].
     pub fn new_from_data_url(data_url: &str) -> Result<Self, Error> {
         let dash_xml = decode_data_url(data_url)?;
         Self::new(dash_xml)
     }
 
-    /// Sets the absolute URL the manifest was loaded from. Relative `BaseURL`
-    /// and segment references resolve against it.
+    /// Sets the absolute source URL used to resolve relative media references.
+    ///
+    /// Use the manifest URL itself, not its containing directory; standard URL joining
+    /// handles the directory. This replaces a previously set base URL.
     pub fn with_base_url(mut self, url: &str) -> Result<Self, Error> {
         self.base_url = Some(resolve_url(None, url)?);
         Ok(self)
     }
 
-    /// The URL the manifest was loaded from, if known.
+    /// Returns the absolute source URL used to resolve relative media references.
+    /// Returns `None` when the manifest was parsed without one.
     pub fn base_url(&self) -> Option<&str> {
         self.base_url.as_ref().map(Url::as_str)
     }
 
-    /// Lists representations in document order, across all periods and
-    /// adaptation sets.
+    /// Lists the media choices advertised by the manifest.
     ///
-    /// Use this to inspect the available IDs, codecs, and bitrates before
-    /// selecting one with [`DashManifest::representation`] or
-    /// [`DashManifest::fragments`].
+    /// A representation is one encoded variant, such as 720p video or 128 kbit/s audio.
+    /// Inspect these values, choose one, and pass its ID to `media_stream`.
     pub fn representations(&self) -> impl Iterator<Item = Representation<'_>> {
         self.selections().map(Selected::summary)
     }
 
-    /// Finds a representation by ID.
+    /// Finds one advertised media choice by representation ID.
     ///
     /// The first pass matches `representation_id` against the full
     /// representation ID. If that misses, a second pass matches the format
@@ -341,7 +348,7 @@ impl DashManifest {
         self.find(representation_id.as_ref()).map(Selected::summary)
     }
 
-    /// Lists the representations of `kind` in document order.
+    /// Lists only the representations classified as `kind`, in manifest order.
     ///
     /// Representations carrying both video and audio are [`ContentKind::Muxed`], and are
     /// not listed for [`ContentKind::Video`] or [`ContentKind::Audio`].
@@ -353,8 +360,7 @@ impl DashManifest {
             .filter(move |representation| representation.kind == kind)
     }
 
-    /// Finds the representation of `kind` with the highest advertised bandwidth; the first
-    /// in document order among equals.
+    /// Chooses the `kind` representation with the highest advertised bitrate.
     ///
     /// Returns `None` if no representation of `kind` advertises a bandwidth.
     pub fn highest_bandwidth(&self, kind: ContentKind) -> Option<Representation<'_>> {
@@ -366,8 +372,7 @@ impl DashManifest {
             })
     }
 
-    /// Finds the representation of `kind` with the lowest advertised bandwidth; the first
-    /// in document order among equals.
+    /// Chooses the `kind` representation with the lowest advertised bitrate.
     ///
     /// Returns `None` if no representation of `kind` advertises a bandwidth.
     pub fn lowest_bandwidth(&self, kind: ContentKind) -> Option<Representation<'_>> {
@@ -379,8 +384,9 @@ impl DashManifest {
             })
     }
 
-    /// Lists a representation's initialization fragment and its media
-    /// fragments in timeline order.
+    /// Resolves the initialization segment and ordered media segments for a representation.
+    ///
+    /// This is a lower-level query; use `media_stream` for decoder-ready playback.
     ///
     /// Fragments come from the representation's `SegmentTemplate` or
     /// `SegmentList` (whose entries may carry byte ranges), with URLs resolved
@@ -391,7 +397,10 @@ impl DashManifest {
         selected.fragments(self.base_url.as_ref(), &segments)
     }
 
-    /// Media-segment durations in timeline order, with the DASH timescale.
+    /// Returns the duration and timestamp scale of each media segment.
+    ///
+    /// Entry `n` describes `fragments(representation_id).media[n]`. This is mainly useful
+    /// with the lower-level fragment APIs.
     pub fn media_timeline(
         &self,
         representation_id: impl AsRef<str>,
@@ -413,13 +422,16 @@ impl DashManifest {
         Ok((fragments, segments.media_timeline()))
     }
 
-    /// MIME type of a representation, inherited from its adaptation set if absent.
+    /// Returns a representation's MIME type, inherited from its adaptation set.
+    /// Returns `Ok(None)` when neither level declares one.
     pub fn mime_type(&self, representation_id: impl AsRef<str>) -> Result<Option<&str>, Error> {
         Ok(self.select(representation_id.as_ref())?.mime_type())
     }
 
-    /// Common-encryption scheme protecting a representation, such as `cenc` or
-    /// `cbcs`, inherited from its adaptation set if absent.
+    /// Returns the representation's Common Encryption scheme, such as `cenc` or `cbcs`.
+    ///
+    /// The value is inherited from its adaptation set. `Ok(None)` means no compatible
+    /// protection declaration was found; it does not inspect downloaded media.
     pub fn protection_scheme(
         &self,
         representation_id: impl AsRef<str>,

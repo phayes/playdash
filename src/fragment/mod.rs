@@ -1,6 +1,8 @@
-//! A representation's fragments: what it is made of and its media timing, and with the
-//! `sync` feature, the `FragmentStream` that downloads them and the `FragmentCache` and
-//! `Transport` it fetches through.
+//! Lower-level access to the segments that make up a DASH representation.
+//!
+//! Most applications should use [`MediaStream`](crate::MediaStream). Use this module
+//! when you need complete downloaded segments, a seekable byte stream for another MP4
+//! demuxer, a shared cache, or a custom source of segment bytes.
 
 #[cfg(any(feature = "sync", feature = "async"))]
 pub(crate) mod buffer;
@@ -54,14 +56,15 @@ use std::time::Duration;
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaTimeline {
-    /// DASH timescale: ticks per second.
+    /// Number of DASH timeline ticks per second. A zero value makes time conversion fail.
     pub timescale: u32,
-    /// Media time at the start of the first media fragment, in `timescale`
-    /// ticks: the timestamp the media itself gives that instant, including any
-    /// `@presentationTimeOffset`. Subtract it from a media timestamp, such as
-    /// an MP4 decode time, to place that timestamp on this timeline.
+    /// Source timestamp of the first media segment, in [`Self::timescale`] ticks.
+    ///
+    /// This includes DASH's presentation-time offset. Subtract it from MP4 timestamps to
+    /// express them relative to the representation's playback time zero.
     pub origin: u64,
-    /// Duration of each media fragment, in timescale ticks, in playback order.
+    /// Duration of each media segment in [`Self::timescale`] ticks, in playback order.
+    /// Entry `n` corresponds to `Fragments::media[n]`.
     pub media_durations: Vec<u64>,
 }
 
@@ -83,8 +86,8 @@ impl MediaTimeline {
         Some(Duration::new(seconds, nanos))
     }
 
-    /// Media time spanned by each media fragment, in playback order. Empty
-    /// if the timescale is zero.
+    /// Converts segment durations into consecutive ranges from playback time zero.
+    /// Returns an empty vector for a zero timescale.
     pub fn spans(&self) -> Vec<Range<Duration>> {
         let mut ticks = 0u64;
         self.media_durations
@@ -129,7 +132,8 @@ impl MediaTimeline {
         Some((index, spans.swap_remove(index)))
     }
 
-    /// Total media duration, or `None` if the timescale is zero.
+    /// Returns the sum of all segment durations as wall-clock time.
+    /// Returns `None` for a zero timescale.
     pub fn total_duration(&self) -> Option<Duration> {
         self.ticks_to_duration(self.media_durations.iter().copied().sum())
     }
@@ -190,15 +194,16 @@ pub(crate) fn slice_range<'a>(body: &'a [u8], range: &RangeInclusive<u64>) -> Op
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Fragment {
-    /// Absolute URL of the resource.
+    /// Absolute URL of the resource containing this segment.
     pub url: String,
-    /// Inclusive byte range within the resource, as in an HTTP `Range`
-    /// header, or `None` for the whole body. Must not be empty.
+    /// Inclusive byte range within [`Self::url`], matching HTTP `Range` semantics.
+    /// `None` means the entire response body. Callers constructing this directly must
+    /// keep the start less than or equal to the end.
     pub range: Option<RangeInclusive<u64>>,
 }
 
 impl Fragment {
-    /// The whole body at `url`.
+    /// Creates a fragment covering the entire response body at `url`.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -206,7 +211,7 @@ impl Fragment {
         }
     }
 
-    /// The bytes of `url` covered by `range`.
+    /// Creates a fragment covering the inclusive byte `range` within `url`.
     pub fn with_range(url: impl Into<String>, range: RangeInclusive<u64>) -> Self {
         Self {
             url: url.into(),
@@ -214,7 +219,8 @@ impl Fragment {
         }
     }
 
-    /// Byte length, when the range makes it known in advance.
+    /// Returns the byte length implied by [`Self::range`].
+    /// Returns `None` for a whole-resource fragment or an invalid/overflowing range.
     pub fn known_size(&self) -> Option<u64> {
         self.range
             .as_ref()
@@ -261,9 +267,10 @@ impl fmt::Display for Fragment {
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fragments {
-    /// Initialization fragment, such as the `ftyp` and `moov` of fragmented MP4.
+    /// Initialization segment read before media, typically containing MP4 `ftyp` and
+    /// `moov` boxes with track and codec configuration.
     pub init: Fragment,
-    /// Media fragments in playback order, one per entry of the
+    /// Media segments in playback order, one per entry of the
     /// representation's [`MediaTimeline::media_durations`].
     pub media: Vec<Fragment>,
 }

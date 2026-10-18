@@ -50,7 +50,9 @@ pub use mp4::codec::Codec;
 #[doc(inline)]
 pub use rodio::DashSource;
 
-/// The byte buffer fragment bodies come in, re-exported for implementing a
-/// `Transport` without depending on the `bytes` crate directly.
+/// The byte buffer used by lower-level fragment transports.
+///
+/// This is re-exported so custom [`Transport`] implementations do not need a direct
+/// dependency on the `bytes` crate.
 #[cfg(any(feature = "sync", feature = "async"))]
 pub use bytes::Bytes;

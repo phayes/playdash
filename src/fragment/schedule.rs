@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Retention windows for a `FragmentStream`: the media time of a
+/// Retention windows for a [`FragmentStream`](crate::fragment::FragmentStream): the media time of a
 /// representation it keeps around its position. The default keeps everything and downloads to
 /// the end, which suits audio; long video wants both bounded.
 ///
@@ -37,14 +37,16 @@ use std::time::Duration;
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Retention {
-    /// Media time to keep behind the position. Fragments that end before it
-    /// are dropped from the cache once no other stream sharing it keeps them,
-    /// and seeking back to one downloads it again. `None` keeps everything.
+    /// Media duration to retain behind the current segment's start.
+    ///
+    /// Older segments are released once no other stream sharing the cache retains them;
+    /// seeking back downloads them again. `None` retains everything behind the position.
     pub behind: Option<Duration>,
 
-    /// Media time to download ahead of the position. The stream stops
-    /// downloading once it is this far ahead, and resumes as the position
-    /// moves. `None` downloads to the end.
+    /// Media duration to download ahead of the current segment's start.
+    ///
+    /// Downloading pauses when the retained window reaches this limit and resumes as
+    /// playback advances. `None` allows downloading through the end.
     pub ahead: Option<Duration>,
 }
 
@@ -59,23 +61,23 @@ pub(crate) struct WindowChange {
 /// Byte and media-time information for a stream position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
-    /// Absolute offset in the concatenated init + media byte stream.
+    /// Absolute offset in the virtual concatenation of initialization and media bytes.
     ///
     /// This is `None` when preceding fragment sizes are not yet known.
     pub byte: Option<u64>,
 
-    /// Media timestamp corresponding to the position, when a timeline applies.
+    /// Playback timestamp corresponding to this position, when a timeline is available.
     pub time: Option<TimePosition>,
 }
 
 /// Media timestamp of a stream position, and how precisely it describes that position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimePosition {
-    /// Media timestamp of the position. It may differ from a time a seek asked for;
-    /// compare the two to see by how much.
+    /// Best-known playback timestamp for the position.
+    /// It may differ from the requested seek time according to [`Self::accuracy`].
     pub timestamp: Duration,
 
-    /// Precision of `timestamp` for the position.
+    /// Granularity at which [`Self::timestamp`] is known.
     pub accuracy: TimeAccuracy,
 }
 

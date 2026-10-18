@@ -59,9 +59,9 @@ pub enum Codec {
 /// Audio stream parameters and decoder configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioConfig {
-    /// Output sample rate in Hz.
+    /// Sample rate of decoded audio, in samples per second (Hz).
     pub sample_rate: u32,
-    /// Output channel count.
+    /// Number of decoded audio channels.
     pub channels: u16,
     /// Decoder configuration bytes, as described on each [`Codec`] variant.
     pub config: Bytes,
@@ -70,7 +70,8 @@ pub struct AudioConfig {
 /// AAC stream parameters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AacConfig {
-    /// Sample rate and channels after any SBR, and the AudioSpecificConfig.
+    /// Decoded sample rate and channel count after any SBR expansion, plus the
+    /// AudioSpecificConfig in [`AudioConfig::config`].
     pub audio: AudioConfig,
     /// MPEG-4 Audio Object Type of the core codec, such as `2` for AAC-LC.
     pub object_type: u8,
@@ -83,22 +84,22 @@ pub struct AacConfig {
 /// Opus stream parameters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpusConfig {
-    /// Always 48 kHz, Opus's decoding rate, and the `dOps` payload.
+    /// Opus's 48 kHz decoding rate, output channel count, and the MP4 `dOps` payload.
     pub audio: AudioConfig,
-    /// Samples at 48 kHz the encoder added at the start, which a decoder discards.
+    /// Number of 48 kHz samples the decoder must discard from the start of its output.
     pub pre_skip: u16,
 }
 
 /// PCM stream parameters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PcmConfig {
-    /// Sample rate and channels, with empty `config`.
+    /// PCM sample rate and channel count. [`AudioConfig::config`] is empty for PCM.
     pub audio: AudioConfig,
     /// Bits per sample.
     pub bits_per_sample: u16,
-    /// Whether samples are IEEE floats rather than signed integers.
+    /// `true` for IEEE floating-point samples; `false` for signed integer samples.
     pub float: bool,
-    /// Whether samples are little-endian.
+    /// `true` for little-endian sample bytes; `false` for big-endian sample bytes.
     pub little_endian: bool,
 }
 
@@ -116,17 +117,18 @@ pub struct VideoConfig {
 /// A sample entry this crate does not interpret.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnknownCodec {
-    /// The sample entry type, such as `mp4v`.
+    /// Four-byte MP4 sample-entry type, such as `b"mp4v"`.
     pub fourcc: [u8; 4],
-    /// The whole sample entry box, header included.
+    /// Complete MP4 sample-entry box, including its box header.
     pub sample_entry: Bytes,
 }
 
 impl Codec {
-    /// Media time a decoder needs to decode before a seek target for its output there to
-    /// be correct: one frame for AAC-LC, AC-3 and E-AC-3, two for HE-AAC, three for MP3,
-    /// 80 ms for Opus, and zero for FLAC, PCM, video and unknown codecs. Video instead
-    /// starts decoding at a keyframe.
+    /// Returns the recommended amount of audio to decode and discard before a seek target.
+    ///
+    /// This is one frame for AAC-LC, AC-3, and E-AC-3; two for HE-AAC; three for MP3;
+    /// and 80 ms for Opus. It is zero for FLAC, PCM, video, and unknown codecs. Video
+    /// obtains decoding context by starting at a keyframe instead.
     pub fn default_preroll(&self) -> Duration {
         let frames = |count: u32, samples: u32, rate: u32| match rate {
             0 => Duration::ZERO,

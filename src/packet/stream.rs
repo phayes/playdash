@@ -1,4 +1,4 @@
-//! A representation's packets: the blocking `PacketStream` over a `FragmentStream`.
+//! Blocking, lower-level access to packets stored in fragmented MP4.
 
 use super::{Packet, PacketSeeked};
 use crate::decoder::{Choice, DecoderFormat, DecoderStyle, MediaStream};
@@ -10,16 +10,17 @@ use crate::mp4::codec::Codec;
 use crate::mp4::demux::{Demuxer, Landing, Loaded, Split};
 use std::time::Duration;
 
-/// A representation's coded frames, demuxed from the fragmented MP4 a
-/// [`FragmentStream`] downloads: an [`Iterator`] of [`Packet`]s in decode order, with
-/// time seeking. The blocking counterpart of the `async` feature's
-/// `nonblocking::packet::PacketStream`.
+/// Demultiplexes one track from a [`FragmentStream`] into MP4 [`Packet`] values.
 ///
-/// It reads one track: a representation's only one, or one chosen from
-/// [`FragmentStream::tracks`]. Protected media must come through a
-/// [`FragmentCache`](crate::FragmentCache) with the content keys.
+/// This is a lower-level API. Packets retain the byte layout used inside MP4, which is
+/// not accepted directly by every decoder. Use [`MediaStream`] for decoder-ready input.
 ///
-/// After an error, iteration yields it once and then ends, until a seek succeeds.
+/// Packets arrive in decode order and include timestamps, duration, and keyframe
+/// information. The stream reads the representation's only track unless you choose one
+/// with [`Self::with_track`]. Protected media must use a
+/// [`FragmentCache`](crate::FragmentCache) configured with content keys.
+///
+/// [`MediaStream`]: crate::MediaStream
 ///
 /// # Examples
 ///

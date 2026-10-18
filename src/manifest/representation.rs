@@ -1,16 +1,15 @@
-//! The summary of a representation that `DashManifest::representations`
-//! lists, and how its media kind and rates are read from the manifest.
+//! The audio and video choices listed by a DASH manifest.
 
 use super::Selected;
 use serde::{Deserialize, Serialize};
 
-/// A representation available for streaming from a [`DashManifest`].
+/// One encoded audio, video, or text choice in a DASH manifest.
 ///
-/// This is a lightweight view of the selection details applications commonly
-/// need. Use [`DashManifest::representations`] to list available
-/// representations and pass [`Self::id`] to [`DashManifest::fragments`], or to
-/// `DashManifest::media_stream` with the `sync` feature. Attributes the
-/// representation does not set are inherited from its adaptation set.
+/// A manifest often contains several representations of the same content, such as
+/// multiple video resolutions or audio bitrates. Use [`DashManifest::representations`]
+/// to list them, then pass [`Self::id`] to
+/// [`DashManifest::media_stream`](crate::DashManifest::media_stream). Fields that are
+/// absent from the representation inherit their value from its adaptation set.
 ///
 /// [`DashManifest`]: crate::DashManifest
 /// [`DashManifest::representations`]: crate::DashManifest::representations
@@ -52,38 +51,41 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Representation<'a> {
-    /// ID accepted by [`DashManifest::fragments`](crate::DashManifest::fragments)
-    /// and related selection methods.
+    /// Manifest-defined identifier used to open this representation.
+    /// Pass it to [`DashManifest::media_stream`](crate::DashManifest::media_stream) or a
+    /// lower-level selection method.
     pub id: &'a str,
 
-    /// Advertised bitrate in bits per second, when present.
+    /// Advertised average bitrate in bits per second, or `None` when not declared.
+    /// This is the value used by `highest_bandwidth` and `lowest_bandwidth`.
     pub bandwidth: Option<u64>,
 
-    /// Codec description, such as `avc1.64001f` or `mp4a.40.2`. A
-    /// representation carrying several media lists one codec per medium,
-    /// separated by commas.
+    /// DASH codec string, such as `avc1.64001f` or `mp4a.40.2`.
+    /// A muxed representation lists multiple codecs separated by commas. `None` means
+    /// neither the representation nor its adaptation set declares a codec.
     pub codecs: Option<&'a str>,
 
-    /// MIME type, such as `video/mp4`.
+    /// MIME type inherited from the representation or adaptation set, such as
+    /// `video/mp4`, or `None` when neither declares one.
     pub mime_type: Option<&'a str>,
 
-    /// Kind of media the representation carries.
+    /// Audio, video, text, muxed, or unknown media inferred from manifest metadata.
     pub kind: ContentKind,
 
-    /// Width of the video in pixels.
+    /// Coded video width in pixels, or `None` for audio/text or undeclared dimensions.
     pub width: Option<u64>,
 
-    /// Height of the video in pixels.
+    /// Coded video height in pixels, or `None` for audio/text or undeclared dimensions.
     pub height: Option<u64>,
 
-    /// Video frame rate. `None` when absent or not a valid DASH frame rate.
+    /// Advertised video frame rate, or `None` when absent or invalid.
     pub frame_rate: Option<FrameRate>,
 
-    /// Audio sampling rate in Hz. When the manifest gives a range, its
-    /// minimum. `None` when absent or not a number.
+    /// Advertised audio sample rate in Hz.
+    /// When the manifest gives a range, this is its minimum. `None` means absent or invalid.
     pub audio_sampling_rate: Option<u32>,
 
-    /// Language of the content, as an RFC 5646 tag such as `en` or `pt-BR`.
+    /// Content language as an RFC 5646 tag such as `en` or `pt-BR`, if declared.
     pub lang: Option<&'a str>,
 
     /// Roles of the adaptation set in the DASH role scheme
@@ -91,10 +93,9 @@ pub struct Representation<'a> {
     /// `commentary`.
     pub roles: Vec<&'a str>,
 
-    /// Position of the representation's adaptation set in document order,
-    /// across all periods. Representations with the same position are
-    /// alternative encodings of the same content, which a player may switch
-    /// between.
+    /// Stable index of the containing adaptation set in manifest order.
+    /// Representations with the same value are alternative encodings of the same logical
+    /// content, such as several resolutions of one video angle.
     pub adaptation_set: usize,
 }
 
@@ -120,15 +121,14 @@ pub enum ContentKind {
 /// `30000/1001` for NTSC's 29.97.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FrameRate {
-    /// Frames per `denominator` seconds.
+    /// Number of frames in each [`Self::denominator`]-second interval.
     pub numerator: u64,
-    /// Seconds that `numerator` frames take. Never zero in a frame rate read
-    /// from a manifest.
+    /// Seconds taken by [`Self::numerator`] frames. Never zero for parsed manifests.
     pub denominator: u64,
 }
 
 impl FrameRate {
-    /// Returns the frame rate in frames per second.
+    /// Converts this exact fraction to approximate frames per second.
     pub fn as_f64(self) -> f64 {
         self.numerator as f64 / self.denominator as f64
     }

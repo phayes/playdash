@@ -8,7 +8,7 @@ use reqwest::header::{CONTENT_LENGTH, RANGE};
 use reqwest::{Client, Response, StatusCode};
 
 /// Fetches fragment bodies and sizes for a [`FragmentCache`](super::FragmentCache):
-/// the async counterpart of the blocking `playdash::fragment::Transport`.
+/// the async counterpart of the blocking [`Transport`](crate::fragment::Transport).
 ///
 /// [`reqwest::Client`] implements this. Implement it to load fragments from
 /// another HTTP client, local storage, or an application-specific source.

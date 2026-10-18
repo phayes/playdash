@@ -31,14 +31,17 @@ use bytes::Bytes;
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Track {
-    /// MP4 track ID, as `PacketStream::with_track` takes it.
+    /// Numeric MP4 track ID accepted by
+    /// [`MediaStreamBuilder::track_id`](crate::MediaStreamBuilder::track_id) and
+    /// [`PacketStream::with_track`](crate::packet::PacketStream::with_track).
     pub id: u32,
-    /// Audio, video, text, or unknown, from the track's handler. Never
-    /// [`ContentKind::Muxed`].
+    /// Audio, video, text, or unknown media inferred from the MP4 handler.
+    /// A single MP4 track is never [`ContentKind::Muxed`].
     pub kind: ContentKind,
-    /// The codec of the track's samples, also when they are still encrypted.
+    /// Source codec and its original MP4 decoder configuration.
+    /// This remains available when the samples themselves are encrypted.
     pub codec: Codec,
-    /// Ticks per second of the track's timestamps.
+    /// Number of timestamp ticks per second for this track's packets.
     pub timescale: u32,
 }
 

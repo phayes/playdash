@@ -1,4 +1,5 @@
-//! Packets: a track's coded frames with their timing, as a `PacketStream` yields them.
+//! Packets: a track's coded frames with their timing, as a
+//! [`PacketStream`](crate::packet::PacketStream) yields them.
 
 use bytes::Bytes;
 use std::time::Duration;
@@ -16,33 +17,38 @@ use std::time::Duration;
 /// packet may record less than the codec decodes from it, the rest being padding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packet {
-    /// The coded frame. It shares memory with the fragment it came from, which stays
-    /// allocated while the packet does.
+    /// Compressed sample exactly as MP4 stores it.
+    /// It shares memory with its source fragment, which remains allocated with the packet.
     pub data: Bytes,
-    /// Presentation timestamp in `timescale` ticks.
+    /// When decoded output should be presented, in [`Self::timescale`] ticks.
+    /// This can be negative for codec priming before time zero.
     pub pts: i64,
-    /// Decode timestamp in `timescale` ticks.
+    /// When this sample should be decoded, in [`Self::timescale`] ticks.
+    /// Packets are yielded in this order.
     pub dts: i64,
-    /// Duration in `timescale` ticks, including trimmed ticks.
+    /// Full decoded duration in [`Self::timescale`] ticks, before applying the trims.
     pub duration: u64,
-    /// Ticks per second of `pts`, `dts`, `duration` and the trims.
+    /// Number of timestamp ticks per second for every timing field in this packet.
     pub timescale: u32,
-    /// Whether decoding can start at this packet. Every audio packet is a keyframe.
+    /// Whether decoding can begin here without an earlier video frame.
+    /// Audio packets are always marked as keyframes.
     pub keyframe: bool,
-    /// Ticks of decoded output to drop from the start.
+    /// Ticks of decoded output to remove from the start, usually encoder priming.
     pub trim_start: u64,
-    /// Ticks of decoded output to drop from the end.
+    /// Ticks of decoded output to remove from the end, usually encoder padding.
     pub trim_end: u64,
 }
 
 impl Packet {
-    /// The presentation timestamp as a time, or `None` if it is negative.
+    /// Converts [`Self::pts`] to a duration from the representation's time zero.
+    /// Returns `None` for a negative timestamp or zero timescale.
     pub fn presentation_time(&self) -> Option<Duration> {
         ticks_to_duration(self.pts, self.timescale)
     }
 }
 
-/// A `PacketStream` seek's landing point, and the packets to decode before continuing.
+/// A [`PacketStream`](crate::packet::PacketStream) seek's landing point, and the packets
+/// to decode before continuing.
 ///
 /// Feed `preroll` to a reset decoder in order and discard its output, then decode the
 /// stream's packets as usual, discarding any output presented before
@@ -51,27 +57,32 @@ impl Packet {
 /// after the landing point can still present earlier, as B-frames do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PacketSeeked {
-    /// The time the seek asked for.
+    /// Original wall-clock position passed to `seek_time` or `seek_keyframe`.
     pub requested: Duration,
-    /// Presentation timestamp of the packet the stream yields next, in `timescale` ticks.
+    /// Presentation timestamp of the stream's next packet, in [`Self::timescale`] ticks.
+    /// It may be earlier than [`Self::requested`] for a keyframe seek.
     pub landed: i64,
-    /// Presentation timestamp before which decoded output is discarded, in `timescale`
-    /// ticks: the requested time for `seek_time`, `landed` for `seek_keyframe`.
+    /// Presentation timestamp before which decoded output must not be shown.
+    ///
+    /// In [`Self::timescale`] ticks. This is the requested time for an exact seek and the
+    /// landing timestamp for a keyframe seek.
     pub discard_before: i64,
-    /// Ticks per second of `landed` and `discard_before`: the stream's timescale.
+    /// Number of ticks per second for [`Self::landed`] and [`Self::discard_before`].
     pub timescale: u32,
-    /// Packets to decode, in order, before the stream's next packet. None of their
-    /// output is presented.
+    /// MP4 packets that must be decoded before the stream's next packet.
+    /// Discard all output produced from this list.
     pub preroll: Vec<Packet>,
 }
 
 impl PacketSeeked {
-    /// The landing point as a time, or `None` if it is negative.
+    /// Converts [`Self::landed`] to a duration from the representation's time zero.
+    /// Returns `None` for a negative timestamp or zero timescale.
     pub fn landed_time(&self) -> Option<Duration> {
         ticks_to_duration(self.landed, self.timescale)
     }
 
-    /// The time before which decoded output is discarded, or `None` if it is negative.
+    /// Converts [`Self::discard_before`] to a duration from time zero.
+    /// Returns `None` for a negative timestamp or zero timescale.
     pub fn discard_before_time(&self) -> Option<Duration> {
         ticks_to_duration(self.discard_before, self.timescale)
     }

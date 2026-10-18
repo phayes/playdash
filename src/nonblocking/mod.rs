@@ -1,12 +1,11 @@
-//! The async API of the `async` feature: manifests and fragments fetched
-//! through [`reqwest`] on a tokio runtime.
+//! Asynchronous MPEG-DASH playback on a Tokio runtime.
 //!
-//! This module mirrors the blocking API of the `sync` feature, with the same
-//! names: [`DashManifest`] and [`MediaStream`] here, [`fragment::FragmentStream`],
-//! [`fragment::FragmentCache`] and [`fragment::Transport`] in [`fragment`], and
-//! [`packet::PacketStream`] in [`packet`]. Here [`DashManifest::new_from_url`] and
-//! [`MediaStreamBuilder::open`] are awaited, and a [`MediaStream`] is a
-//! [`futures_util::Stream`] of decoder-ready packets.
+//! Start with [`DashManifest`], choose a representation, and open its [`MediaStream`].
+//! A media stream implements [`futures_util::Stream`] and yields compressed packets ready
+//! for a decoder. Manifest and segment HTTP requests use [`reqwest`].
+//!
+//! The [`fragment`] and [`packet`] modules provide lower-level access to downloaded
+//! segments and MP4 packets. Most applications do not need them.
 //!
 //! # Examples
 //!
@@ -72,18 +71,20 @@ pub struct DashManifest {
 }
 
 impl DashManifest {
-    /// Parses MPEG-DASH XML. See [`crate::DashManifest::new`].
+    /// Parses manifest XML without making a network request.
+    ///
+    /// Call [`Self::with_base_url`] when the XML contains relative media URLs. A
+    /// `SegmentBase` manifest also needs [`Self::load_segment_indexes`] before streaming.
     pub fn new(dash_xml: impl AsRef<str>) -> Result<Self, Error> {
         crate::DashManifest::new(dash_xml).map(Self::from)
     }
 
-    /// Decodes a base64 `data:` URL and parses the embedded MPEG-DASH XML.
+    /// Parses a manifest embedded in a base64-encoded `data:` URL without network I/O.
     pub fn new_from_data_url(data_url: &str) -> Result<Self, Error> {
         crate::DashManifest::new_from_data_url(data_url).map(Self::from)
     }
 
-    /// Fetches and parses an MPEG-DASH manifest, and loads any `SegmentBase`
-    /// indexes it needs.
+    /// Downloads a manifest and prepares it for representation selection and streaming.
     ///
     /// The final URL, after redirects, becomes the [`Self::base_url`] that
     /// relative `BaseURL` and segment references resolve against. `data:` URLs
@@ -109,15 +110,17 @@ impl DashManifest {
         Ok(manifest)
     }
 
-    /// Fetches through `client` from now on, for its connection pool, proxy,
-    /// timeouts or TLS settings.
+    /// Uses `client` for subsequent manifest-index and media-segment requests.
+    ///
+    /// Configure the client before passing it to control connection pooling, proxies,
+    /// timeouts, redirects, TLS, and default headers.
     pub fn with_client(mut self, client: Client) -> Self {
         self.client = OnceLock::from(client);
         self
     }
 
-    /// Sets the absolute URL the manifest was loaded from. See
-    /// [`crate::DashManifest::with_base_url`].
+    /// Sets the absolute source URL used to resolve relative media references.
+    /// Use the manifest URL itself, not its containing directory.
     pub fn with_base_url(self, url: &str) -> Result<Self, Error> {
         Ok(Self {
             manifest: self.manifest.with_base_url(url)?,
@@ -125,7 +128,10 @@ impl DashManifest {
         })
     }
 
-    /// Fetches every `SegmentBase` index the manifest still needs.
+    /// Loads unresolved `SegmentBase` indexes with this manifest's HTTP client.
+    ///
+    /// [`Self::new_from_url`] does this automatically. Call it after [`Self::new`] for a
+    /// `SegmentBase` manifest, or after changing the base URL.
     ///
     /// A representation whose index fails to load reports the failure when it
     /// is streamed; the others are unaffected. Call it again after
@@ -142,12 +148,15 @@ impl DashManifest {
         }
     }
 
-    /// Returns a builder of a representation's [`MediaStream`]: its track's packets in the
-    /// form codec decoders read. Set options on the builder, then await
-    /// [`MediaStreamBuilder::open`].
+    /// Prepares one representation for decoder-ready async streaming.
     ///
-    /// The representation is matched as by [`Self::representation`]. Never fails; errors
-    /// come from [`MediaStreamBuilder::open`].
+    /// This is the main entry point after loading a manifest. Set any options on the
+    /// returned builder, then await [`MediaStreamBuilder::open`]. The resulting
+    /// [`MediaStream`] supplies decoder setup data and compressed packets as they
+    /// download.
+    ///
+    /// `representation_id` is matched as by [`Self::representation`]. Creating the
+    /// builder cannot fail; downloading and media errors are reported by `open`.
     ///
     /// # Examples
     ///
@@ -166,25 +175,23 @@ impl DashManifest {
         MediaStreamBuilder::new(self, representation_id.as_ref())
     }
 
-    /// The URL the manifest was loaded from, if known.
+    /// Returns the source URL used to resolve relative references, if one is known.
     pub fn base_url(&self) -> Option<&str> {
         self.manifest.base_url()
     }
 
-    /// Lists representations in document order. See
-    /// [`crate::DashManifest::representations`].
+    /// Lists every advertised audio, video, text, or muxed choice in manifest order.
     pub fn representations(&self) -> impl Iterator<Item = Representation<'_>> {
         self.manifest.representations()
     }
 
-    /// Finds a representation by ID. See
-    /// [`crate::DashManifest::representation`].
+    /// Finds one advertised media choice by representation ID.
+    /// Matching is case-insensitive and also accepts the token before the first comma.
     pub fn representation(&self, representation_id: impl AsRef<str>) -> Option<Representation<'_>> {
         self.manifest.representation(representation_id)
     }
 
-    /// Lists the representations of `kind` in document order. See
-    /// [`crate::DashManifest::representations_of`].
+    /// Lists only the representations classified as `kind`, in manifest order.
     pub fn representations_of(
         &self,
         kind: ContentKind,
@@ -192,25 +199,25 @@ impl DashManifest {
         self.manifest.representations_of(kind)
     }
 
-    /// Finds the representation of `kind` with the highest advertised bandwidth. See
-    /// [`crate::DashManifest::highest_bandwidth`].
+    /// Chooses the `kind` representation with the highest advertised bitrate.
+    /// Returns `None` if none of that kind declares a bitrate.
     pub fn highest_bandwidth(&self, kind: ContentKind) -> Option<Representation<'_>> {
         self.manifest.highest_bandwidth(kind)
     }
 
-    /// Finds the representation of `kind` with the lowest advertised bandwidth. See
-    /// [`crate::DashManifest::lowest_bandwidth`].
+    /// Chooses the `kind` representation with the lowest advertised bitrate.
+    /// Returns `None` if none of that kind declares a bitrate.
     pub fn lowest_bandwidth(&self, kind: ContentKind) -> Option<Representation<'_>> {
         self.manifest.lowest_bandwidth(kind)
     }
 
-    /// Lists a representation's initialization fragment and its media
-    /// fragments in timeline order. See [`crate::DashManifest::fragments`].
+    /// Resolves a representation's initialization segment and ordered media segments.
+    /// This is a lower-level query; use [`Self::media_stream`] for decoder-ready playback.
     pub fn fragments(&self, representation_id: impl AsRef<str>) -> Result<Fragments, Error> {
         self.manifest.fragments(representation_id)
     }
 
-    /// Media-segment durations in timeline order, with the DASH timescale.
+    /// Returns the duration and timestamp scale of each resolved media segment.
     pub fn media_timeline(
         &self,
         representation_id: impl AsRef<str>,
@@ -218,13 +225,13 @@ impl DashManifest {
         self.manifest.media_timeline(representation_id)
     }
 
-    /// MIME type of a representation, inherited from its adaptation set if absent.
+    /// Returns the representation's inherited MIME type, or `Ok(None)` if undeclared.
     pub fn mime_type(&self, representation_id: impl AsRef<str>) -> Result<Option<&str>, Error> {
         self.manifest.mime_type(representation_id)
     }
 
-    /// Common-encryption scheme protecting a representation, such as `cenc` or
-    /// `cbcs`. See [`crate::DashManifest::protection_scheme`].
+    /// Returns the declared Common Encryption scheme, such as `cenc` or `cbcs`.
+    /// `Ok(None)` means no compatible protection declaration was found.
     pub fn protection_scheme(
         &self,
         representation_id: impl AsRef<str>,
@@ -232,12 +239,13 @@ impl DashManifest {
         self.manifest.protection_scheme(representation_id)
     }
 
-    /// The parsed manifest underneath.
+    /// Borrows the client-independent parsed manifest used by this async wrapper.
     pub fn manifest(&self) -> &crate::DashManifest {
         &self.manifest
     }
 
-    /// The parsed manifest underneath, without the client.
+    /// Removes the async wrapper and returns its client-independent parsed manifest.
+    /// The configured HTTP client is discarded.
     pub fn into_inner(self) -> crate::DashManifest {
         self.manifest
     }

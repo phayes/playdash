@@ -136,7 +136,7 @@ pub enum Error {
         reason: String,
     },
 
-    /// A fragment uses MP4 features a `PacketStream` does not read, such as
+    /// A fragment uses MP4 features a [`PacketStream`](crate::packet::PacketStream) does not read, such as
     /// several tracks or samples still encrypted
     #[cfg(any(feature = "sync", feature = "async"))]
     #[error("Fragment {fragment} uses unsupported MP4 features: {reason}")]

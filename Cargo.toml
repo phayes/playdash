@@ -2,7 +2,7 @@
 name = "playdash"
 version = "0.2.0"
 authors = ["Patrick Hayes <patrick.d.hayes@gmail.com>"]
-description = "Parse MPEG-DASH manifests and set them up for progressive streaming playback"
+description = "Stream seekable MPEG-DASH audio and video as decoder-ready packets"
 license = "MIT OR Apache-2.0"
 edition = "2024"
 repository = "https://github.com/phayes/playdash"
@@ -43,10 +43,9 @@ serde_with = "3.23.0"
 
 [features]
 default = ["sync"]
-# The blocking API: `FragmentStream`, `FragmentCache` and `Transport`, fetching through ureq.
+# The blocking `MediaStream` API and its lower-level helpers, fetching through ureq.
 sync = ["dep:ureq", "dep:bytes"]
-# The async API in `playdash::nonblocking`: `DashManifest`, `FragmentStream`, `FragmentCache`
-# and `Transport`, fetching through reqwest on tokio.
+# The async `MediaStream` API in `playdash::nonblocking`, fetching through reqwest on tokio.
 async = ["dep:reqwest", "dep:futures-util", "dep:bytes", "dep:tokio"]
 rodio = ["sync", "dep:rodio"]
 log = ["dep:log"]

@@ -1,5 +1,4 @@
-//! The blocking API: fetching manifests and indexes through ureq or a
-//! [`Transport`], and opening a [`MediaStream`](crate::MediaStream).
+//! Loading manifests and opening decoder-ready media with the blocking API.
 
 use ureq::ResponseExt;
 
@@ -10,8 +9,7 @@ use crate::fragment::Transport;
 use crate::fragment::transport::ureq_agent;
 
 impl DashManifest {
-    /// Fetches and parses an MPEG-DASH manifest, and loads any `SegmentBase`
-    /// indexes it needs.
+    /// Downloads a manifest and prepares it for representation selection and streaming.
     ///
     /// The final URL, after redirects, becomes the [`DashManifest::base_url`]
     /// that relative `BaseURL` and segment references resolve against. `data:`
@@ -33,8 +31,11 @@ impl DashManifest {
         Ok(manifest)
     }
 
-    /// Fetches every `SegmentBase` index the manifest still needs through
-    /// `transport`.
+    /// Loads unresolved `SegmentBase` indexes through `transport`.
+    ///
+    /// Most callers do not need this because [`Self::new_from_url`] loads indexes
+    /// automatically. Call it after [`DashManifest::new`] when the manifest uses
+    /// `SegmentBase`, or after changing its base URL.
     ///
     /// A representation whose index fails to load reports the failure when it
     /// is streamed; the others are unaffected. Call it again after
@@ -50,12 +51,15 @@ impl DashManifest {
         }
     }
 
-    /// Returns a builder of a representation's [`MediaStream`](crate::MediaStream): its
-    /// track's packets in the form codec decoders read. Set options on the builder, then
-    /// call [`MediaStreamBuilder::open`].
+    /// Prepares one representation for decoder-ready streaming.
     ///
-    /// The representation is matched as by [`DashManifest::representation`]. Never
-    /// fails; errors come from [`MediaStreamBuilder::open`].
+    /// This is the main entry point after loading a manifest. Set any options on the
+    /// returned builder, then call [`MediaStreamBuilder::open`]. The resulting
+    /// [`MediaStream`](crate::MediaStream) supplies decoder setup data and compressed
+    /// packets as they download.
+    ///
+    /// `representation_id` is matched as by [`DashManifest::representation`]. Creating
+    /// the builder cannot fail; downloading and media errors are reported by `open`.
     ///
     /// # Examples
     ///
