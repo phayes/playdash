@@ -315,9 +315,8 @@ cargo run --release --example video_player --features rodio -- MANIFEST_URL
 - Only single-period playback is supported; seamless multi-period playback is not yet
   supported.
 - Live (`type="dynamic"`) manifests play through `SegmentTemplate` addressing only, from
-  `media_stream` or `segment_stream`. Seeking within the time-shift window, a policy for
-  falling behind it, bounded memory by default, `UTCTiming` clock sync and low-latency
-  DASH are not yet supported, and rodio's `DashSource` does not play them.
+  `media_stream`, `segment_stream` or rodio's `DashSource`. `UTCTiming` clock sync,
+  low-latency DASH and multi-period live are not yet supported.
 - Hierarchical `sidx` indexes are not supported.
 - Open-GOP random access points and gradual decoding refresh are not supported.
 - A stream cannot change codecs partway through playback.

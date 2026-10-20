@@ -80,6 +80,32 @@ impl LiveDelay {
     const FALLBACK: Self = Self::Segments(4);
 }
 
+/// Controls what happens when playback falls behind a live presentation.
+///
+/// A live server normally keeps only a moving window of recent media. If the
+/// next required segment has left that window, this policy determines whether
+/// the stream reports an error or resumes at a newer point. It has no effect
+/// on static presentations.
+///
+/// # Examples
+///
+/// ```
+/// use playdash::BehindWindow;
+///
+/// assert_eq!(BehindWindow::default(), BehindWindow::Fail);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BehindWindow {
+    /// Return [`Error::BehindLiveWindow`]. The stream can be resumed by
+    /// seeking to a time in the error's `available` range.
+    #[default]
+    Fail,
+    /// Resume at the earliest segment still available.
+    WindowStart,
+    /// Resume at the stream's configured [`LiveDelay`] behind the live edge.
+    LiveEdge,
+}
+
 /// Live timing and refresh settings parsed from the MPD element.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LivePresentation {
@@ -305,23 +331,6 @@ impl Live {
         }
     }
 
-    /// Chooses the segment at `delay` behind the current live edge.
-    ///
-    /// The result is clamped to the available window. If the window is empty,
-    /// it is the next segment expected to become available.
-    #[cfg(any(feature = "sync", feature = "async"))]
-    pub(crate) fn start(&self, index: &MediaIndex, delay: Duration) -> SegmentNumber {
-        let now = self.clock.now();
-        let available = index.available(now);
-        let (Some(edge), Some(last)) = (index.live_edge(now), available.end.checked_prev()) else {
-            return available.end;
-        };
-        index
-            .number_at(edge.saturating_sub(delay))
-            .unwrap_or(last)
-            .clamp(available.start, last)
-    }
-
     /// Returns when the next manifest refresh is due.
     ///
     /// Returns `None` if refresh is disabled, impossible, or no longer needed.
@@ -478,9 +487,10 @@ impl Live {
 #[cfg(any(feature = "sync", feature = "async"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum LiveStart {
-    /// Use the caller's delay, or the manifest/default delay when absent.
-    Delay(Option<LiveDelay>),
-    /// Use the segment containing this presentation time.
+    /// Start at the configured delay behind the live edge.
+    Delay,
+    /// Start at the segment containing this presentation time, clamped to
+    /// media that is currently available.
     At(Duration),
 }
 
@@ -493,14 +503,16 @@ pub(crate) struct LiveSource {
     pub(crate) first: SegmentNumber,
     /// Presentation time at which the first segment starts.
     pub(crate) start: Duration,
+    /// The resolved distance behind the live edge at which playback starts.
+    pub(crate) delay: Duration,
 }
 
 #[cfg(any(feature = "sync", feature = "async"))]
 impl DashManifest {
-    /// What a stream of the representation `representation_id` opens with
-    /// to start as `start` says, while the manifest is live: its segments,
-    /// the link that keeps them refreshed, and where it starts. `None` for a
-    /// static manifest.
+    /// Prepares the live representation named by `representation_id`.
+    ///
+    /// `start` selects the initial segment. `delay` overrides the manifest's
+    /// suggested delay when present. Returns `None` for a static manifest.
     ///
     /// Fails as [`DashManifest::segments`] does, and with
     /// [`Error::Initialization`] for a start time when the segments are
@@ -509,6 +521,7 @@ impl DashManifest {
         &self,
         representation_id: &str,
         start: LiveStart,
+        delay: Option<LiveDelay>,
     ) -> Result<Option<LiveSource>, Error> {
         let Some(live) = self.live() else {
             return Ok(None);
@@ -516,10 +529,17 @@ impl DashManifest {
         let representation = self.select_indexed(representation_id)?.id().to_owned();
         let (segments, generation) = live.segments(&representation)?;
         let index = segments.index();
+
+        // Resolve the delay once, then clamp an explicit start to the current window.
+        let delay = live.delay(delay, index);
+        let now = live.clock().now();
         let (first, start) = match start {
-            LiveStart::At(time) => start_at(index, time)?,
-            LiveStart::Delay(choice) => {
-                let first = live.start(index, live.delay(choice, index));
+            LiveStart::At(time) => {
+                let time = index.clamp_time(time, now, delay).unwrap_or(time);
+                start_at(index, time)?
+            }
+            LiveStart::Delay => {
+                let first = index.behind_edge(now, delay);
                 let start = index.span(first).map_or(Duration::ZERO, |span| span.start);
                 (first, start)
             }
@@ -530,6 +550,7 @@ impl DashManifest {
             link,
             first,
             start,
+            delay,
         }))
     }
 }

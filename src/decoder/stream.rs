@@ -8,7 +8,7 @@ use super::{
 #[cfg(feature = "encryption")]
 use crate::cenc::ContentKeys;
 use crate::error::Error;
-use crate::manifest::{ContentKind, DashManifest, LiveDelay};
+use crate::manifest::{BehindWindow, ContentKind, DashManifest, LiveDelay};
 use crate::mp4::codec::Codec;
 use crate::packet::{PacketSeeked, PacketStream};
 use crate::segment::SegmentCache;
@@ -383,6 +383,7 @@ pub struct MediaStreamBuilder<'a> {
     keys: Option<ContentKeys>,
     retention: Option<Retention>,
     live_delay: Option<LiveDelay>,
+    behind_window: BehindWindow,
     track: Option<TrackChoice>,
     preroll: Option<Duration>,
     choice: Choice,
@@ -400,6 +401,7 @@ impl<'a> MediaStreamBuilder<'a> {
             keys: None,
             retention: None,
             live_delay: None,
+            behind_window: BehindWindow::default(),
             track: None,
             preroll: None,
             choice: Choice::Style(DecoderStyle::Elementary),
@@ -445,6 +447,16 @@ impl<'a> MediaStreamBuilder<'a> {
     /// setting has no effect on static manifests.
     pub fn live_delay(mut self, delay: LiveDelay) -> Self {
         self.live_delay = Some(delay);
+        self
+    }
+
+    /// Sets how playback recovers after falling behind a live presentation.
+    ///
+    /// The default, [`BehindWindow::Fail`], returns
+    /// [`Error::BehindLiveWindow`]. This setting has no effect on static
+    /// presentations.
+    pub fn behind_window(mut self, policy: BehindWindow) -> Self {
+        self.behind_window = policy;
         self
     }
 
@@ -527,7 +539,8 @@ impl<'a> MediaStreamBuilder<'a> {
             cache,
             retention,
             self.live_delay,
-        )?;
+        )?
+        .with_behind_window(self.behind_window);
 
         // The packets of the chosen track.
         let mut packets = match self.track {
@@ -548,7 +561,9 @@ impl<'a> MediaStreamBuilder<'a> {
     /// Opens the representation and seeks directly to the media playing at `time`.
     ///
     /// The returned [`Seeked`] must be handled before consuming the stream: reset and
-    /// configure the decoder, then decode its pre-roll as described on that type.
+    /// configure the decoder, then decode its pre-roll as described on that type. For
+    /// live media, an unavailable `time` is clamped to the current window;
+    /// [`Seeked::landed`] reports the actual starting point.
     ///
     /// Fails like [`Self::open`] and [`MediaStream::seek_time`].
     pub fn open_at(self, time: Duration) -> Result<(MediaStream, Seeked), Error> {

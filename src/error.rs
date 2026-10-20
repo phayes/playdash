@@ -57,9 +57,8 @@ pub enum Error {
     #[error("Live MPEG-DASH manifest is missing MPD@availabilityStartTime")]
     DashManifestMissingAvailabilityStart,
 
-    /// The live manifest uses a feature that this crate cannot play, or its
-    /// segments were opened somewhere that cannot keep them refreshed, such as
-    /// `SegmentStream::new` or rodio's `DashSource`.
+    /// The live manifest cannot be played with the requested API or uses live
+    /// features that this crate does not support.
     #[error("Unsupported live MPEG-DASH manifest: {0}")]
     DashManifestUnsupportedLive(String),
 
@@ -71,10 +70,19 @@ pub enum Error {
         attempts: u32,
     },
 
-    /// A refreshed manifest has a gap after the previous segment timeline,
-    /// so playback cannot continue seamlessly.
-    #[error("Refreshed live MPEG-DASH manifest no longer reaches the segments before it: {0}")]
-    DashManifestLiveGap(String),
+    /// Playback fell behind the earliest media still available from a live
+    /// presentation, and [`BehindWindow::Fail`](crate::BehindWindow::Fail) is
+    /// in effect.
+    ///
+    /// The stream remains usable. Seek to a time in `available` to resume.
+    /// When returned through [`std::io::Read`], this error is wrapped in an
+    /// [`std::io::Error`] and can be recovered with `get_ref` and `downcast_ref`.
+    #[error("Live stream fell behind the available window {available:?}")]
+    BehindLiveWindow {
+        /// The range of presentation times that was available when playback
+        /// fell behind.
+        available: std::ops::Range<std::time::Duration>,
+    },
 
     /// A representation's `SegmentBase` index could not be fetched or parsed
     /// when the manifest was loaded

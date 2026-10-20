@@ -33,7 +33,9 @@ pub use decoder::{MediaStream, MediaStreamBuilder};
 #[doc(inline)]
 pub use error::Error;
 #[doc(inline)]
-pub use manifest::{ContentKind, DashManifest, FrameRate, LiveDelay, Representation};
+pub use manifest::{
+    BehindWindow, ContentKind, DashManifest, FrameRate, LiveDelay, Representation,
+};
 #[cfg(any(feature = "sync", feature = "async"))]
 #[doc(inline)]
 pub use mp4::codec::Codec;

@@ -165,6 +165,10 @@ impl PacketStream {
     /// in earlier segments; those are fetched without moving the underlying stream's
     /// retention window.
     ///
+    /// For live media, a time outside the current window is clamped as
+    /// [`SegmentStream::seek_time`] describes. [`PacketSeeked::requested`]
+    /// remains `time`, while [`PacketSeeked::landed`] reports the actual result.
+    ///
     /// Fails like [`SegmentStream::seek_time`], and with the errors of fetching
     /// and parsing the segments it reads.
     pub fn seek_time(&mut self, time: Duration) -> Result<PacketSeeked, Error> {
@@ -186,11 +190,13 @@ impl PacketStream {
         self.seek(time, Landing::Keyframe)
     }
 
-    /// Seeks to `time`, landing as `landing` says.
-    fn seek(&mut self, time: Duration, landing: Landing) -> Result<PacketSeeked, Error> {
+    /// Performs a seek using the requested landing rule.
+    fn seek(&mut self, requested: Duration, landing: Landing) -> Result<PacketSeeked, Error> {
+        // Preserve the requested time while targeting currently available media.
+        let time = self.segments.clamp_time(requested)?;
         let index = self.segments.representation_index();
         let range = self.demuxer.seek_range(time, &index)?;
-        let first = self.segments.first_number();
+        let first = self.segments.earliest_number();
 
         // The segment containing `time`, where the stream then carries on.
         self.segments.seek_time(time)?;
@@ -222,7 +228,10 @@ impl PacketStream {
             match self.demuxer.seek(time, landing, &loaded, at_first, at_last) {
                 Split::Done(seeked) => {
                     self.failed = false;
-                    return Ok(seeked);
+                    return Ok(PacketSeeked {
+                        requested,
+                        ..seeked
+                    });
                 }
                 Split::Earlier => {
                     let before = earliest.checked_prev().ok_or_else(|| {
@@ -292,11 +301,15 @@ impl Iterator for PacketStream {
                 return Some(Ok(packet));
             }
             let loaded = match self.segments.next_part()? {
-                Ok(part) => self.load(part),
+                Ok(part) => {
+                    let jumped = part.jumped;
+                    self.load(part).map(|loaded| (loaded, jumped))
+                }
                 Err(error) => Err(error),
             };
             match loaded {
-                Ok(loaded) => self.demuxer.push(loaded),
+                Ok((loaded, false)) => self.demuxer.push(loaded),
+                Ok((loaded, true)) => self.demuxer.push_jumped(loaded),
                 Err(error) => {
                     self.failed = true;
                     return Some(Err(error));

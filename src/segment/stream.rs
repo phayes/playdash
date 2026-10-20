@@ -7,13 +7,15 @@ use super::index::MediaIndex;
 #[cfg(any(doc, test))]
 use super::schedule::TimeAccuracy;
 use super::schedule::{
-    self, Cursor, Part, PartBody, Position, Retention, Schedule, SizeStep, Supply, WindowChange,
+    self, Cursor, Part, PartBody, Position, ReadStep, Retention, Schedule, SizeStep, Supply,
+    WindowChange,
 };
 use super::store::SegmentData;
 use super::transport::Transport;
 use super::{SegmentNumber, Segments, refuse_live};
 use crate::error::Error;
-use crate::manifest::live::{LiveLink, Plan};
+use crate::manifest::BehindWindow;
+use crate::manifest::live::{LiveLink, LiveSource, Plan};
 use crate::mp4::track::{self, Track};
 use bytes::Bytes;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -83,9 +85,11 @@ pub struct SegmentStream {
     /// Estimated stream length. When set, [`SeekFrom::End`]`(0)` may report it
     /// instead of waiting for every segment size.
     length_estimate: Option<u64>,
-    /// Set once iteration has yielded an error, so it ends rather than
-    /// yielding the same error forever.
+    /// Whether iteration has reported a terminal error. A successful seek
+    /// clears this flag.
     failed: bool,
+    /// Whether the next returned segment follows an automatic live-window jump.
+    jumped: bool,
 }
 
 /// A stream's state, shared with its GET and HEAD worker threads.
@@ -141,16 +145,15 @@ impl SegmentStream {
         Self::open(&segments, first, cache, retention, None)
     }
 
-    /// Opens live `segments` at segment `first` and follows refreshes through `live`.
-    /// Retention and cache behavior match [`Self::new_retained`].
+    /// Opens `source` and follows its live manifest refreshes, using `cache`
+    /// and `retention` as [`Self::new_retained`] does.
     pub(crate) fn new_live(
-        segments: &Segments,
-        live: LiveLink,
-        first: SegmentNumber,
+        source: LiveSource,
         cache: Arc<SegmentCache>,
         retention: Retention,
     ) -> Result<Self, Error> {
-        Self::open(segments, first, cache, retention, Some(live))
+        let live = Some((source.link, source.delay));
+        Self::open(&source.segments, source.first, cache, retention, live)
     }
 
     /// Creates a stream that reads the initialization segment of
@@ -159,10 +162,11 @@ impl SegmentStream {
     /// or before `time`. The initialization segment is fetched before this
     /// returns.
     ///
-    /// The stream reports and seeks by the presentation time of `segments`,
-    /// as a stream of every segment would; seeking to a time before its start
-    /// fails. A `time` before the first media segment starts at the first,
-    /// and a `time` at or past the end starts at the last.
+    /// Times remain relative to the full presentation. Byte offset zero is
+    /// the initialization segment followed by the selected media segment, so
+    /// earlier media has no byte offset in this stream. Times before the
+    /// presentation start select the first segment; times at or beyond its end
+    /// select the last.
     ///
     /// Fails with [`Error::Initialization`] if `segments` are untimed or have
     /// no media segments, and with [`Error::DashManifestUnsupportedLive`] for
@@ -179,16 +183,16 @@ impl SegmentStream {
         Ok((stream, start))
     }
 
-    /// A stream of `segments` from the media segment numbered `first`,
-    /// fetching through `cache` and keeping as much as `retention` says, and
-    /// kept current by `live`'s refreshes when live.
+    /// Opens `segments` at `first`, backed by `cache` and bounded by
+    /// `retention`. `live` supplies refresh state and the target live delay.
     fn open(
         segments: &Segments,
         first: SegmentNumber,
         cache: Arc<SegmentCache>,
         retention: Retention,
-        live: Option<LiveLink>,
+        live: Option<(LiveLink, Duration)>,
     ) -> Result<Self, Error> {
+        let (live, delay) = live.unzip();
         // Fetch the initialization segment, which tells how to decrypt the media.
         let init = cache.data(segments.init().clone());
         #[cfg(feature = "encryption")]
@@ -206,7 +210,8 @@ impl SegmentStream {
             now: clock.now(),
         };
         let index = segments.index().clone();
-        let schedule = Schedule::new(init, index, first, retention, role, supply);
+        let delay = delay.unwrap_or_default();
+        let schedule = Schedule::new(init, index, first, retention, role, delay, supply);
         cache.store.acquire(&schedule.kept());
         let shared = Arc::new(StreamShared {
             schedule: Mutex::new(schedule),
@@ -223,6 +228,7 @@ impl SegmentStream {
             cursor: Cursor::start(first),
             length_estimate: None,
             failed: false,
+            jumped: false,
         })
     }
 
@@ -235,6 +241,16 @@ impl SegmentStream {
             .lock()
             .set_retention(retention, self.shared.supply());
         self.shared.window_moved(change);
+        self
+    }
+
+    /// Sets how reading recovers after falling behind a live presentation.
+    ///
+    /// The default, [`BehindWindow::Fail`], returns
+    /// [`Error::BehindLiveWindow`]. This setting has no effect on static
+    /// presentations.
+    pub fn with_behind_window(self, policy: BehindWindow) -> Self {
+        self.shared.lock().set_behind_window(policy);
         self
     }
 
@@ -301,8 +317,8 @@ impl SegmentStream {
     /// Once all sizes are known, the exact length is returned. Other
     /// [`SeekFrom::End`] offsets always wait for exact sizes.
     ///
-    /// Fails with [`Error::Initialization`] if the stream's segments are
-    /// untimed or have no media, or `bitrate_bps` is zero.
+    /// Fails with [`Error::Initialization`] if the stream is live, has no
+    /// timeline or media, or `bitrate_bps` is zero.
     pub fn set_symphonia_compat(&mut self, enabled: bool, bitrate_bps: u32) -> Result<(), Error> {
         if !enabled {
             self.length_estimate = None;
@@ -320,9 +336,10 @@ impl SegmentStream {
     /// Otherwise backfills bodies until the offset is reachable.
     /// [`SeekFrom::Current`] requires a known absolute byte cursor.
     ///
-    /// Fails if the sizes of the segments before the target cannot be learned:
-    /// without HEAD, a stream with a bounded [`Retention`] may stop downloading
-    /// short of the target.
+    /// Fails if earlier segment sizes cannot be learned. For live streams,
+    /// offsets belonging to expired segments cannot be resolved, and
+    /// [`SeekFrom::End`] returns [`io::ErrorKind::Unsupported`] because the
+    /// stream has no fixed end.
     ///
     /// The returned byte offset is exact, except [`SeekFrom::End`]`(0)` under
     /// [`Self::set_symphonia_compat`], which may report an oversized estimate.
@@ -330,12 +347,15 @@ impl SegmentStream {
     /// segment boundary, and otherwise the containing segment's start as
     /// [`TimeAccuracy::Segment`].
     pub fn seek_bytes(&mut self, from: SeekFrom) -> io::Result<Position> {
+        self.shared.lock().check_seek_from(from)?;
+
         // The end, as far as it is known or estimated, without retargeting
         // the GET worker.
+        let reported_end = self.shared.lock().reported_end(self.length_estimate);
         if let SeekFrom::End(0) = from
-            && let Some((end, position)) = self.shared.lock().reported_end(self.length_estimate)
+            && let Some((end, position)) = reported_end
         {
-            self.cursor.place(end, 0, position.byte);
+            self.landed(end, 0, position.byte);
             return Ok(position);
         }
 
@@ -351,35 +371,48 @@ impl SegmentStream {
             .lock()
             .land_byte_seek(target, self.shared.supply())?;
         self.shared.window_moved(change);
-        self.cursor.place(part, offset_in_segment, Some(target));
+        self.landed(part, offset_in_segment, Some(target));
         Ok(position)
+    }
+
+    /// Updates all reader state after a seek lands and clears prior errors or
+    /// jump markers.
+    fn landed(&mut self, part: Part, offset_in_segment: usize, byte_position: Option<u64>) {
+        self.cursor.place(part, offset_in_segment, byte_position);
+        self.failed = false;
+        self.jumped = false;
     }
 
     /// Seeks to the start of the media segment containing presentation time
     /// `time`.
     ///
-    /// A `time` before the first media segment lands on the first. The seek
-    /// lands at byte `0` of the segment
-    /// containing `time`, so an fMP4 consumer receives the segment's leading `moof`
-    /// rather than an arbitrary position inside `mdat`. The target segment is
-    /// prioritized and loaded before this method returns.
+    /// Static times before the first segment land on that segment. For live
+    /// media, times before the current window land at its start; times at or
+    /// beyond the live edge land at the configured delay behind it. The
+    /// selected segment is downloaded before this method returns unless it
+    /// expires and the behind-window policy selects a replacement.
     ///
-    /// This is segment-granular: playback may begin earlier than `time` by up
-    /// to one media-segment duration. The returned [`TimePosition`](super::TimePosition)
-    /// holds the segment's start, which is exact for the position
-    /// ([`TimeAccuracy::Packet`]); compare it with `time` to see how far back
-    /// the seek landed. The byte field is `None` until every earlier segment
-    /// size is known.
+    /// Seeking is segment-granular, so playback may start earlier than the
+    /// requested time. The returned time is the exact start of the selected
+    /// segment. Its byte offset is `None` if earlier sizes are unknown or the
+    /// selected segment precedes this stream's initial join point.
+    ///
+    /// Returns an error if a live stream has no segment available. A target
+    /// can also expire from a live stream's moving window while it downloads.
+    /// In that case, [`BehindWindow::Fail`] returns
+    /// [`Error::BehindLiveWindow`]; the other [`BehindWindow`] policies move
+    /// to their chosen current segment, which the next read downloads if
+    /// necessary.
     pub fn seek_time(&mut self, time: Duration) -> io::Result<Position> {
         let (target, change) = self
             .shared
             .lock()
             .begin_time_seek(time, self.shared.supply())?;
         self.shared.window_moved(change);
-        let position = self
-            .wait_until(|schedule| schedule.settled(target))?
-            .land_time_seek(target)?;
-        self.cursor.place(target, 0, position.byte);
+        let step = self.wait_for(|schedule| schedule.read_step(target, self.shared.supply()))?;
+        let (part, position, change) = self.shared.lock().land_time_seek(step)?;
+        self.shared.window_moved(change);
+        self.landed(part, 0, position.byte);
         Ok(position)
     }
 
@@ -391,9 +424,9 @@ impl SegmentStream {
     /// [`Self::starting_at`]. A segment outside the retention window is not
     /// kept once returned, unless another stream sharing the cache keeps it.
     ///
-    /// Fails with [`Error::Initialization`] for a segment before the stream's
-    /// first or past its last, and with the download's error if it fails. A
-    /// failed fetch does not end the stream.
+    /// Fails with [`Error::Initialization`] if the segment is past the end or
+    /// has expired from a live window. Download failures are returned without
+    /// ending normal stream iteration.
     pub fn fetch_segment(&self, index: usize) -> Result<Bytes, Error> {
         Ok(self.media_part_body(SegmentNumber(index as u64))?.body)
     }
@@ -442,6 +475,7 @@ impl SegmentStream {
             span,
             location: data.location.clone(),
             body,
+            jumped: false,
         })
     }
 
@@ -470,15 +504,7 @@ impl SegmentStream {
     {
         let mut inner = self.shared.lock();
         loop {
-            if self.shared.cancelled.load(Ordering::SeqCst) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "MPEG stream cancelled",
-                ));
-            }
-            if let Some(error) = &inner.error {
-                return Err(io::Error::other(error.clone()));
-            }
+            self.check(&inner)?;
             if ready(&inner) {
                 return Ok(inner);
             }
@@ -490,6 +516,50 @@ impl SegmentStream {
         }
     }
 
+    /// Rechecks `step` after each schedule change until it returns a value or
+    /// the stream fails.
+    fn wait_for<T>(&self, mut step: impl FnMut(&mut Schedule) -> Option<T>) -> io::Result<T> {
+        let mut inner = self.shared.lock();
+        loop {
+            self.check(&inner)?;
+            if let Some(value) = step(&mut inner) {
+                return Ok(value);
+            }
+            inner = self
+                .shared
+                .condvar
+                .wait(inner)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    /// Returns the current cancellation or download error, if any.
+    fn check(&self, schedule: &Schedule) -> io::Result<()> {
+        if self.shared.cancelled.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "MPEG stream cancelled",
+            ));
+        }
+        match &schedule.error {
+            Some(error) => Err(io::Error::other(error.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Prioritizes `part` and waits for the reader's next action.
+    fn read_step(&self, part: Part) -> io::Result<ReadStep> {
+        self.prioritize_segment(part);
+        self.wait_for(|schedule| schedule.read_step(part, self.shared.supply()))
+    }
+
+    /// Moves the reader to the segment selected by a behind-window policy.
+    fn jump(&mut self, to: Part, byte: Option<u64>, change: WindowChange) {
+        self.shared.window_moved(change);
+        self.cursor.place(to, 0, byte);
+        self.jumped = true;
+    }
+
     fn prioritize_segment(&self, part: Part) {
         let mut schedule = self.shared.lock();
         if schedule.missing_body(part) {
@@ -498,13 +568,69 @@ impl SegmentStream {
         }
     }
 
-    /// Tells the workers where the cursor is now, which moves the window.
-    fn publish_cursor(&self) {
-        let change = self
-            .shared
-            .lock()
-            .move_cursor(self.cursor.part, self.shared.supply());
+    /// Publishes the cursor's current part to the workers and moves the
+    /// retained window with it.
+    ///
+    /// If the cursor is at the start of a part whose absolute byte offset is
+    /// now known, records that offset for later byte-position queries.
+    fn publish_cursor(&mut self) {
+        let (change, start) = {
+            let mut schedule = self.shared.lock();
+            let change = schedule.move_cursor(self.cursor.part, self.shared.supply());
+            (change, schedule.prefix_len(self.cursor.part))
+        };
+        self.cursor.learn_byte_position(start);
         self.shared.window_moved(change);
+    }
+}
+
+/// Weak access to stream state retained after another component owns the
+/// reader. Operations become no-ops or return `None` after the stream drops.
+#[cfg(feature = "rodio")]
+#[derive(Clone, Debug)]
+pub(crate) struct StreamHandle(std::sync::Weak<StreamShared>);
+
+#[cfg(feature = "rodio")]
+impl SegmentStream {
+    /// Returns weak access to this stream's shared state.
+    pub(crate) fn handle(&self) -> StreamHandle {
+        StreamHandle(Arc::downgrade(&self.shared))
+    }
+
+    /// Returns the presentation time of this stream's first media segment.
+    pub(crate) fn join_time(&self) -> Option<Duration> {
+        self.shared.lock().join_time()
+    }
+}
+
+#[cfg(feature = "rodio")]
+impl StreamHandle {
+    /// Updates the behind-window policy if the stream still exists.
+    pub(crate) fn set_behind_window(&self, policy: BehindWindow) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.lock().set_behind_window(policy);
+        }
+    }
+
+    /// Connects a buffer report to the stream if it still exists.
+    pub(crate) fn subscribe_buffer(&self, feed: super::buffer::BufferFeed) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.lock().subscribe_buffer(feed, shared.supply());
+        }
+    }
+
+    /// Returns the current available range if the stream still exists.
+    pub(crate) fn available(&self) -> Option<Range<Duration>> {
+        let shared = self.0.upgrade()?;
+        let now = shared.clock.now();
+        shared.lock().available_time(now)
+    }
+
+    /// Returns the current live edge if the stream still exists.
+    pub(crate) fn live_edge(&self) -> Option<Duration> {
+        let shared = self.0.upgrade()?;
+        let now = shared.clock.now();
+        shared.lock().live_edge(now)
     }
 }
 
@@ -523,11 +649,19 @@ impl StreamShared {
         }
     }
 
-    /// Applies a window move to the cache, dropping bodies no stream keeps,
-    /// and wakes the GET worker for what entered the window.
+    /// Applies cache ownership changes, evicts unused expired entries, and
+    /// wakes the download worker.
     fn window_moved(&self, change: WindowChange) {
-        self.cache.store.acquire(&change.acquired);
-        self.cache.store.release(&change.released, true);
+        let WindowChange {
+            acquired,
+            released,
+            trimmed,
+        } = change;
+        self.cache.store.acquire(&acquired);
+        self.cache.store.release(&released, true);
+        // Drop temporary ownership before checking whether trimmed entries are unused.
+        drop((acquired, released));
+        self.cache.store.evict(trimmed);
         self.condvar.notify_all();
     }
 
@@ -547,7 +681,9 @@ fn spawn_get_worker(shared: Arc<StreamShared>) {
         while let Some((part, data)) = next_get(&shared) {
             // Release data fetched only to discover its size once the request completes.
             let result = shared.cache.get(&data).map(drop);
-            let kept = shared.lock().finish_get(part, result);
+            let kept = shared
+                .lock()
+                .finish_get(part, result, shared.clock.now());
             if !kept {
                 shared.cache.store.forget_if_unheld(&data);
             }
@@ -585,7 +721,7 @@ fn next_get(shared: &StreamShared) -> Option<(Part, Arc<SegmentData>)> {
             continue;
         }
 
-        if let Some(work) = schedule.take_get() {
+        if let Some(work) = schedule.take_get(shared.clock.now()) {
             return Some(work);
         }
 
@@ -672,22 +808,25 @@ impl Read for SegmentStream {
         }
 
         loop {
+            // Resolve the current part, including any required live-window recovery.
             let part = self.cursor.part;
-            if self.shared.lock().past_end(part) {
-                let _schedule = self.wait_until(|schedule| schedule.complete)?;
-                return Ok(0);
-            }
-
-            // Wait for the segment under the cursor.
-            self.prioritize_segment(part);
-            let body = self
-                .wait_until(|schedule| schedule.settled(part))?
-                .checked_body(part);
-            let Some(body) = body else {
-                return Ok(0);
+            let body = match self.read_step(part)? {
+                ReadStep::Ready(found) => found.body,
+                ReadStep::End => {
+                    let _schedule = self.wait_until(|schedule| schedule.complete)?;
+                    return Ok(0);
+                }
+                ReadStep::Behind { available } => {
+                    return Err(io::Error::other(Error::BehindLiveWindow { available }));
+                }
+                ReadStep::Jumped { to, byte, change } => {
+                    self.jump(to, byte, change);
+                    continue;
+                }
             };
+            self.jumped = false;
 
-            // Copy from it, moving on to the next segment once it is used up.
+            // Copy available bytes and publish a cursor move at segment boundaries.
             let copied = self.cursor.read(&body, buf);
             if self.cursor.part != part {
                 self.publish_cursor();
@@ -707,29 +846,36 @@ impl SegmentStream {
             return None;
         }
         loop {
+            // Resolve the current part, including any required live-window recovery.
             let part = self.cursor.part;
-            if self.shared.lock().past_end(part) {
-                return None;
-            }
-
-            // Wait for the segment under the cursor.
-            self.prioritize_segment(part);
-            let waited = self
-                .wait_until(|schedule| schedule.settled(part))
-                .map(|mut schedule| schedule.checked_part(part));
-            let found = match waited {
-                Ok(found) => found?,
+            let step = self.read_step(part).map_err(Error::from);
+            let found = match step {
+                Ok(ReadStep::Ready(found)) => found,
+                Ok(ReadStep::End) => return None,
+                Ok(ReadStep::Behind { available }) => {
+                    self.failed = true;
+                    return Some(Err(Error::BehindLiveWindow { available }));
+                }
+                Ok(ReadStep::Jumped { to, byte, change }) => {
+                    self.jump(to, byte, change);
+                    continue;
+                }
                 Err(error) => {
                     self.failed = true;
-                    return Some(Err(error.into()));
+                    return Some(Err(error));
                 }
             };
 
-            // Hand over what is left of it and move on to the next.
+            // Return the unread suffix and advance to the next part.
             let rest = self.cursor.take_rest(found.body.clone());
             self.publish_cursor();
             if let Some(body) = rest {
-                return Some(Ok(PartBody { body, ..found }));
+                let jumped = std::mem::take(&mut self.jumped);
+                return Some(Ok(PartBody {
+                    body,
+                    jumped,
+                    ..found
+                }));
             }
         }
     }
@@ -745,9 +891,22 @@ impl SegmentStream {
         self.shared.lock().index().clone()
     }
 
-    /// Number of the stream's first media segment in its representation.
-    pub(crate) fn first_number(&self) -> SegmentNumber {
-        self.shared.lock().first()
+    /// Returns the earliest media segment currently reachable by the stream.
+    pub(crate) fn earliest_number(&self) -> SegmentNumber {
+        self.shared.lock().earliest(self.shared.clock.now())
+    }
+
+    /// Clamps `time` as [`Self::seek_time`] would.
+    ///
+    /// Fails if a live stream currently has no available segment.
+    pub(crate) fn clamp_time(&self, time: Duration) -> io::Result<Duration> {
+        self.shared.lock().clamp_time(time, self.shared.clock.now())
+    }
+
+    /// Returns the number of media entries currently held in the schedule.
+    #[cfg(test)]
+    pub(crate) fn scheduled_len(&self) -> usize {
+        self.shared.lock().media_data().count()
     }
 
     /// Wakes the test worker so it rechecks the manual clock.
@@ -2415,22 +2574,20 @@ mod tests {
         });
         assert_eq!(stream.next().unwrap().unwrap(), &b"init"[..]);
 
-        // Segment 0 is before this stream's first; segment 3 does not exist.
-        for index in [0, 3] {
-            assert!(matches!(
-                stream.fetch_segment(index),
-                Err(Error::Initialization(_))
-            ));
-        }
+        // An index beyond the representation still fails.
+        assert!(matches!(
+            stream.fetch_segment(3),
+            Err(Error::Initialization(_))
+        ));
 
-        // Fetching the last segment leaves the stream reading its first.
+        // Side-fetches on either side do not move the iterator cursor.
+        assert_eq!(stream.fetch_segment(0).unwrap(), &b"a"[..]);
         assert_eq!(stream.fetch_segment(2).unwrap(), &b"c"[..]);
         assert_eq!(stream.next().unwrap().unwrap(), &b"b"[..]);
         assert_eq!(stream.next().unwrap().unwrap(), &b"c"[..]);
         assert!(stream.next().is_none());
 
-        // Behind the window now, so fetching it again downloads it again and
-        // does not keep it.
+        // Once outside retention, a side-fetch downloads the segment again without keeping it.
         wait_for(|| cache.cached(&"b".into()).is_none());
         assert_eq!(stream.fetch_segment(1).unwrap(), &b"b"[..]);
         assert_eq!(cache.cached(&"b".into()), None);
@@ -2594,13 +2751,14 @@ mod tests {
         assert_eq!(bytes, b"initbc");
         assert_eq!(transport.gets(), ["init", "b", "c"]);
 
-        // Times stay the representation's: buffered ranges, seeks and positions.
+        // Buffer and seek times remain relative to the full presentation.
         let status = stream.buffer().unwrap().status();
         assert_eq!(
             status.ranges,
             [Duration::from_millis(1_500)..Duration::from_millis(4_500)]
         );
-        assert_eq!(status.total.segments, 2);
+        assert_eq!(status.total.segments, 3, "the representation's, all reachable");
+        assert_eq!(status.total.start, Duration::ZERO);
         assert_eq!(
             stream.seek_time(Duration::from_millis(3_500)).unwrap(),
             position(
@@ -2609,8 +2767,21 @@ mod tests {
             )
         );
         assert_eq!(stream.next().unwrap().unwrap(), &b"c"[..]);
-        let before_start = stream.seek_time(Duration::from_secs(1)).unwrap_err();
-        assert_eq!(before_start.kind(), io::ErrorKind::InvalidInput);
+
+        // Media before the join point remains seekable by time but has no stream byte offset.
+        assert_eq!(
+            stream.seek_time(Duration::from_secs(1)).unwrap(),
+            position(None, Some((Duration::ZERO, TimeAccuracy::Packet)))
+        );
+        assert_eq!(stream.next().unwrap().unwrap(), &b"a"[..]);
+
+        // Reaching the stream's initial segment restores absolute byte positions.
+        let here = stream.seek_bytes(SeekFrom::Current(0)).unwrap();
+        assert_eq!(here.byte, Some(4), "just past the initialization segment");
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"bc");
+        assert_eq!(stream.seek_bytes(SeekFrom::Current(0)).unwrap().byte, Some(6));
     }
 
     #[test]

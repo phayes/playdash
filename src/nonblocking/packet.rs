@@ -163,6 +163,10 @@ impl PacketStream {
     /// in earlier segments; those are fetched without moving the underlying stream's
     /// retention window.
     ///
+    /// For live media, a time outside the current window is clamped as
+    /// [`SegmentStream::seek_time`] describes. [`PacketSeeked::requested`]
+    /// remains `time`, while [`PacketSeeked::landed`] reports the actual result.
+    ///
     /// Fails like [`SegmentStream::seek_time`], and with the errors of fetching
     /// and parsing the segments it reads.
     pub async fn seek_time(&mut self, time: Duration) -> Result<PacketSeeked, Error> {
@@ -184,11 +188,13 @@ impl PacketStream {
         self.seek(time, Landing::Keyframe).await
     }
 
-    /// Seeks to `time`, landing as `landing` says.
-    async fn seek(&mut self, time: Duration, landing: Landing) -> Result<PacketSeeked, Error> {
+    /// Performs a seek using the requested landing rule.
+    async fn seek(&mut self, requested: Duration, landing: Landing) -> Result<PacketSeeked, Error> {
+        // Preserve the requested time while targeting currently available media.
+        let time = self.segments.clamp_time(requested)?;
         let index = self.segments.representation_index();
         let range = self.demuxer.seek_range(time, &index)?;
-        let first = self.segments.first_number();
+        let first = self.segments.earliest_number();
 
         // The segment containing `time`, where the stream then carries on.
         self.segments.seek_time(time).await?;
@@ -220,7 +226,10 @@ impl PacketStream {
             match self.demuxer.seek(time, landing, &loaded, at_first, at_last) {
                 Split::Done(seeked) => {
                     self.failed = false;
-                    return Ok(seeked);
+                    return Ok(PacketSeeked {
+                        requested,
+                        ..seeked
+                    });
                 }
                 Split::Earlier => {
                     let before = earliest.checked_prev().ok_or_else(|| {
@@ -291,12 +300,16 @@ impl Stream for PacketStream {
                 return Poll::Ready(Some(Ok(packet)));
             }
             let loaded = match ready!(this.segments.poll_next_part(cx)) {
-                Some(Ok(part)) => this.load(part),
+                Some(Ok(part)) => {
+                    let jumped = part.jumped;
+                    this.load(part).map(|loaded| (loaded, jumped))
+                }
                 Some(Err(error)) => Err(error),
                 None => return Poll::Ready(None),
             };
             match loaded {
-                Ok(loaded) => this.demuxer.push(loaded),
+                Ok((loaded, false)) => this.demuxer.push(loaded),
+                Ok((loaded, true)) => this.demuxer.push_jumped(loaded),
                 Err(error) => {
                     this.failed = true;
                     return Poll::Ready(Some(Err(error)));

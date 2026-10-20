@@ -298,6 +298,25 @@ impl Demuxer {
         }
     }
 
+    /// Queues a segment reached after a live-window jump.
+    ///
+    /// Packets before the first sync sample are discarded. For video, leading
+    /// pictures that depend on skipped media are discarded as well.
+    pub(crate) fn push_jumped(&mut self, loaded: Loaded) {
+        let mut entries = loaded
+            .entries
+            .into_iter()
+            .skip_while(|entry| !entry.packet.keyframe)
+            .peekable();
+        self.leading_before = entries
+            .peek()
+            .filter(|_| !self.audio)
+            .map(|entry| entry.packet.pts);
+        for entry in entries {
+            self.enqueue(entry);
+        }
+    }
+
     /// The next packet, if one is queued.
     pub(crate) fn pop(&mut self) -> Option<Packet> {
         self.queue.pop_front().map(|entry| entry.packet)
@@ -1054,6 +1073,26 @@ mod tests {
         assert_eq!(seeked.landed, 70);
         assert!(seeked.preroll.is_empty());
         assert_eq!(pts(drain(&mut demuxer)), [70, 100]);
+    }
+
+    #[test]
+    fn a_jump_starts_at_a_sync_sample_without_its_leading_pictures() {
+        let mut demuxer = demuxer(one_track(b"vide", Some(20), &[]), &[70, 70, 70]);
+        let first = load(&mut demuxer, 0, Some(0), &gop(), 0);
+        demuxer.push(first);
+        drain(&mut demuxer);
+
+        // The skipped segment is required by the new segment's leading RASL pictures.
+        let samples = video_samples(&[(SYNC, 40), (RASL, 10), (RASL, 10), (NON_SYNC, 40)]);
+        let jumped = load(&mut demuxer, 2, Some(120), &samples, 0);
+        demuxer.push_jumped(jumped);
+        assert_eq!(pts(drain(&mut demuxer)), [140, 170], "not the RASL at 120 and 130");
+
+        // Packets before the first sync sample are also discarded.
+        let samples = video_samples(&[(NON_SYNC, 0), (SYNC, 0), (NON_SYNC, 0)]);
+        let jumped = load(&mut demuxer, 5, Some(400), &samples, 0);
+        demuxer.push_jumped(jumped);
+        assert_eq!(pts(drain(&mut demuxer)), [390, 400]);
     }
 
     #[test]

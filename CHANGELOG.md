@@ -93,8 +93,30 @@
   - `DashManifest::is_live`, `Segments::is_live` and `Segments::available`, and
     `is_live`, `available` and `live_edge` on `SegmentStream`, `PacketStream` and
     `MediaStream` (blocking and async).
+  - Falling behind the time-shift window, as a reader paused for longer than
+    `@timeShiftBufferDepth` does, follows a `BehindWindow` policy, set with
+    `MediaStreamBuilder::behind_window` and `SegmentStream::with_behind_window`
+    (blocking and async): `Fail`, the default, fails reading with the recoverable
+    `Error::BehindLiveWindow`, after which a seek into the window carries on;
+    `WindowStart` carries on from the window's start; `LiveEdge` from the start delay
+    behind the live edge. A jump shows as a gap in the media's timestamps. Segments
+    already downloaded stay readable while in the window, and expired ones are never
+    fetched. A refresh whose timeline starts after the previous one ends counts as
+    falling behind.
+  - Seeks, and `open_at`, move a time outside the time-shift window into it: before it,
+    to its start; at or past the live edge, to the start delay behind it, but no later
+    than the newest segment. The returned position or `Seeked::landed` says where.
+  - A live stream keeps bounded state: `Retention::behind`, unset, keeps the time-shift
+    window, segments that leave it are dropped from the stream and its cache, and
+    `BufferStatus` covers the window as it moves. Byte offsets count on past the
+    segments dropped; `SeekFrom::End` and `set_symphonia_compat` fail while live.
+  - Rodio's `DashSource` plays live manifests: positions count from where it started
+    (`DashSource::start`), `total_duration` is `None`, seeks land inside the window,
+    and falling behind carries on from the window's start, or as
+    `DashSource::with_behind_window` says. `DashSource::available` and `live_edge`
+    report the window.
   - `Error::DashManifestMissingAvailabilityStart`, `DashManifestUnsupportedLive`,
-    `DashManifestStale` and `DashManifestLiveGap`.
+    `DashManifestStale` and `BehindLiveWindow`.
 - `Transport::fetch_manifest` (blocking and async), returning a `FetchedManifest`: the
   manifest and the URL it came from after redirects. `DashManifest::new_from_url` and
   live refreshes fetch through it.
@@ -107,6 +129,12 @@
 - `SegmentStream::new`, `new_with_transport`, `new_with_cache` and `starting_at`
   (blocking and async) refuse live `Segments` with `Error::DashManifestUnsupportedLive`;
   live streams open from their `DashManifest`, which keeps them refreshed.
+- A stream from `SegmentStream::starting_at` or `DashManifest::segment_stream_at`
+  (blocking and async) can seek, and `fetch_segment`, before the segment it started at;
+  positions there report no byte offset. Its `BufferStatus` covers the whole
+  representation.
+- A seek clears an error that ended a `SegmentStream`'s iteration, as `PacketStream` and
+  `MediaStream` seeks already did.
 - The async API's tokio dependency enables its `time` feature, for live streams' waits.
 
 - What DASH calls a segment is now named a segment throughout; "fragment" is left to the

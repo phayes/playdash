@@ -185,6 +185,54 @@ impl MediaIndex {
         Some(self.span(last)?.end)
     }
 
+    /// Returns the segment at `delay` behind the live edge at `now`.
+    ///
+    /// The result is clamped to the available live window. If the window is
+    /// empty, returns the number of the next segment expected to arrive.
+    #[cfg(any(feature = "sync", feature = "async"))]
+    pub(crate) fn behind_edge(&self, now: SystemTime, delay: Duration) -> SegmentNumber {
+        let available = self.available(now);
+        let (Some(edge), Some(last)) = (self.live_edge(now), available.end.checked_prev()) else {
+            return available.end;
+        };
+        self.number_at(edge.saturating_sub(delay))
+            .unwrap_or(last)
+            .clamp(available.start, last)
+    }
+
+    /// Clamps `time` to media available at `now`.
+    ///
+    /// Times before the live window move to its start. Times at or beyond the
+    /// live edge move to `delay` behind the edge, no later than the start of
+    /// the newest segment. A static index returns `time` unchanged. Returns
+    /// `None` if a live index currently has no available segment.
+    #[cfg(any(feature = "sync", feature = "async"))]
+    pub(crate) fn clamp_time(
+        &self,
+        time: Duration,
+        now: SystemTime,
+        delay: Duration,
+    ) -> Option<Duration> {
+        if !self.is_live() {
+            return Some(time);
+        }
+        let available = self.available(now);
+        let last = available
+            .end
+            .checked_prev()
+            .filter(|&last| last >= available.start)?;
+        let start = self.span(available.start)?.start;
+        let newest = self.span(last)?;
+        if time < start {
+            return Some(start);
+        }
+        if time >= newest.end {
+            let latest = newest.end.saturating_sub(delay).min(newest.start);
+            return Some(latest.max(start));
+        }
+        Some(time)
+    }
+
     /// The clock the media segments are timed on. `None` when untimed.
     pub(crate) fn timing(&self) -> Option<&MediaTiming> {
         match self {
@@ -382,16 +430,16 @@ impl MediaIndex {
         Some(self.number(low))
     }
 
-    /// Aligns this refreshed index's numbering with `old`.
+    /// Assigns segment numbers to this refreshed index that continue `old`.
     ///
-    /// A template keeps its numbers. A timeline is matched by start time: its
-    /// first segment takes the number of the old segment it starts in, or
-    /// counts back from the old first segment when it starts earlier.
+    /// Template indexes retain their existing numbering. Timeline indexes are
+    /// aligned by presentation time so overlapping segments keep stable
+    /// numbers. A gap after the old timeline leaves a skipped number, allowing
+    /// readers to recognize that the expected segment is no longer available.
     ///
-    /// Fails with [`Error::DashManifestLiveGap`] when the refreshed timeline
-    /// starts after the old one ends, and with
-    /// [`Error::DashManifestUnsupportedLive`] when the refresh changed the
-    /// segments' clock or addressing, or would number a segment below zero.
+    /// Fails with [`Error::DashManifestUnsupportedLive`] when the refresh
+    /// changed the segments' clock or addressing, or would number a segment
+    /// below zero.
     #[cfg(any(feature = "sync", feature = "async"))]
     pub(crate) fn aligned_to(self, old: &MediaIndex) -> Result<Self, Error> {
         let unsupported = |reason: &str| Err(Error::DashManifestUnsupportedLive(reason.to_owned()));
@@ -454,15 +502,12 @@ impl MediaIndex {
                 });
         }
 
-        // Otherwise align with the overlapping old segment or its immediate successor.
+        // Align with an overlapping segment, its successor, or one number past a gap.
         let at = old.ending_after(start).unwrap_or(old.first());
         if old.end() == Some(at)
-            && let Some(old_end) = old.end_time()
-            && start > old_end
+            && old.end_time().is_some_and(|old_end| start > old_end)
         {
-            return Err(Error::DashManifestLiveGap(format!(
-                "the refreshed timeline starts at {start:?}, after the previous one ends at {old_end:?}"
-            )));
+            return Ok(at.next());
         }
         Ok(at)
     }
@@ -826,11 +871,10 @@ mod tests {
             Err(Error::DashManifestUnsupportedLive(_))
         ));
 
-        // Starting after the old ones end leaves a gap.
-        assert!(matches!(
-            aligned(r#"<S t="12" d="2"/>"#),
-            Err(Error::DashManifestLiveGap(_))
-        ));
+        // A gap consumes one number so a waiting reader can detect missing media.
+        let past_gap = aligned(r#"<S t="12" d="2"/>"#).unwrap();
+        assert_eq!(past_gap.numbers(), n(7)..n(8));
+        assert_eq!(past_gap.span(n(7)), Some(secs(12)..secs(14)));
     }
 
     #[test]

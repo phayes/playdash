@@ -21,7 +21,7 @@ use crate::vendor::dash_mpd_core::{
     AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation as CoreRepresentation,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-pub use live::LiveDelay;
+pub use live::{BehindWindow, LiveDelay};
 use live::{Live, LivePresentation};
 pub use representation::{ContentKind, FrameRate, Representation};
 use segment_list::ListChain;

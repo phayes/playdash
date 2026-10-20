@@ -2,7 +2,7 @@
 
 use super::{SegmentCache, SegmentStream};
 use crate::error::Error;
-use crate::manifest::live::{LiveSource, LiveStart};
+use crate::manifest::live::LiveStart;
 use crate::nonblocking::DashManifest;
 use crate::{LiveDelay, Retention};
 use std::sync::Arc;
@@ -50,16 +50,8 @@ impl DashManifest {
         delay: Option<LiveDelay>,
     ) -> Result<SegmentStream, Error> {
         let id = representation_id.as_ref();
-        match self.manifest.live_source(id, LiveStart::Delay(delay))? {
-            Some(source) => {
-                let LiveSource {
-                    segments,
-                    link,
-                    first,
-                    ..
-                } = source;
-                SegmentStream::new_live(&segments, link, first, cache, retention).await
-            }
+        match self.manifest.live_source(id, LiveStart::Delay, delay)? {
+            Some(source) => SegmentStream::new_live(source, cache, retention).await,
             None => {
                 let segments = self.manifest.segments(id)?;
                 SegmentStream::new_retained(segments, cache, retention).await
@@ -91,17 +83,10 @@ impl DashManifest {
         cache: Arc<SegmentCache>,
     ) -> Result<(SegmentStream, Duration), Error> {
         let id = representation_id.as_ref();
-        match self.manifest.live_source(id, LiveStart::At(time))? {
+        match self.manifest.live_source(id, LiveStart::At(time), None)? {
             Some(source) => {
-                let LiveSource {
-                    segments,
-                    link,
-                    first,
-                    start,
-                } = source;
-                let retention = Retention::default();
-                let stream =
-                    SegmentStream::new_live(&segments, link, first, cache, retention).await?;
+                let start = source.start;
+                let stream = SegmentStream::new_live(source, cache, Retention::default()).await?;
                 Ok((stream, start))
             }
             None => {

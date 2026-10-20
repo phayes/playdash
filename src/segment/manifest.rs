@@ -83,14 +83,8 @@ impl DashManifest {
         delay: Option<LiveDelay>,
     ) -> Result<SegmentStream, Error> {
         let id = representation_id.as_ref();
-        match self.live_source(id, LiveStart::Delay(delay))? {
-            Some(source) => SegmentStream::new_live(
-                &source.segments,
-                source.link,
-                source.first,
-                cache,
-                retention,
-            ),
+        match self.live_source(id, LiveStart::Delay, delay)? {
+            Some(source) => SegmentStream::new_live(source, cache, retention),
             None => SegmentStream::new_retained(self.segments(id)?, cache, retention),
         }
     }
@@ -133,17 +127,11 @@ impl DashManifest {
         cache: Arc<SegmentCache>,
     ) -> Result<(SegmentStream, Duration), Error> {
         let id = representation_id.as_ref();
-        match self.live_source(id, LiveStart::At(time))? {
+        match self.live_source(id, LiveStart::At(time), None)? {
             Some(source) => {
-                let retention = Retention::default();
-                let stream = SegmentStream::new_live(
-                    &source.segments,
-                    source.link,
-                    source.first,
-                    cache,
-                    retention,
-                )?;
-                Ok((stream, source.start))
+                let start = source.start;
+                let stream = SegmentStream::new_live(source, cache, Retention::default())?;
+                Ok((stream, start))
             }
             None => SegmentStream::starting_at(self.segments(id)?, time, cache),
         }

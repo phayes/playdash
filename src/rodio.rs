@@ -2,9 +2,8 @@
 
 #[cfg(feature = "encryption")]
 use crate::ContentKeys;
-use crate::segment::schedule;
-use crate::segment::{SegmentStream, Segments};
-use crate::{BufferHandle, DashManifest, Error, SegmentCache};
+use crate::segment::{SegmentStream, StreamHandle};
+use crate::{BehindWindow, BufferHandle, DashManifest, Error, SegmentCache};
 use ::rodio::{Decoder, Source, source::SeekError};
 use std::ops::Range;
 use std::sync::Arc;
@@ -14,6 +13,13 @@ use std::time::Duration;
 ///
 /// Use [`DashSource::new`] for unprotected media. Common-encrypted media needs
 /// the `encryption` feature and [`DashSource::new_with_keys`].
+///
+/// Live playback starts at the manifest's suggested delay behind the live
+/// edge, or four segments behind when no delay is specified, and waits for new
+/// media at the edge. [`Source::total_duration`] returns `None`. Rodio seek
+/// positions are relative to [`Self::start`], not presentation time zero.
+/// Seeks are clamped to the current live window. By default, playback that
+/// falls behind resumes at the window start; see [`Self::with_behind_window`].
 ///
 /// # Examples
 ///
@@ -33,12 +39,20 @@ use std::time::Duration;
 /// # }
 /// ```
 pub struct DashSource {
-    segments: Segments,
-    /// Presentation time of the media's start and end. Rodio positions count
-    /// from the start.
-    media: Range<Duration>,
+    manifest: DashManifest,
+    id: String,
     cache: Arc<SegmentCache>,
     mime_type: String,
+    /// Recovery policy used after playback falls behind the live window.
+    behind: BehindWindow,
+    /// Presentation time corresponding to rodio position zero.
+    start: Duration,
+    /// End of static media in presentation time, or `None` while live.
+    end: Option<Duration>,
+    /// Buffer report shared across streams rebuilt by seeks.
+    buffer: BufferHandle,
+    /// Handle to the segment stream currently owned by `decoder`.
+    stream: StreamHandle,
     decoder: Decoder<SegmentStream>,
 }
 
@@ -78,68 +92,95 @@ impl DashSource {
         cache: Arc<SegmentCache>,
     ) -> Result<Self, Error> {
         let id = id.as_ref();
-        if manifest.is_live() {
-            return Err(Error::DashManifestUnsupportedLive(
-                "DashSource does not play live manifests".to_owned(),
-            ));
-        }
         if let Some(scheme) = manifest.protection_scheme(id)?
             && !cache.decrypts()
         {
             return Err(Error::RodioProtectedContent(scheme));
         }
-        let segments = manifest.segments(id)?;
-        let media = segments
-            .span(0)
-            .zip(segments.end())
-            .map(|(first, end)| first.start..end)
-            .ok_or_else(|| {
-                Error::Initialization("rodio playback requires media segments".to_owned())
-            })?;
         let mime_type = manifest.mime_type(id)?.unwrap_or_default().to_owned();
-        let (decoder, _) = Self::build_decoder(&segments, &cache, &mime_type, media.start)?;
 
+        // Open the initial stream and establish rodio's presentation-time origin.
+        let behind = BehindWindow::WindowStart;
+        let stream = manifest
+            .segment_stream_with_cache(id, cache.clone())?
+            .with_behind_window(behind);
+        let no_media = || Error::Initialization("rodio playback requires media segments".to_owned());
+        let start = stream.join_time().ok_or_else(no_media)?;
+        let end = match manifest.is_live() {
+            true => None,
+            false => Some(manifest.segments(id)?.end().ok_or_else(no_media)?),
+        };
+
+        // Keep one buffer handle subscribed across decoder rebuilds.
+        let (stream, decoder) = Self::decoder(stream, &mime_type)?;
+        let buffer = BufferHandle::empty(&cache.store);
+        stream.subscribe_buffer(buffer.feed());
         Ok(Self {
-            segments,
-            media,
+            manifest: manifest.clone(),
+            id: id.to_owned(),
             cache,
             mime_type,
+            behind,
+            start,
+            end,
+            buffer,
+            stream,
             decoder,
         })
     }
 
-    /// A handle reporting how much of this source's stream its cache holds.
+    /// Sets how playback recovers after falling behind the live window.
     ///
-    /// Get it before handing the source to rodio; it stays usable from any
-    /// thread afterwards. Plays no part in playback.
-    pub fn buffer(&self) -> BufferHandle {
-        let index = self.segments.index();
-        let numbers = index.first()..index.end().unwrap_or(index.first());
-        let media = schedule::timed_media(index, numbers, &self.cache.store);
-        BufferHandle::new(&self.cache.store, media)
+    /// The default, [`BehindWindow::WindowStart`], resumes at the earliest
+    /// available media. [`BehindWindow::Fail`] ends this rodio source because
+    /// [`Source`] cannot report playback errors. This setting has no effect on
+    /// static presentations.
+    pub fn with_behind_window(mut self, policy: BehindWindow) -> Self {
+        self.behind = policy;
+        self.stream.set_behind_window(policy);
+        self
     }
 
-    /// A decoder from the media segment covering presentation time `time`,
-    /// and that segment's start.
-    fn build_decoder(
-        segments: &Segments,
-        cache: &Arc<SegmentCache>,
+    /// Returns a handle reporting how much currently relevant media is cached.
+    ///
+    /// Obtain the handle before moving this source into rodio. It remains
+    /// usable from other threads, follows seeks, and does not affect playback.
+    pub fn buffer(&self) -> BufferHandle {
+        self.buffer.clone()
+    }
+
+    /// Returns the presentation time corresponding to rodio position zero.
+    pub fn start(&self) -> Duration {
+        self.start
+    }
+
+    /// Returns the currently seekable presentation-time range.
+    ///
+    /// For static media this is the full presentation. Returns `None` for
+    /// untimed media or while a live presentation has no available segment.
+    pub fn available(&self) -> Option<Range<Duration>> {
+        self.stream.available()
+    }
+
+    /// Returns the current live edge, or `None` for static media or an empty
+    /// live window.
+    pub fn live_edge(&self) -> Option<Duration> {
+        self.stream.live_edge()
+    }
+
+    /// Builds a decoder and returns weak access to its segment stream.
+    fn decoder(
+        stream: SegmentStream,
         mime_type: &str,
-        time: Duration,
-    ) -> Result<(Decoder<SegmentStream>, Duration), Error> {
+    ) -> Result<(StreamHandle, Decoder<SegmentStream>), Error> {
         // The decoder is unseekable and seeks rebuild by timeline, so byte
         // sizes from eager HEADs would go unused.
-        let (reader, start) = SegmentStream::starting_at(segments.clone(), time, cache.clone())?;
-
+        let handle = stream.handle();
         let decoder = Decoder::builder()
-            .with_data(reader)
+            .with_data(stream)
             .with_mime_type(mime_type)
             .build()?;
-        Ok((decoder, start))
-    }
-
-    fn total_duration_value(&self) -> Duration {
-        self.media.end - self.media.start
+        Ok((handle, decoder))
     }
 }
 
@@ -169,15 +210,24 @@ impl Source for DashSource {
     }
 
     fn total_duration(&self) -> Option<Duration> {
-        Some(self.total_duration_value())
+        Some(self.end?.saturating_sub(self.start))
     }
 
     fn try_seek(&mut self, requested: Duration) -> Result<(), SeekError> {
-        // Past the end, play from the end of the last segment.
-        let target = self.media.start + requested.min(self.total_duration_value());
-        let (mut decoder, segment_start) =
-            Self::build_decoder(&self.segments, &self.cache, &self.mime_type, target)
-                .map_err(|error| SeekError::Other(Arc::new(error)))?;
+        let failed = |error: Error| SeekError::Other(Arc::new(error));
+
+        // Static seeks stop at the known end; live seeks are clamped by the stream.
+        let target = self.start.saturating_add(requested);
+        let target = self.end.map_or(target, |end| target.min(end));
+        let (stream, segment_start) = self
+            .manifest
+            .segment_stream_at_with_cache(&self.id, target, self.cache.clone())
+            .map_err(failed)?;
+        let stream = stream.with_behind_window(self.behind);
+        let target = stream
+            .clamp_time(target)
+            .map_err(|error| failed(error.into()))?;
+        let (stream, mut decoder) = Self::decoder(stream, &self.mime_type).map_err(failed)?;
 
         let frames_to_skip = target
             .saturating_sub(segment_start)
@@ -200,6 +250,9 @@ impl Source for DashSource {
             }
         }
 
+        // Reattach reporting before replacing the active stream and decoder.
+        stream.subscribe_buffer(self.buffer.feed());
+        self.stream = stream;
         self.decoder = decoder;
         Ok(())
     }
@@ -210,6 +263,78 @@ mod tests {
     use super::*;
     use crate::Transport;
     use crate::segment::SegmentLocation;
+    use crate::segment::clock::ManualClock;
+    use std::sync::Mutex;
+
+    /// Serves numbered live AAC requests from a repeating three-segment fixture
+    /// and records every requested segment number.
+    #[derive(Default)]
+    struct LoopedAac(Mutex<Vec<u64>>);
+
+    impl Transport for LoopedAac {
+        fn get(&self, segment: &SegmentLocation, _size_hint: Option<u64>) -> Result<crate::Bytes, Error> {
+            let name = segment.url.trim_start_matches("https://cdn.test/");
+            let number = name
+                .strip_prefix("aac_")
+                .and_then(|name| name.strip_suffix(".m4s"))
+                .and_then(|number| number.parse::<u64>().ok());
+            let file = match number {
+                Some(number) => {
+                    self.0.lock().unwrap().push(number);
+                    format!("aac_{}.m4s", (number - 1) % 3 + 1)
+                }
+                None => name.to_owned(),
+            };
+            let path = format!("{}/tests/files/packets/{file}", env!("CARGO_MANIFEST_DIR"));
+            Ok(crate::Bytes::from(std::fs::read(path)?))
+        }
+    }
+
+    #[test]
+    fn a_live_source_plays_on_after_falling_behind_the_window() {
+        // Use half-second AAC segments in a two-second live window.
+        let xml = r#"
+            <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"
+                 availabilityStartTime="1970-01-01T00:00:00Z" timeShiftBufferDepth="PT2S">
+              <Period start="PT0S">
+                <AdaptationSet mimeType="audio/mp4">
+                  <Representation id="aac" codecs="mp4a.40.2" bandwidth="24000">
+                    <SegmentTemplate timescale="48000" initialization="aac_init.mp4"
+                                     media="aac_$Number$.m4s" duration="24000"/>
+                  </Representation>
+                </AdaptationSet>
+              </Period>
+            </MPD>"#;
+        let clock = ManualClock::at(10);
+        let manifest = DashManifest::new(xml)
+            .and_then(|manifest| manifest.with_base_url("https://cdn.test/live.mpd"))
+            .unwrap()
+            .with_clock(clock.clone());
+        let transport = Arc::new(LoopedAac::default());
+        let cache = Arc::new(SegmentCache::new(transport.clone()));
+
+        // The default four-segment delay starts at the beginning of this window.
+        let mut source = DashSource::new_with_cache(&manifest, "aac", cache).unwrap();
+        let secs = Duration::from_secs;
+        assert_eq!(source.total_duration(), None);
+        assert_eq!(source.start(), secs(8));
+        assert_eq!(source.available(), Some(secs(8)..secs(10)));
+        assert_eq!(source.live_edge(), Some(secs(10)));
+
+        // Move the live window ahead after playing a quarter second.
+        let second = source.sample_rate().get() as usize * source.channels().get() as usize;
+        assert_eq!(source.by_ref().take(second / 4).count(), second / 4);
+        clock.set(20);
+
+        // Playback resumes at the new window start without fetching expired media.
+        assert_eq!(source.by_ref().take(2 * second).count(), 2 * second);
+        let fetched = transport.0.lock().unwrap().clone();
+        assert!(fetched.contains(&37), "{fetched:?}");
+        assert!(
+            !fetched.iter().any(|number| (21..37).contains(number)),
+            "{fetched:?}"
+        );
+    }
 
     #[test]
     fn protected_representation_is_rejected_before_streaming() {

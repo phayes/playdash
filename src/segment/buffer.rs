@@ -9,6 +9,10 @@ use std::time::Duration;
 
 /// The stream's download progress: the portion of it that its cache holds.
 ///
+/// For a static presentation, totals and ranges are measured against the full
+/// representation. For a live presentation, they are measured against the
+/// current live window and change as segments are published and expire.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -54,17 +58,21 @@ pub struct BufferAmount {
     pub time: Duration,
 }
 
-/// The size of a whole stream.
+/// The total media currently represented by a buffer report.
+///
+/// For static presentations this covers the entire representation. For live
+/// presentations it covers the current, moving live window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferTotal {
-    /// Total number of media segments in the representation.
+    /// Number of media segments covered by this total.
     pub segments: usize,
-    /// Combined byte length of all media segments, excluding initialization.
-    /// `None` until every segment's size is known from a byte range, HEAD, or download.
+    /// Combined byte length of the media segments, excluding initialization
+    /// data, or `None` until every segment size is known.
     pub bytes: Option<u64>,
-    /// Presentation time at which the representation's first media segment starts.
+    /// Presentation time at which the covered media starts.
     pub start: Duration,
-    /// Presentation time at which the representation's last media segment ends.
+    /// Presentation time at which the covered media ends. For a live
+    /// presentation, this is the current live edge.
     pub end: Duration,
 }
 
@@ -214,33 +222,53 @@ pub struct BufferHandle(Arc<BufferShared>);
 type ChangeCallback = dyn Fn(&BufferStatus) + Send + Sync;
 
 struct BufferShared {
-    /// Buffered media and its presentation spans; live streams append to this list.
+    /// Media included in reports, paired with each segment's presentation span.
     media: Mutex<Vec<(Arc<SegmentData>, Range<Duration>)>>,
     callbacks: Mutex<Vec<Arc<ChangeCallback>>>,
 }
 
-/// Weak producer handle used to append newly available live segments.
-#[derive(Debug)]
+/// Producer-side handle for updating the media tracked by a [`BufferHandle`].
+#[derive(Clone, Debug)]
 pub(crate) struct BufferFeed(Weak<BufferShared>);
 
 impl BufferFeed {
-    /// Appends `media` and reports the updated range.
+    /// Replaces the tracked media and notifies subscribers.
     ///
     /// Returns `false` after the corresponding [`BufferHandle`] is dropped.
-    pub(crate) fn push(&self, media: Vec<(Arc<SegmentData>, Range<Duration>)>) -> bool {
+    pub(crate) fn replace(&self, media: Vec<(Arc<SegmentData>, Range<Duration>)>) -> bool {
         let Some(shared) = self.0.upgrade() else {
             return false;
         };
-        if !media.is_empty() {
-            shared.lock_media().extend(media);
-            shared.changed();
-        }
+        *shared.lock_media() = media;
+        shared.changed();
         true
     }
 
-    /// Returns whether the corresponding [`BufferHandle`] still exists.
-    pub(crate) fn is_alive(&self) -> bool {
-        self.0.strong_count() > 0
+    /// Adds newly available `media`, removes segments ending at or before
+    /// `window_start`, and notifies subscribers if the report changed.
+    ///
+    /// Returns `false` after the corresponding [`BufferHandle`] is dropped.
+    pub(crate) fn update(
+        &self,
+        media: Vec<(Arc<SegmentData>, Range<Duration>)>,
+        window_start: Duration,
+    ) -> bool {
+        let Some(shared) = self.0.upgrade() else {
+            return false;
+        };
+        let changed = {
+            let mut tracked = shared.lock_media();
+            let before = tracked.len();
+            tracked.retain(|(_, span)| span.end > window_start);
+            let dropped = tracked.len() != before;
+            let added = !media.is_empty();
+            tracked.extend(media);
+            dropped || added
+        };
+        if changed {
+            shared.changed();
+        }
+        true
     }
 }
 

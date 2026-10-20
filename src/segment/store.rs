@@ -300,6 +300,20 @@ impl Store {
         }
     }
 
+    /// Removes unreferenced entries in `segments` after they leave every live
+    /// schedule. A later request for an evicted segment creates a new entry.
+    pub(crate) fn evict(&self, segments: Vec<Arc<SegmentData>>) {
+        let mut map = self.lock();
+        for data in segments {
+            // Two references mean only the store and this list still own the entry.
+            let unused = Arc::strong_count(&data) == 2 && data.lock_held().holds == 0;
+            let entry = map.get(&data.location);
+            if unused && entry.is_some_and(|entry| Arc::ptr_eq(entry, &data)) {
+                map.remove(&data.location);
+            }
+        }
+    }
+
     /// Drops `data`'s body if no stream wants it, as after a download that
     /// landed outside every window.
     pub(crate) fn forget_if_unheld(&self, data: &SegmentData) {

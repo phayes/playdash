@@ -59,11 +59,11 @@ Prior art (dash.js 8502c40, androidx/media 8c6678b) - see /opt/dash.js
   time for timelines, and tracks loaded requests by `startTime`
   (`FragmentModel`).
 
-What blocked it (resolved by Phases 1 to 4)
+What blocked it (resolved by Phases 1 to 5)
 
 - `Schedule` assumed the stream has an end: `complete`, `past_end`,
   `total_len`, `SeekFrom::End`, the symphonia-compat length estimate, and
-  `BufferTotal`. (`BufferTotal` and byte-offset semantics remain: Phase 5.)
+  `BufferTotal`. (`BufferTotal` and byte-offset semantics: Phase 5.)
 - Manifest timing (`manifest/segments.rs`) needed a period end or
   `@endNumber` to bound `S@r="-1"` and `@duration` addressing.
 - The dynamic-MPD attributes were parsed by the vendored dash_mpd_core but
@@ -123,7 +123,7 @@ Phase 4 (done): the live index and the shared refresh
   become available. Queries: `available(now)`, `available_at(number)`,
   `live_edge(now)` (the end of the newest available segment), and
   `aligned_to(old)`, ExoPlayer's `copyWithNewRepresentation` cases by start
-  time (a gap is `DashManifestLiveGap`).
+  time (a gap numbers on past one unused number: Phase 5).
 - A refreshed timeline replaces the old index, shifted, rather than merging
   `S` entries: each segment the schedule has added keeps its own span
   (`Scheduled { data, span }`), which travels on `PartBody` to the demuxer.
@@ -156,45 +156,49 @@ Phase 4 (done): the live index and the shared refresh
 - The `Clock` comes from `Live` (a `ManualClock` in tests). A `UTCTiming`
   server offset would wrap it: not done.
 
-Phase 5: stream semantics at the live edge
-- Byte offsets: byte 0 is the start of the init, then the first segment the
-  stream joined at. `prefix_len` only covers segments seen since joining, so
-  `SeekFrom::Start` works only within the materialised range and
-  `SeekFrom::End` errors while live. symphonia-compat length estimates are not
-  available live.
-- `seek_time_coarse` (and so `seek_time` and `open_at`) clamps a time outside
-  the available window into it, as dash.js does, and reports where it landed
-  through the returned position.
-- Behind-window policy, chosen per stream on the builder:
-      pub enum Jump { WindowStart, LiveEdge }
-      MediaStreamBuilder::behind_window(self, jump: Jump) -> Self   // blocking and async
-      SegmentStream::with_behind_window(self, jump: Jump) -> Self
-  Stored as `Option<Jump>`. Unset, reading fails with a recoverable
-  `Error::BehindLiveWindow { available: Range<Duration> }`; the stream stays
-  usable and the caller seeks back into the window. `Jump::WindowStart`
-  continues from the earliest available segment (dash.js's default);
-  `Jump::LiveEdge` from the live edge less the start delay (dash.js's
-  low-latency mode). No effect on static manifests.
-- The policy applies at the first media segment the stream never fetched that
-  has left the window: segments already downloaded stay readable after the
-  server drops them. A gap between an old and a refreshed index (ExoPlayer's
-  `BehindLiveWindowException` case) is the same event; Phase 4 fails the
-  stream with `DashManifestLiveGap` there.
-- A jump shows as a forward `tfdt` discontinuity in the byte stream and a
-  timestamp gap in packets. Check that symphonia's isomp4 demuxer accepts a
-  `tfdt` jump before relying on jumps through the byte-stream path.
-- Retention `behind` defaults to the time-shift window depth, so memory stays
-  bounded even with `Retention::default()`. Today a live stream with the
-  default retention keeps every body it downloads.
-- Trim the front of the schedule's `media` deque (and the `Store` entries
-  behind it) once segments leave both the retention window and the
-  time-shift window; both grow without bound while live.
-- `seek_time` before the stream's first segment fails today; with clamping it
-  needs the byte numbering above.
-- `BufferStatus.total` becomes optional (or reports the available window) while
-  live.
-- Rodio `DashSource`: `total_duration` is `None` while live, and seeks clamp
-  to the available window.
+Phase 5 (done): stream semantics at the live edge
+- `pub enum BehindWindow { Fail (default), WindowStart, LiveEdge }`, set by
+  `MediaStreamBuilder::behind_window` and `SegmentStream::with_behind_window`
+  (blocking and async). `Fail` reads as a recoverable
+  `Error::BehindLiveWindow { available }` (wrapped in the `io::Error` for
+  `Read`); iteration ends until a seek, which clears it. `WindowStart`
+  carries on from the earliest available segment (dash.js's default), and
+  `LiveEdge` from the stream's start delay behind the edge (dash.js's
+  low-latency mode). Neither adds a margin, as neither player does.
+- The `Schedule` holds the policy and the resolved start delay, and readers
+  ask it `read_step(part)`: ready, end, behind, or jumped (the cursor and
+  window moved). A live segment counts as behind once it is before the
+  window and its body is not held; held bodies stay readable. Expired
+  segments are never fetched, and a GET failing for one that expired while in
+  flight does not end the stream. A jumped-to segment reaches the demuxer
+  marked, which drops packets before its first sync sample and its leading
+  pictures; symphonia (0.5, non-seekable) ignores `tfdt` and plays through.
+- A refreshed timeline starting after the old one ends numbers on past one
+  unused number, so a reader waiting after the old ones finds its segment
+  expired: the same event, through the policy. `DashManifestLiveGap` is gone.
+- Byte offsets: byte 0 is the init, then `join`, the segment the stream
+  started at. The deque's `front` moves back on seeks and pre-roll fetches
+  before it (segments before `join` have no byte offset, also for static
+  `starting_at` streams) and forward as live segments are trimmed, with their
+  sizes summed in `skipped` (`None` once one was unknown, or after a jump).
+  `SeekFrom::End` and symphonia-compat estimates fail while live.
+- Seeks (`seek_time`, packet seeks, `open_at`, `segment_stream_at`) move a
+  live time before the window to its start, and one at or past the edge to
+  the start delay behind it, no later than the newest segment's start.
+- Memory: `Retention::behind` unset means the time-shift depth while live;
+  the live window never starts before the time-shift window (a reader behind
+  it pins only its own segment); the deque front is trimmed and the trimmed
+  segments evicted from the `Store` once nothing else refers to them; the
+  schedule does not add expired segments past a paused reader.
+- `BufferStatus.total` and ranges cover the time-shift window while live, and
+  every reachable segment while static.
+- Rodio `DashSource` plays live: positions count from `start()`,
+  `total_duration` is `None`, seeks clamp into the window, and its policy
+  defaults to `WindowStart` (`with_behind_window`). `available`/`live_edge`.
+  A weak `StreamHandle` reaches the stream inside rodio's `Decoder`.
+- Left over: a store entry stays when its segment is trimmed while a GET of
+  it is in flight. A 404 for a segment the clock still counts as available
+  ends the stream (needs retries, Additional TODOs 5, and `UTCTiming`).
 
 Out of scope for this entry (note, don't solve)
 - Multi-period live, where a new period can bring a new init segment.
@@ -213,12 +217,6 @@ Out of scope for this entry (note, don't solve)
   live `SegmentList` / `SegmentBase`.
 - Retrying a failed refresh: today it fails the stream, as a failed GET does
   (Additional TODOs 5).
-
-Open questions
-- `behind_window(Jump)` with the recoverable error as the unset default, or a
-  three-variant enum (`WindowStart`, `LiveEdge`, `RecoverableError`) that can
-  name the default explicitly? `Jump` at the crate root may also want a more
-  specific name, such as `LiveJump`.
 
 
 2. Presentation time: timeline origins and decoder timestamps

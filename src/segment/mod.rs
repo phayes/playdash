@@ -29,6 +29,8 @@ pub use cache::SegmentCache;
 pub use schedule::{Position, TimePosition};
 #[cfg(feature = "sync")]
 pub use stream::SegmentStream;
+#[cfg(feature = "rodio")]
+pub(crate) use stream::StreamHandle;
 #[cfg(feature = "sync")]
 pub use transport::Transport;
 
