@@ -179,8 +179,12 @@ impl Store {
             .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(keys));
     }
 
-    /// Merges `keys` into the store's keys. A store without keys takes them only if it
-    /// knows no segments yet: one that does may hold bodies it kept undecrypted.
+    /// Adds `keys` without replacing any key already used by this store.
+    ///
+    /// A store first configured with keys must not contain any segments. Returns
+    /// [`Error::Initialization`] if it does, or [`Error::ConflictingContentKey`] if an
+    /// existing key ID has a different key. If either error is returned, no keys are
+    /// added.
     #[cfg(feature = "encryption")]
     pub(crate) fn add_keys(&self, keys: ContentKeys) -> Result<(), Error> {
         // Held throughout, so no stream can start using the store meanwhile.
@@ -189,7 +193,9 @@ impl Store {
         match current.as_deref() {
             Some(existing) => {
                 let mut merged = existing.clone();
-                merged.merge(keys);
+                merged
+                    .merge(keys)
+                    .map_err(|kid| Error::ConflictingContentKey(cenc::hex(&kid)))?;
                 *current = Some(Arc::new(merged));
             }
             None if segments.is_empty() => *current = Some(Arc::new(keys)),
@@ -409,5 +415,30 @@ impl Store {
         self.segments
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+#[cfg(all(test, feature = "encryption"))]
+mod tests {
+    use super::*;
+
+    const KID: [u8; 16] = *b"0123456789abcdef";
+
+    fn keys(key: &[u8; 16]) -> ContentKeys {
+        let mut keys = ContentKeys::new();
+        keys.insert(KID, *key);
+        keys
+    }
+
+    #[test]
+    fn a_kid_keeps_the_key_it_was_added_with() {
+        let store = Store::default();
+        store.add_keys(keys(b"fedcba9876543210")).unwrap();
+        store.add_keys(keys(b"fedcba9876543210")).unwrap();
+        assert!(matches!(
+            store.add_keys(keys(b"a different key!")),
+            Err(Error::ConflictingContentKey(kid)) if kid == cenc::hex(&KID)
+        ));
+        assert_eq!(store.keys().unwrap().len(), 1);
     }
 }

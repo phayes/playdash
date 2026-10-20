@@ -100,9 +100,20 @@ impl ContentKeys {
         self.keys.is_empty()
     }
 
-    /// Adds every key of `other`, replacing any earlier key for the same KID.
-    pub(crate) fn merge(&mut self, other: ContentKeys) {
+    /// Adds every key from `other` without replacing an existing key.
+    ///
+    /// Returns a conflicting key ID when both sets contain different keys for that ID.
+    /// No keys are added when a conflict is found.
+    pub(crate) fn merge(&mut self, other: ContentKeys) -> Result<(), [u8; 16]> {
+        let conflict = other
+            .keys
+            .iter()
+            .find(|&(kid, key)| self.keys.get(kid).is_some_and(|known| known != key));
+        if let Some((kid, _)) = conflict {
+            return Err(*kid);
+        }
         self.keys.extend(other.keys);
+        Ok(())
     }
 
     fn key(&self, kid: &[u8; 16]) -> Result<&[u8; 16], Problem> {
@@ -403,6 +414,9 @@ fn protected_regions(
         };
         regions.push(start..end);
         pos = end;
+    }
+    if pos != len {
+        return Err(malformed("subsamples do not cover their sample"));
     }
     Ok(regions)
 }
@@ -775,6 +789,26 @@ mod tests {
     }
 
     #[test]
+    fn merging_keeps_each_kids_key() {
+        let mut known = keys();
+        known.merge(keys()).unwrap();
+
+        let other_kid = *b"another key id!!";
+        let mut more = ContentKeys::new();
+        more.insert(other_kid, KEY);
+        known.merge(more).unwrap();
+        assert!(known.contains(&other_kid));
+
+        // Reject the entire set when it changes a known KID, including any new KIDs.
+        let mut changed = ContentKeys::new();
+        changed.insert(KID, *b"a different key!");
+        changed.insert(*b"third key id....", KEY);
+        assert_eq!(known.merge(changed), Err(KID));
+        assert_eq!(known.key(&KID).unwrap(), &KEY);
+        assert_eq!(known.len(), 2);
+    }
+
+    #[test]
     fn hex_keys_accept_uuid_form_and_never_echo_values() {
         let mut keys = ContentKeys::new();
         keys.insert_hex(
@@ -950,6 +984,18 @@ mod tests {
         let mut init = init(&CENC, 0);
         let mut sample = cenc_reference(&plaintext(32, 1), [1; 8], &[(16, 16)]);
         sample.subsamples = vec![(16, 17)];
+        let mut media = movie_fragment(&[sample], &SIZED);
+        assert!(matches!(
+            decrypt(&mut init, &mut media),
+            Err(Problem::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn subsamples_must_cover_their_sample() {
+        let mut init = init(&CENC, 0);
+        let mut sample = cenc_reference(&plaintext(32, 1), [1; 8], &[(16, 16)]);
+        sample.subsamples = vec![(16, 8)];
         let mut media = movie_fragment(&[sample], &SIZED);
         assert!(matches!(
             decrypt(&mut init, &mut media),

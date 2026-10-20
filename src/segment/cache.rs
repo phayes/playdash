@@ -60,11 +60,11 @@ impl SegmentCache {
         self
     }
 
-    /// Adds `keys` to the keys this cache decrypts with, as [`Self::with_keys`] does,
-    /// replacing any earlier key for the same KID. Readers opened afterwards can use them.
+    /// Adds content keys for readers opened with this cache.
     ///
-    /// Fails with [`Error::Initialization`] if the cache has no keys yet and a reader has
-    /// already used it.
+    /// Returns [`Error::Initialization`] when adding the cache's first keys after it has
+    /// already been used. Returns [`Error::ConflictingContentKey`] when a key ID already
+    /// has a different key. If either error is returned, no keys are added.
     #[cfg(feature = "encryption")]
     pub fn add_keys(&self, keys: ContentKeys) -> Result<(), Error> {
         self.store.add_keys(keys)
@@ -80,9 +80,10 @@ impl SegmentCache {
 
     /// Returns the cached body of `segment` without downloading it.
     ///
-    /// Returns `None` when the segment has not been downloaded or has been released by
-    /// every stream retaining it. On a cache with content keys, the returned bytes are
-    /// plaintext.
+    /// Returns `None` if the segment has not been downloaded or was evicted after
+    /// leaving every stream's retention window. Dropping a stream does not evict its
+    /// cached segments. When the cache has content keys, the returned bytes are
+    /// decrypted.
     pub fn cached(&self, segment: &SegmentLocation) -> Option<Bytes> {
         self.store.cached(segment)
     }

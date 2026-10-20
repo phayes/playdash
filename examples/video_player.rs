@@ -75,16 +75,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     print_keys();
 
-    // Audio sets the clock the video follows.
+    // Use audio playback as the master clock so video stays synchronized with sound.
+    // The player's position starts at zero, while DASH timestamps use presentation
+    // time, so add the audio stream's starting timestamp (`origin`) when timing video.
     let device = DeviceSinkBuilder::open_default_sink()?;
     let player = Player::connect_new(device.mixer());
     let audio_source = DashSource::new(&manifest, audio.id)?;
     let audio_buffer = audio_source.buffer();
+    let origin = audio_source.start();
     player.append(audio_source);
+    let now = || origin + player.get_pos();
 
     // Every video decoder, including those started by a seek, shares one cache.
     let cache = Arc::new(SegmentCache::default());
-    let mut decoder = Decoder::start(&manifest, id, &cache, Duration::ZERO)?;
+    let mut decoder = Decoder::start(&manifest, id, &cache, origin)?;
 
     let mut window = Window::new("playdash", WIDTH, HEIGHT, WindowOptions::default())?;
     window.set_target_fps(REDRAW_FPS);
@@ -98,7 +102,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     {
         // Keys and clicks on the progress bar.
         let mut seek_to = None;
-        let position = player.get_pos();
+        let position = now();
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
             if player.is_paused() {
                 player.play();
@@ -122,16 +126,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             && let (Some(total), Some((x, y))) = (total, window.get_mouse_pos(MouseMode::Discard))
             && y as usize >= HEIGHT - BAR_HEIGHT * 3
         {
-            seek_to = Some(total.mul_f32(x / WIDTH as f32));
+            seek_to = Some(origin + total.saturating_sub(origin).mul_f32(x / WIDTH as f32));
         }
         mouse_was_down = mouse_down;
 
         // A seek moves the audio exactly, and replaces the video decoder with
         // one starting at the segment containing the target.
         if let Some(target) = seek_to {
-            let target = total.map_or(target, |total| target.min(total));
+            let target = total.map_or(target, |total| target.min(total)).max(origin);
             let result = player
-                .try_seek(target)
+                .try_seek(target - origin)
                 .map_err(Box::<dyn Error>::from)
                 .and_then(|()| Decoder::start(&manifest, id, &cache, target));
             match result {
@@ -142,7 +146,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
         // Show the latest frame due by the audio's position, dropping any
         // that are late.
-        let clock = player.get_pos();
+        let clock = now();
         while decoder.next_frame_time() <= clock {
             match decoder.frames.try_recv() {
                 Ok(frame) => {
@@ -158,9 +162,17 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut statuses = vec![audio_buffer.status()];
             statuses.extend(decoder.buffer.as_ref().map(BufferHandle::status));
             let buffered = BufferStatus::buffered_until_all(&statuses, clock);
-            draw_progress(&mut screen, clock, buffered, total);
+            let from_origin = |time: Duration| time.saturating_sub(origin);
+            draw_progress(
+                &mut screen,
+                from_origin(clock),
+                from_origin(buffered),
+                from_origin(total),
+            );
         }
-        window.set_title(&title(clock, total, player.is_paused()));
+        let elapsed = clock.saturating_sub(origin);
+        let length = total.map(|total| total.saturating_sub(origin));
+        window.set_title(&title(elapsed, length, player.is_paused()));
         window.update_with_buffer(&screen, WIDTH, HEIGHT)?;
     }
     Ok(())

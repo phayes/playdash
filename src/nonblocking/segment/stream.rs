@@ -2,8 +2,8 @@
 
 use super::{SegmentCache, Transport};
 use crate::error::Error;
-use crate::manifest::BehindWindow;
 use crate::manifest::live::{LiveLink, LiveSource, Plan};
+use crate::manifest::{BehindWindow, ContentKind};
 use crate::mp4::track::{self, Track};
 use crate::segment::buffer::BufferHandle;
 use crate::segment::clock::{Clock, SystemClock};
@@ -15,7 +15,7 @@ use crate::segment::schedule::{
     WindowChange,
 };
 use crate::segment::store::SegmentData;
-use crate::segment::{SegmentNumber, Segments, refuse_live};
+use crate::segment::{SegmentLocation, SegmentNumber, Segments, refuse_live};
 use bytes::Bytes;
 use futures_util::Stream;
 use std::fmt;
@@ -312,13 +312,31 @@ impl SegmentStream {
     /// Fails with [`Error::MalformedMedia`] or [`Error::UnsupportedMedia`] if the
     /// initialization segment is not MP4 this crate reads.
     pub fn tracks(&self) -> Result<Vec<Track>, Error> {
+        let (body, location) = self.init_body()?;
+        track::tracks(&body, &location)
+    }
+
+    /// Returns each track's ID and content kind in initialization-segment order.
+    ///
+    /// Unlike [`Self::tracks`], this does not inspect codec configuration, so one
+    /// unreadable codec does not prevent the other tracks from being listed. Malformed
+    /// or unsupported MP4 structure still returns the same errors as [`Self::tracks`].
+    pub(crate) fn track_kinds(&self) -> Result<Vec<(u32, ContentKind)>, Error> {
+        let (body, location) = self.init_body()?;
+        track::track_kinds(&body, &location)
+    }
+
+    /// Returns the retained initialization segment body and its location.
+    ///
+    /// Returns [`Error::Initialization`] if the stream no longer retains that segment.
+    fn init_body(&self) -> Result<(Bytes, SegmentLocation), Error> {
         let init = self.shared.lock().init.clone();
         let body = init.body().ok_or_else(|| {
             Error::Initialization(
                 "MPEG stream no longer holds its initialization segment".to_owned(),
             )
         })?;
-        track::tracks(&body, &init.location)
+        Ok((body, init.location.clone()))
     }
 
     /// [`Self::fetch_segment`], with where the segment sits.

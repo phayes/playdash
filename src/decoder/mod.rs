@@ -30,7 +30,6 @@ use crate::manifest::ContentKind;
 use crate::mp4::codec::Codec;
 use crate::mp4::packet::{self, Packet, ticks_to_duration};
 use crate::mp4::reader::ParseError;
-use crate::mp4::track::Track;
 use bytes::Bytes;
 use std::fmt;
 use std::time::Duration;
@@ -506,12 +505,18 @@ pub(crate) enum TrackChoice {
     Kind(ContentKind),
 }
 
-/// The ID of the first of `tracks` of `kind`, or an [`Error::Initialization`] if none is.
-pub(crate) fn track_of_kind(tracks: &[Track], kind: ContentKind) -> Result<u32, Error> {
+/// Returns the ID of the first track matching `kind`.
+///
+/// Tracks are searched in initialization-segment order. Returns
+/// [`Error::Initialization`] if none has the requested kind.
+pub(crate) fn track_of_kind(
+    tracks: &[(u32, ContentKind)],
+    kind: ContentKind,
+) -> Result<u32, Error> {
     tracks
         .iter()
-        .find(|track| track.kind == kind)
-        .map(|track| track.id)
+        .find(|&&(_, track_kind)| track_kind == kind)
+        .map(|&(id, _)| id)
         .ok_or_else(|| Error::Initialization(format!("representation has no {kind:?} track")))
 }
 

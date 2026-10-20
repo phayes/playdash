@@ -70,13 +70,12 @@ pub enum Error {
         attempts: u32,
     },
 
-    /// Playback fell behind the earliest media still available from a live
-    /// presentation, and [`BehindWindow::Fail`](crate::BehindWindow::Fail) is
-    /// in effect.
+    /// Playback fell behind the media still available in a live presentation.
     ///
-    /// The stream remains usable. Seek to a time in `available` to resume.
-    /// When returned through [`std::io::Read`], this error is wrapped in an
-    /// [`std::io::Error`] and can be recovered with `get_ref` and `downcast_ref`.
+    /// This is returned when [`BehindWindow::Fail`](crate::BehindWindow::Fail) is
+    /// selected. The stream remains usable; seek to a time in `available` to resume.
+    /// APIs that return [`std::io::Result`] wrap this value in [`std::io::Error`].
+    /// Convert that error into [`Error`] to recover this variant.
     #[error("Live stream fell behind the available window {available:?}")]
     BehindLiveWindow {
         /// The range of presentation times that was available when playback
@@ -146,7 +145,7 @@ pub enum Error {
 
     /// IO error while reading a media segment body
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
 
     /// HTTP request for a segment failed
     #[cfg(feature = "sync")]
@@ -231,6 +230,12 @@ pub enum Error {
     #[error("No content key for KID {0}")]
     MissingContentKey(String),
 
+    /// A cache already has a different content key for this hexadecimal key ID.
+    /// The existing key is left unchanged.
+    #[cfg(feature = "encryption")]
+    #[error("A different content key is already set for KID {0}")]
+    ConflictingContentKey(String),
+
     /// A segment uses Common Encryption features this crate does not decrypt
     #[cfg(feature = "encryption")]
     #[error("Segment {segment} uses unsupported content protection: {reason}")]
@@ -252,11 +257,45 @@ pub enum Error {
     },
 }
 
+/// Recovers a playdash [`Error`] wrapped in an [`std::io::Error`].
+///
+/// Other I/O errors are wrapped in [`Error::Io`]. This recovers errors such as
+/// [`Error::BehindLiveWindow`] from APIs that return [`std::io::Result`].
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        error.downcast::<Error>().unwrap_or_else(Error::Io)
+    }
+}
+
 /// A decoder-input error's format, for its message.
 #[cfg(any(feature = "sync", feature = "async"))]
 fn format_name(format: &Option<crate::decoder::DecoderFormat>) -> String {
     match format {
         Some(format) => format.to_string(),
         None => "any format".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn io_errors_give_back_the_error_they_carry() {
+        let available = Duration::from_secs(4)..Duration::from_secs(8);
+        let carried = std::io::Error::other(Error::BehindLiveWindow {
+            available: available.clone(),
+        });
+        assert!(matches!(
+            Error::from(carried),
+            Error::BehindLiveWindow { available: range } if range == available
+        ));
+
+        let plain = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short");
+        assert!(matches!(
+            Error::from(plain),
+            Error::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
     }
 }

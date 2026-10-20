@@ -417,13 +417,15 @@ impl<'a> MediaStreamBuilder<'a> {
         self
     }
 
-    /// Supplies content keys for `cenc` or `cbcs` encrypted media.
+    /// Supplies the content keys needed to decrypt `cenc` or `cbcs` media.
     ///
-    /// With [`Self::cache`], the keys are added to that cache. Otherwise `open` creates
-    /// a private cache containing these keys. Unencrypted media is unaffected.
+    /// If [`Self::cache`] is set, [`Self::open`] adds the keys to that cache. Otherwise,
+    /// it creates a private cache with these keys. This has no effect on unencrypted
+    /// media.
     ///
-    /// [`Self::open`] fails with [`Error::Initialization`] if that cache has no keys yet
-    /// and a reader has already used it.
+    /// [`Self::open`] returns [`Error::Initialization`] if the shared cache was already
+    /// used without keys, or [`Error::ConflictingContentKey`] if it contains a different
+    /// key for one of the supplied key IDs.
     #[cfg(feature = "encryption")]
     pub fn keys(mut self, keys: ContentKeys) -> Self {
         self.keys = Some(keys);
@@ -547,7 +549,7 @@ impl<'a> MediaStreamBuilder<'a> {
             None => PacketStream::new(segments)?,
             Some(TrackChoice::Id(track_id)) => PacketStream::with_track(segments, track_id)?,
             Some(TrackChoice::Kind(kind)) => {
-                let track_id = track_of_kind(&segments.tracks()?, kind)?;
+                let track_id = track_of_kind(&segments.track_kinds()?, kind)?;
                 PacketStream::with_track(segments, track_id)?
             }
         };

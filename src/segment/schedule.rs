@@ -455,6 +455,17 @@ impl Schedule {
         self.scheduled(part.number()?)?.span.clone()
     }
 
+    /// Returns the presentation-time range of media segment `number`.
+    ///
+    /// Uses the stored range for an added segment because a refreshed live index may no
+    /// longer list it. Otherwise, reads the range from the current index.
+    fn span_of(&self, number: SegmentNumber) -> Option<Range<Duration>> {
+        match self.scheduled(number) {
+            Some(scheduled) => scheduled.span.clone(),
+            None => self.index.span(number),
+        }
+    }
+
     /// The data of the segment at `part`, or `None` for a media segment not
     /// added.
     pub(crate) fn part_data(&self, part: Part) -> Option<&Arc<SegmentData>> {
@@ -628,12 +639,12 @@ impl Schedule {
         }
 
         // Past the last segment, the position is the end of the media.
-        let playhead = match self.index.span(cursor) {
+        let playhead = match self.span_of(cursor) {
             Some(span) => span.start,
             None => end
                 .checked_prev()
                 .filter(|&last| last >= self.index.first())
-                .and_then(|last| self.index.span(last))
+                .and_then(|last| self.span_of(last))
                 .map_or(Duration::ZERO, |span| span.end),
         };
 
@@ -1003,7 +1014,7 @@ impl Schedule {
     /// segment begins, or `None` for untimed or missing media.
     #[cfg(feature = "rodio")]
     pub(crate) fn join_time(&self) -> Option<Duration> {
-        Some(self.index.span(self.join)?.start)
+        Some(self.span_of(self.join)?.start)
     }
 
     /// The start of the media segment at `part`, as a position of `accuracy`.
@@ -1014,7 +1025,7 @@ impl Schedule {
             return None;
         };
         Some(TimePosition {
-            timestamp: self.index.span(number)?.start,
+            timestamp: self.span_of(number)?.start,
             accuracy,
         })
     }
@@ -1961,6 +1972,24 @@ mod tests {
             schedule.part_data(media(7)).unwrap().location,
             SegmentLocation::new("https://cdn.test/6")
         );
+
+        // A scheduled segment keeps its original timestamp after it leaves the index.
+        assert_eq!(
+            schedule.time_at(media(1), TimeAccuracy::Packet),
+            Some(TimePosition {
+                timestamp: secs(0),
+                accuracy: TimeAccuracy::Packet,
+            })
+        );
+
+        // Retention is still measured from that timestamp. A two-second forward window
+        // therefore ends before the first segment in the refreshed index.
+        let ahead = Retention {
+            behind: None,
+            ahead: Some(secs(2)),
+        };
+        schedule.set_retention(ahead, supply_at(&store, 7));
+        assert!(schedule.window.is_empty(), "{:?}", schedule.window);
     }
 
     #[test]

@@ -65,6 +65,22 @@ pub(crate) fn tracks(init: &Bytes, init_location: &SegmentLocation) -> Result<Ve
         .collect()
 }
 
+/// Returns each track's ID and content kind in initialization-segment order.
+///
+/// This does not inspect codec configuration, so an unsupported or malformed codec in
+/// one track does not prevent the other tracks from being listed.
+pub(crate) fn track_kinds(
+    init: &Bytes,
+    init_location: &SegmentLocation,
+) -> Result<Vec<(u32, ContentKind)>, Error> {
+    let parsed = init::parse(init).map_err(|error| media_error(init_location, error))?;
+    Ok(parsed
+        .tracks
+        .iter()
+        .map(|track| (track.id, kind(&track.handler)))
+        .collect())
+}
+
 /// The kind of media an `hdlr` handler type carries.
 fn kind(handler: &[u8; 4]) -> ContentKind {
     match handler {
@@ -128,5 +144,33 @@ mod tests {
             ),
             Err(Error::MalformedMedia { .. })
         ));
+    }
+
+    #[test]
+    fn kinds_are_listed_when_another_tracks_codec_cannot_be_read() {
+        // Omit the video's required `avcC` configuration to make its codec unreadable.
+        let audio = [audio_entry(b"abcd", 1, 1000, &[])];
+        let video = [video_entry(b"avc1", 16, 16, &[])];
+        let body = Bytes::from(init(&[
+            TrackSpec {
+                id: 2,
+                handler: b"vide",
+                entries: &video,
+                ..SOUND
+            },
+            TrackSpec {
+                entries: &audio,
+                ..SOUND
+            },
+        ]));
+        let location = SegmentLocation::new("init");
+
+        assert!(tracks(&body, &location).is_err());
+        let kinds = track_kinds(&body, &location).unwrap();
+        assert_eq!(kinds, [(2, ContentKind::Video), (1, ContentKind::Audio)]);
+        assert_eq!(
+            crate::decoder::track_of_kind(&kinds, ContentKind::Audio).unwrap(),
+            1
+        );
     }
 }

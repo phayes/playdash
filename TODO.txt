@@ -1,228 +1,109 @@
 TODO
 ====
 
-1. Dynamic segment production for live streams
-----------------------------------------------
+0. Architecture:
+----------------
 
-Goal: play `MPD@type="dynamic"` manifests, where segments appear over time and
-old ones fall out of the time-shift window, without changing how static
-manifests behave. The list of media segments stops being a fixed `Vec` that
-`DashManifest::segments` builds once; `Segments` produces media segments on
-demand instead.
+1. **Download workers and requests have no owned lifecycle.** (L)
+   - Each blocking `SegmentStream` spawns a detached GET thread, and eager HEAD a second one (segment/stream.rs:224, 297). No `JoinHandle` is kept; `Drop` only sets `cancelled`, which the worker checks between requests. `Transport` has no cancellation.
+   - `SegmentCache::get` holds the segment's `blocking_fetch` mutex across the network call (segment/cache.rs:110), so one hung GET blocks every stream waiting for that segment, and dropping the stream does not free it.
+   - The async stream captures `Handle::current()` at open and spawns every task there; if that runtime shuts down, the fetch task dies without a terminal stream error.
+   - Streams scale as OS threads, not as requests.
+   - ExoPlayer's `Loader` owns its load tasks and cancels them; dash.js's `HTTPLoader` aborts requests.
+   - Refactor: a download coordinator scoped to the presentation, with owned workers, explicit shutdown, cancellable requests, and in-flight state in place of a mutex held across I/O. Async: an injected spawner or an explicit driver, with supervised tasks.
 
-Decisions (settled)
+2. **There is no presentation or session object.** (L to XL)
+   - `DashManifest` is a cloneable value that shares a mutable `Arc<Live>`:
+     - `with_base_url` changes the shared `Live`, so it affects every clone and every stream already open.
+     - For a live manifest, `representations()`, `mime_type()`, `highest_bandwidth()` and `protection_scheme()` read the MPD as parsed, while `segments()` reads the refreshed one.
+     - `segments(id)` registers the representation for refreshes as a side effect (live.rs:265-290).
+   - Refresh admission is split by I/O flavour: `Live` has separate blocking and async refresh locks (live.rs:174-179), so blocking and async streams from one manifest can both fetch and install a refresh.
+   - `Live::segments` and `Live::install` build and align indexes while holding the presentation-wide state mutex, so a large timeline stalls opening and index adoption for every stream.
+   - The clock is split: streams use `Live`'s clock, while `Segments::available()`, `media()` and `segment_at()` use `SystemTime::now()`. They will disagree once `UTCTiming` wraps the clock.
+   - Options are spread out and arrive late:
+     - Retention and live delay reach a stream only through `MediaStreamBuilder`; `segment_stream_retained` is crate-private.
+     - `segment_stream_at` drops retention for live; `DashSource` takes no retention, so a static `DashSource` keeps everything.
+     - `SegmentStream::with_retention` / `with_behind_window` apply after the GET worker has started (examples/list_tracks.rs works around this with `Retention { 0, 0 }`).
+     - `MediaStreamBuilder::open_at` is `open()` then `seek_time()`, so a static stream starts downloading at segment 0.
+     - Inspecting tracks or the codec means opening a stream that downloads media.
+   - Controls and status live on the reader: `is_live`, `available`, `live_edge` and `buffer` are forwarded through `SegmentStream`, `PacketStream`, `MediaStream`, the async copies and `DashSource`. A reader moved into a thread can no longer be asked, and each rebuilt stream gives a new `BufferHandle`, so `on_change` callbacks must be registered again. rodio works around this with a private weak `StreamHandle` and `BufferFeed`.
+   - Nothing owns a group of streams: examples/video_player.rs implements its own audio/video seek, combined buffer status and shutdown.
+   - Transport ownership differs: async keeps a `Client` on `nonblocking::DashManifest`, but `nonblocking::SegmentCache::default()` makes a new one, silently ignoring `with_client`. Blocking default caches each make their own ureq agent, so nothing is pooled unless the caller passes caches around.
+   - ExoPlayer's `DashMediaSource` owns the refresh loop and publishes immutable `DashManifest` snapshots; `Player` (control and listeners) is separate from `SampleStream` (data).
+   - Refactor:
+     - An immutable manifest snapshot plus a session handle that owns the clock, refresh admission, a default cache, prepare (init only: tracks, codec) and then open, and cloneable observation handles. A durable buffer subscription lives on the handle.
+     - Keep the settled "run on demand by whichever stream's worker needs it": the coordinator admits one refresh, and the stream that needs it does the fetch through its own transport.
+     - Make the refresh logic sans-IO (`due(now)`, `install(fetched, now)`), as `Schedule` already is, and build indexes outside the state lock, committing if the generation still matches.
+     - Keep `SegmentStream::new*(Segments)` and `PacketStream::into_media_stream*` as the lower-level composition paths.
 
-- `Segments` wraps a closed `MediaIndex` enum (`List`, `Template`,
-  `Timeline`), not a trait object: callers don't supply their own sources.
-- `Segments` no longer needs to be serialisable; drop `Serialize` /
-  `Deserialize`.
-- Walking the index (a cursor whose step yields a segment, "not before
-  <time>", or the end) is internal to the schedule, not public API.
-- One refresh per presentation, shared by every stream opened from the same
-  `DashManifest`, run on demand by whichever stream's worker needs it
-  (Phase 4).
-- Media segments are identified by a sequential number per representation,
-  kept aligned by start time when an index refreshes, as ExoPlayer does
-  (Phase 2, alignment in Phase 4). The next segment is always number + 1.
-- Seeks outside the available window clamp into it. Falling behind the window
-  while reading follows a policy chosen on the builder (Phase 5).
+3. **No single parsed model of an init segment, a track or a codec.**
+   - Parse once (M):
+     - A keyed `MediaStreamBuilder::track(kind).open()` parses one `moov` four times: `cenc::clear_sample_entries`, `cenc::protection` (in `Store::media_role`), `track::tracks` and `Demuxer::new`.
+     - There are two types named `Track` (`mp4::init::Track`, `mp4::track::Track`).
+     - The media kind is encoded as `hdlr` bytes, `ContentKind`, `Demuxer.audio` and the public `Track.kind`.
+     - Refactor: one `Arc<InitSegment>` built per init body (tracks, sample entries, protection), and the codec resolved only for the selected track. ExoPlayer's `FragmentedMp4Extractor` turns `moov` into `Track`s once.
+   - One codec model (L, separately):
+     - The public `Codec` drops fields (FLAC bit depth, Opus mapping) that `DecoderParameters` parses again from the same payload.
+     - Bitstream parsing is duplicated: two AAC AudioSpecificConfig parsers (mp4/codec.rs, decoder/aac.rs `adts_fields`); the `hvcC` length size read in mp4/demux.rs `hevc_length_size`, which silently turns off RASL detection, and in decoder/hevc.rs, which errors; `is_rasl` re-implements `nal::nal_units`. decoder/ fakes MP4 box kinds to reuse `mp4::reader`.
+     - Refactor: `Codec` is the complete description and `DecoderParameters` is derived from it; a neutral `bitstream` module (AAC, NAL, OBU, Opus, FLAC) shared by mp4/ and decoder/, like ExoPlayer's `NalUnitUtil` / `AacUtil`.
 
-Prior art (dash.js 8502c40, androidx/media 8c6678b) - see /opt/dash.js
+4. **Decryption happens inside the shared cache, keyed by URL.** (L)
+   - Keys belong to the whole `Store`. `add_keys` fails once an unkeyed cache holds any segment, and `MediaStreamBuilder::keys` changes a cache other streams may share. Keys can be supplied four ways.
+   - Each `SegmentData` gets its decryption role from a `OnceLock` set by the first stream that schedules it; a later conflicting role is silently ignored.
+   - Each protected `moof` is parsed twice (`cenc::protected_samples`, then `Demuxer::load`); `senc` is parsed outside `fragment.rs`.
+   - ExoPlayer keeps ciphertext in its cache, reads `senc` into each sample's `CryptoInfo` in the same pass as `trun`, and scopes DRM sessions per source.
+   - Refactor: cache ciphertext; parse `senc` in `fragment::parse`; keys and protection per stream; decrypt per sample in the demuxer (packet path) and per body in the byte view (byte path). A plaintext cache, if kept, must be keyed by key identity, not only by KID. Builds towards Additional TODOs 9.
 
-- ExoPlayer `DashSegmentIndex` (exoplayer_dash): an immutable, pure index
-  queried with `now` passed in: `getSegmentNum(time)`, `getTimeUs(n)`,
-  `getFirstAvailableSegmentNum(now)`, `getAvailableSegmentCount(now)`,
-  `getNextSegmentAvailableTimeUs(now)`, and `getSegmentCount`, which is
-  `INDEX_UNBOUNDED` for live templates. Template availability is arithmetic,
-  in `SegmentBase.MultiSegmentBase`.
-- ExoPlayer refresh: `DashMediaSource` owns one manifest load per
-  presentation and pushes each new manifest through
-  `DashMediaPeriod.updateManifest` to every track's `DefaultDashChunkSource`.
-  `RepresentationHolder.copyWithNewRepresentation` keeps a `segmentNumShift`,
-  since numbers drift across refreshes, and throws `BehindLiveWindowException`
-  on a gap. Stale manifests (older `publishTime`, fewer periods) are retried,
-  then fail with `DashManifestStaleException`. `minimumUpdatePeriod = 0`
-  falls back to 5 s. `UTCTiming` sets a client clock offset.
-- dash.js: stateless getters per addressing (`TemplateSegmentsGetter`,
-  `TimelineSegmentsGetter`, `ListSegmentsGetter`). One `ManifestUpdater` per
-  player refreshes on a `minimumUpdatePeriod` timer, paused while playback is
-  paused. `DashHandler` continues from `lastSegment`'s presentation time, so
-  refreshes need no renumbering. Behind the window, `PlaybackController` seeks
-  to the window start (to the live edge in low-latency mode); seeks are
-  clamped to the window.
-- Segment identity: ExoPlayer's `MediaChunk.chunkIndex` is the segment number
-  plus `segmentNumShift`, the next chunk is `chunkIndex + 1`
-  (`DefaultDashChunkSource.getSegmentNum`), and behind the window is
-  `segmentNum < firstAvailableSegmentNum`. Its loaded queue
-  (`ChunkSampleStream.mediaChunks`) is trimmed from the front, and positions
-  in it are never the identity. dash.js steps by `index` for templates and by
-  time for timelines, and tracks loaded requests by `startTime`
-  (`FragmentModel`).
+5. **Cache memory has no budget, and its ownership is tracked by hand.**
+   - Budget (M): `SegmentStream`'s `Drop` releases with `forget = false`, so a dropped static stream's bodies stay in the `SegmentCache` until the cache drops, contrary to `SegmentCache::cached`'s doc. Add an opt-in byte budget with LRU eviction of bodies no stream holds (ExoPlayer: `SimpleCache` with `LeastRecentlyUsedCacheEvictor`), without changing today's reuse by default.
+   - Bookkeeping (S to M): every `Schedule` change returns a `WindowChange { acquired, released, trimmed }` that both stream implementations must apply, in order, through `window_moved`. `Store` mixes a `holds` counter, a `forget` flag and an `Arc::strong_count == 2` check in `evict`. Apply changes in one place, or use hold tokens that move with window membership; a guard on every `Scheduled` entry would over-retain segments outside the window.
 
-What blocked it (resolved by Phases 1 to 5)
+6. **Buffer callbacks run inside the download path.** (M)
+   - `Store::notify` runs `on_change` callbacks synchronously on the thread or task that stored the body, before `finish_get`. A slow callback stalls downloads (and blocks a Tokio worker); a panicking one ends the worker and leaves readers waiting with no error.
+   - `on_change` has no unsubscribe, and dead weak listeners stay until the next notification.
+   - `BufferHandle`s hold strong `Arc<SegmentData>`s, which defeats `evict`'s `strong_count` check.
+   - Refactor: publish generation-counted snapshots (a watch channel), dispatch callbacks off the data path, return a removable subscription, and track segments by number and span rather than by `Arc<SegmentData>`. Entry 3's underrun and watermark events land on this.
 
-- `Schedule` assumed the stream has an end: `complete`, `past_end`,
-  `total_len`, `SeekFrom::End`, the symphonia-compat length estimate, and
-  `BufferTotal`. (`BufferTotal` and byte-offset semantics: Phase 5.)
-- Manifest timing (`manifest/segments.rs`) needed a period end or
-  `@endNumber` to bound `S@r="-1"` and `@duration` addressing.
-- The dynamic-MPD attributes were parsed by the vendored dash_mpd_core but
-  unused.
+7. **`Schedule` mixes byte-view machinery into an I/O-free core that returns `io::Result`.**
+   - Errors first (S): `clamp_time`, `time_target`, `begin_time_seek`, `land_byte_seek` and `land_time_seek` return `io::Error`, because `SegmentStream`'s public seeks are `io::Result`. Return domain errors from `Schedule` and convert to `io::Error` only at the `Read` / `Seek` trait boundary.
+   - Byte view (L, optional): `join`, `skipped`, `prefix_len`, `resolve_cursor`, `reported_end_len`, `Cursor::byte_position` and the HEAD-probe state (`head_available`, `eager_head`, `head_worker_running`, `size_step`) serve only the concatenated byte stream; the packet path reads whole segments through `next_part`. A byte-view layer over a segment loader would own them. The public byte stream stays (entry 2, ffmpeg and symphonia need it).
+   - `Schedule`'s fields are `pub(crate)`, written directly from the streams (`eager_head`, `error`), and `complete` is a cached flag kept by hand in four places. Make the fields private, with `stop_eager_head`, `fail`, `is_complete`.
 
-Plan, in phases that each ship on their own
+8. **The public error type is unstable and leans on one catch-all.** (M)
+   - `Error` is not `#[non_exhaustive]`, but has variants gated by `sync`, `async`, `rodio` and `encryption`; features enabled anywhere in a dependency graph can break exhaustive matches downstream. It also exposes `ureq`, `reqwest` and `rodio` error types.
+   - `Error::Initialization(String)` (about 50 uses) covers caller misuse, transport capability (HEAD unsupported) and runtime state (segment expired, init released, refresh failure).
+   - Refactor: `#[non_exhaustive]`, and split `Initialization` into a few actionable variants. HTTP error shape and recoverability belong to Additional TODOs 5.
 
-Phase 1 (done): one list for media and timing
-- `Segments` holds a private `MediaIndex` (`Untimed(Vec<SegmentLocation>)`, or
-  `List` of `MediaSegment { location, start, duration }` on a `MediaTiming`
-  clock) with accessors; `MediaTimeline` is gone, and `SegmentStream::new*`
-  take only `Segments`. Every reported time is presentation time (entry 2,
-  folded in). `SegmentList` and `SegmentBase` honour
-  `@presentationTimeOffset`.
+9. **The module graph has cycles, and public types sit where they were first used.** (M staged, L in full)
+   - `segment::index` imports `manifest::{FixedSegments, TimelineSegments, MediaUrls}`; `segment::schedule` imports `manifest::BehindWindow`; `manifest::live` imports `schedule::{Idle, start_at}` and builds the GET worker's `Plan`; `segment::stream` imports `live::{LiveLink, LiveSource, Plan}`.
+   - `packet` imports `decoder::MediaStream` for `into_media_stream*`, while `decoder` imports `packet`; `decoder/` holds both the I/O-free converters and the top-level `MediaStream` / `MediaStreamBuilder`. `SegmentStream::tracks` reaches into `mp4::track`.
+   - `Retention` and `TimeAccuracy` are defined in the private `schedule` module; `BehindWindow` and `LiveDelay` (stream policies) in manifest/live.rs. `playdash::segment` mixes shared data types with blocking-only I/O types.
+   - Refactor, in stages, keeping public re-exports: first pull out a neutral bottom layer (timing, `SegmentNumber`, `MediaIndex` and its addressing types, `LiveWindow`, `Clock`) and the policy types; then move `MediaStream` and its builder out of `decoder/`. Much of the rest follows from refactors 2 and 3.
 
-Phase 2 (done): stable segment identity
-- `SegmentNumber`, a crate-internal sequential number per representation (the
-  position, for static segments), identifies media everywhere in a stream:
-  `Part::Media(SegmentNumber)`, the retention window, `PartBody`, the
-  demuxer's `Loaded` and `PacketStream` seeks.
-- The schedule keeps its media in a `VecDeque<Scheduled { data, span }>`
-  numbered from a base `first`, so Phase 4 can append at the back and drop
-  from the front without renumbering. The stream's `first` offset arithmetic
-  is gone; the cursor carries `first` to step from the init to the first
-  media segment.
+10. **`Demuxer` does too much, and sizes seek fetches with a different preroll than it lands with.** (M)
+    - 17 fields: track selection, timing shift, trims, preroll, the decode queue, `tfdt` continuation, leading-picture filtering, a 110-line seek and HEVC RASL sniffing.
+    - `preroll()` (used by `seek_range` to size the fetch) multiplies the init's roll by `trex`'s default sample duration; `preroll_ticks()` (used to land) uses the target's roll and its first packet's real duration. With `trex` default 0, common in practice, the fetch falls back to the codec default, and `Split::Earlier` then fetches the missing segments one at a time. Seeks still land correctly.
+    - `load` writes `next_decode`, which `seek` overwrites afterwards from the target.
+    - Refactor, staged: one preroll function for fetch sizing and landing; a pure `load` that returns the next decode time; then a pure seek planner (`Need::Earlier(n) | Later | Done`), which would also shrink the copied sync and async seek loops (Additional TODOs 6), and a separate sample queue.
 
-Phase 3 (done): a segment index behind `Segments`
-- `Segments` holds an `Arc<MediaIndex>` (`segment/index.rs`): `Untimed`,
-  `List`, `Template` (`@duration`, arithmetic) and `Timeline` (run-length
-  `S` entries), each numbering its segments from zero. Static
-  `SegmentTemplate`s build `Template` or `Timeline`; `SegmentList` and
-  `SegmentBase` stay `List`. Template URLs are filled per segment from a
-  parsed `UrlTemplate`, every one checked once when the index is built.
-- Index queries are pure: the segment at a time (`number_at`,
-  `ending_after`), the first starting from a time (`starting_from`), the
-  numbers, and `available(now)`, which is every segment while static. A
-  crate-internal `Clock` gives streams `now`.
-- The schedule adds segments from the index as its window, a priority
-  request, a byte seek, a HEAD probe or `fetch_segment` reaches them, and
-  keeps every segment it has added. Retention reaches the schedule at open
-  (`MediaStreamBuilder` passes it through), so a bounded window adds only
-  what it keeps. Each added segment gets the `MediaRole` the init's
-  protection gave at open.
+11. **Tests do not exercise an async-only build.** (M)
+    - tests/packets.rs and tests/decoder.rs are gated on `sync` and nest their async tests inside; the async encryption tests sit in a file that needs `rodio`; segment/live_tests.rs builds only with `sync`. `--no-default-features --features async` therefore skips most end-to-end tests, and many async tests only compare against the blocking result.
+    - Refactor: contract tests run against both backends, standalone sync-only and async-only suites, and CI over sync-only, async-only, both, and with `encryption`, including runtime shutdown and a stalled request.
 
-Phase 4 (done): the live index and the shared refresh
-- `DashManifest` reads the dynamic-MPD fields into a `LivePresentation`
-  (`manifest/live.rs`) and has `is_live()`. `availabilityTimeOffset` is the
-  innermost `SegmentTemplate` value, else the innermost `BaseURL` value, as
-  both players do. Only `SegmentTemplate` addressing plays live;
-  `SegmentList` and `SegmentBase` fail with `DashManifestUnsupportedLive`.
-- `MediaIndex` `Template` and `Timeline` carry a `first` number (live
-  numbers start at the first `$Number$`, static ones at zero) and an optional
-  `LiveWindow`. Segment `n` is available once `availabilityStartTime + its
-  presentation end - availabilityTimeOffset` has passed, until its end falls
-  out of `timeShiftBufferDepth`. `end()` is `None` for a live template, and
-  for a timeline whose last `S@r="-1"` has no bound: it repeats as segments
-  become available. Queries: `available(now)`, `available_at(number)`,
-  `live_edge(now)` (the end of the newest available segment), and
-  `aligned_to(old)`, ExoPlayer's `copyWithNewRepresentation` cases by start
-  time (a gap numbers on past one unused number: Phase 5).
-- A refreshed timeline replaces the old index, shifted, rather than merging
-  `S` entries: each segment the schedule has added keeps its own span
-  (`Scheduled { data, span }`), which travels on `PartBody` to the demuxer.
-  The demuxer takes `MediaTiming` at construction and the stream's current
-  index at `seek_range`.
-- The schedule's window ends at the segments available now. `step` (ready,
-  not before a time, refresh, end) feeds `advance`, which the GET worker
-  calls with nothing to fetch, and `replace_index` swaps in a refreshed
-  index. `end()` is `None` while live; `finish_index` makes a live index's
-  end final when no refresh can extend it. `BufferHandle`s are fed live
-  segments as they become available.
-- Template URLs are checked once by pattern (`MediaUrls::check`), and
-  timeline order once per run.
-- `Live` (shared behind an `Arc` by every stream from one `DashManifest`)
-  holds the current MPD and one aligned index per opened representation,
-  with a `generation`. The `SegmentStream` holds a `LiveLink`; wrappers ask it
-  (`is_live`, `available`, `live_edge`). `SegmentStream::new*` refuses live
-  `Segments`; they open from the manifest.
-- The GET worker refreshes on demand: due at `fetched_at +
-  minimumUpdatePeriod` (5 s when zero), or one second after the last fetch
-  once a timeline runs out (neither player refreshes early there). One fetch
-  at a time, through the stream's `Transport::fetch_manifest`, honouring
-  `Location`. A stale `publishTime` retries after 1, 2, 3 s, then fails with
-  `DashManifestStale`. No `minimumUpdatePeriod` (or no URL) means a timeline
-  that runs out ends the stream. A switch to static ends it cleanly.
-- Readers wait at the live edge (pulled forward from Phase 5).
-- Start position: `MediaStreamBuilder::live_delay(LiveDelay)`; unset, the
-  manifest's `suggestedPresentationDelay`, else `LiveDelay::Segments(4)`;
-  capped at the time-shift window.
-- The `Clock` comes from `Live` (a `ManualClock` in tests). A `UTCTiming`
-  server offset would wrap it: not done.
-
-Phase 5 (done): stream semantics at the live edge
-- `pub enum BehindWindow { Fail (default), WindowStart, LiveEdge }`, set by
-  `MediaStreamBuilder::behind_window` and `SegmentStream::with_behind_window`
-  (blocking and async). `Fail` reads as a recoverable
-  `Error::BehindLiveWindow { available }` (wrapped in the `io::Error` for
-  `Read`); iteration ends until a seek, which clears it. `WindowStart`
-  carries on from the earliest available segment (dash.js's default), and
-  `LiveEdge` from the stream's start delay behind the edge (dash.js's
-  low-latency mode). Neither adds a margin, as neither player does.
-- The `Schedule` holds the policy and the resolved start delay, and readers
-  ask it `read_step(part)`: ready, end, behind, or jumped (the cursor and
-  window moved). A live segment counts as behind once it is before the
-  window and its body is not held; held bodies stay readable. Expired
-  segments are never fetched, and a GET failing for one that expired while in
-  flight does not end the stream. A jumped-to segment reaches the demuxer
-  marked, which drops packets before its first sync sample and its leading
-  pictures; symphonia (0.5, non-seekable) ignores `tfdt` and plays through.
-- A refreshed timeline starting after the old one ends numbers on past one
-  unused number, so a reader waiting after the old ones finds its segment
-  expired: the same event, through the policy. `DashManifestLiveGap` is gone.
-- Byte offsets: byte 0 is the init, then `join`, the segment the stream
-  started at. The deque's `front` moves back on seeks and pre-roll fetches
-  before it (segments before `join` have no byte offset, also for static
-  `starting_at` streams) and forward as live segments are trimmed, with their
-  sizes summed in `skipped` (`None` once one was unknown, or after a jump).
-  `SeekFrom::End` and symphonia-compat estimates fail while live.
-- Seeks (`seek_time`, packet seeks, `open_at`, `segment_stream_at`) move a
-  live time before the window to its start, and one at or past the edge to
-  the start delay behind it, no later than the newest segment's start.
-- Memory: `Retention::behind` unset means the time-shift depth while live;
-  the live window never starts before the time-shift window (a reader behind
-  it pins only its own segment); the deque front is trimmed and the trimmed
-  segments evicted from the `Store` once nothing else refers to them; the
-  schedule does not add expired segments past a paused reader.
-- `BufferStatus.total` and ranges cover the time-shift window while live, and
-  every reachable segment while static.
-- Rodio `DashSource` plays live: positions count from `start()`,
-  `total_duration` is `None`, seeks clamp into the window, and its policy
-  defaults to `WindowStart` (`with_behind_window`). `available`/`live_edge`.
-  A weak `StreamHandle` reaches the stream inside rodio's `Decoder`.
-- Left over: a store entry stays when its segment is trimmed while a GET of
-  it is in flight. A 404 for a segment the clock still counts as available
-  ends the stream (needs retries, Additional TODOs 5, and `UTCTiming`).
-
-Out of scope for this entry (note, don't solve)
-- Multi-period live, where a new period can bring a new init segment.
-  `SegmentNumber` should leave room for a period index; the byte stream would
-  need to re-emit an init at the boundary, which most fMP4 demuxers only
-  accept by starting again.
-- Low-latency DASH (chunked transfer, `availabilityTimeComplete=false`); it
-  ties into the existing TODO in schedule.rs about publishing a `moof` before
-  its `mdat` arrives. A low-latency media segment arrives as several CMAF
-  chunks, each a `moof`+`mdat` movie fragment, so this is where "fragment"
-  (or "chunk") names a part of a segment.
-- Adaptive bitrate switching: entry 4.
-- Refreshes signalled in-band by `emsg` (ExoPlayer's `PlayerEmsgHandler`), and
-  MPD patches.
-- `UTCTiming` clock sync (a server offset around `Live`'s `Clock`), and
-  live `SegmentList` / `SegmentBase`.
-- Retrying a failed refresh: today it fails the stream, as a failed GET does
-  (Additional TODOs 5).
+12. **Smaller.**
+    - `Segments` exposes `SegmentNumber`s as a `usize` "index": a position while static, close to `$Number$` while live, so a live `media_len()` returns something like 1,000,005. Rename it or document it as an exclusive number bound, and add a real count; a public `SegmentNumber` would be clearer but breaking. Refusing live `Segments` in `SegmentStream::new*` stays (settled).
+    - `MediaIndex`: `Template` and `Timeline` repeat `timing`, `urls`, `first` and `live`. A shared struct around a closed `Addressing` enum (keeping the settled closed enum), with the delay policy (`behind_edge`, `clamp_time`'s delay) moved to the schedule. (M)
+    - The five public packet adapters have no public dispatcher; `Adapter` / `Choice` (decoder/adapter.rs) are crate-private, so a `PacketStream` user re-implements the codec match. A public `PacketConverter` with `from_style` / `from_format`. (S to M)
+    - `Packet` / `MediaPacket` and `PacketSeeked` / `Seeked` are field-for-field copies with a destructuring shim; share their timing internally. (S)
+    - SegmentBase indexes are loaded eagerly for every representation when a manifest is fetched (serially in async), outside the selected stream's cache; load the chosen one lazily at open. Goes with Additional TODOs 2.
+    - The vendored `dash_mpd_core` schema types act as the domain model across manifest, live and segment code, and its error type is in the public `Error`. A normalized manifest built once would sit between them. Goes with Additional TODOs 3.
 
 
-2. Presentation time: timeline origins and decoder timestamps
+
+1. Presentation time: timeline origins and decoder timestamps
 ------------------------------------------------------------
 
-Done with entry 1's Phase 1: every reported time is presentation time,
+Done with the live-stream work: every reported time is presentation time,
 `Period@start + (media time - @presentationTimeOffset) / timescale`, and
 `MediaTiming::presentation_time` maps a decoder's media timestamps onto it.
 A time before the first segment lands on the first. `MediaTimeline` is gone.
@@ -233,7 +114,7 @@ Left to do
   counting frames from the segment start.
 
 
-3. Container wrapping for raw-demuxer decoders
+2. Container wrapping for raw-demuxer decoders
 ----------------------------------------------
 
 Goal: every codec's `MediaStream` output can be piped to a decoder that reads a
@@ -271,7 +152,7 @@ Open questions
   accepts?
 
 
-4. Adaptive bitrate switching
+3. Adaptive bitrate switching
 -----------------------------
 
 Goal: callers can switch between a stream's representations as network
@@ -353,12 +234,13 @@ Example and tests
 - Integration test on the same throttled transport: no gap and no overlap in
   the timeline at the switch boundary.
 
-Depends on entry 1
-- `LiveEdge` needs Phase 4's "when the next segment becomes available" index
-  query and Phase 5's waiting at the edge. `behind_live_edge` needs Phase 4's
-  live edge. `next_boundary` while live respects availability (Phase 5's
-  waiting). Boundaries are presentation times, so per-representation segment
-  numbers need not line up across a switch.
+Builds on the live-stream work (done)
+- `LiveEdge` uses the index's "when the next segment becomes available"
+  query (`MediaIndex::available_at`) and the readers' waiting at the edge.
+  `behind_live_edge` uses the live edge (`MediaIndex::live_edge`).
+  `next_boundary` while live respects availability, as reads at the edge do.
+  Boundaries are presentation times, so per-representation segment numbers
+  need not line up across a switch.
 
 Out of scope for this entry (note, don't solve)
 - Abandoning an in-flight download that is too slow (dash.js's
@@ -370,8 +252,8 @@ Out of scope for this entry (note, don't solve)
 - A library-side switch, `MediaStream::switch_to(id)` at the next boundary: it
   needs an "initialization changed" signal in the packet iterator and handles
   `pts` units changing with the timescale. Revisit if composing two streams
-  proves painful; it would reuse Phase 4's `replace_index` and alignment by
-  start time.
+  proves painful; it would reuse `Schedule::replace_index` and
+  `MediaIndex::aligned_to`'s alignment by start time.
 - Switching across adaptation sets
   (`urn:mpeg:dash:adaptation-set-switching:2016`).
 
@@ -421,7 +303,7 @@ These are ranked by how much they matter. These are candidates for follow-up wor
    - `Schedule` and `Store` contain no I/O. The segment streams' shared steps now live on `Schedule` (GET and HEAD worker steps, `size_step` for `ensure_sizes`, time and byte seek begin/land, `reported_end`); what is left in each stream is its waiting, its I/O, and the read loops around them. Still copied: the packet-stream seek loop in `packet/stream.rs` and `nonblocking/packet.rs`, the caches, transports and `MediaStream` builders. dash.js has a single code path, so there is no direct comparison.
 
 7. **The first manifest fetch has no caller-chosen `Transport`.**
-   - Since TODO §1 Phase 4, `new_from_url` and live refreshes fetch through `Transport::fetch_manifest` (one ureq agent for the MPD and its indexes; the async version's `Client`), and refreshes use the stream's own transport.
+   - Since live-stream support, `new_from_url` and live refreshes fetch through `Transport::fetch_manifest` (one ureq agent for the MPD and its indexes; the async version's `Client`), and refreshes use the stream's own transport.
    - There is still no `new_from_url_with_transport`, so custom transports and test fixtures cannot intercept the first load.
    - dash.js loads the MPD, init, index and media segments through one HTTPLoader.
 
@@ -434,4 +316,29 @@ These are ranked by how much they matter. These are candidates for follow-up wor
    - `cenc:default_KID` and `pssh` are parsed by the vendored crate but never read. Keys come only from `tenc` in the init segment.
    - `protected_entries` skips any track whose handler is not `soun` (cenc.rs:272). Encrypted video therefore fails later with "samples are encrypted", not with a clear "unsupported" error.
 
-10. **Every `SegmentList` segment is built up front.** Templates now compute segments on demand (TODO §1 Phase 3), but `SegmentList` and `SegmentBase` build a `Vec` of `MediaSegment`s, one per `SegmentURL`. That matches what the MPD lists, so it only matters for very long lists.
+10. **Every `SegmentList` segment is built up front.** Templates now compute segments on demand, but `SegmentList` and `SegmentBase` build a `Vec` of `MediaSegment`s, one per `SegmentURL`. That matches what the MPD lists, so it only matters for very long lists.
+
+11. **Live follow-ups left over from the live-stream work.**
+    - A store entry stays when its segment is trimmed while a GET of it is in flight.
+    - A 404 for a segment the clock still counts as available ends the stream (needs retries, Additional TODOs 5, and `UTCTiming`).
+    - Retrying a failed refresh: today it fails the stream, as a failed GET does (Additional TODOs 5).
+    - `UTCTiming` clock sync: a server offset around `Live`'s `Clock`.
+    - Live `SegmentList` / `SegmentBase`: today they fail with `DashManifestUnsupportedLive`.
+    - Multi-period live, where a new period can bring a new init segment. `SegmentNumber` should leave room for a period index; the byte stream would need to re-emit an init at the boundary, which most fMP4 demuxers only accept by starting again.
+    - Low-latency DASH (chunked transfer, `availabilityTimeComplete=false`). It ties into the TODO in schedule.rs about publishing a `moof` before its `mdat` arrives. A low-latency media segment arrives as several CMAF chunks, each a `moof`+`mdat` movie fragment, so this is where "fragment" (or "chunk") names a part of a segment.
+    - Refreshes signalled in-band by `emsg` (ExoPlayer's `PlayerEmsgHandler`), and MPD patches.
+
+
+
+Bugs to fix later:
+
+Found in the same review; each needs one of the refactors above, or a design decision, to fix properly.
+
+1. **A hung GET or HEAD blocks every stream that needs that segment, and dropping the stream does not stop it.** The per-segment fetch mutex is held across the request. Refactor 1.
+2. **An async stream whose runtime shuts down can leave reads pending forever.** The fetch task dies without a terminal error (reported by the reviewer, not reproduced). Refactor 1.
+3. **Blocking and async refreshes of one live presentation are not serialized,** so both can fetch and install the same generation and race the stale-retry state. Refactor 2.
+4. **A live `DashManifest` answers representation queries from the original MPD,** and `with_base_url` on one clone changes the live state of every clone and open stream. Refactor 2.
+5. **`nonblocking::SegmentCache::default()` ignores `nonblocking::DashManifest::with_client`.** `segment_stream_with_cache(id, Arc::default())` silently uses a new `Client`. Removing `Default` is breaking. Refactor 2.
+6. **A panicking `on_change` callback ends the download worker and leaves readers waiting with no error;** a slow one stalls downloads. Refactor 6.
+7. **The same segment URL opened under two different protection contexts decrypts with whichever role was set first.** The second `OnceLock::set` is ignored. Refactor 4.
+8. **Response bodies are read without a size limit.** Both transports read the whole body (`read_to_end`, `Response::bytes()`), and a server that ignores `Range` sends the whole resource before the range is sliced and its length checked. Needs configurable limits for manifest, init, index and media bodies in both transports.

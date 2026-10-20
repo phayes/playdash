@@ -209,10 +209,16 @@ fn track(buf: &[u8], trak: Atom, defaults: &[(u32, TrackDefaults)]) -> Result<Tr
     let stsd = require(stbl.children(buf), b"stsd")?;
     let mut fields = stsd.fields(buf);
     fields.version_flags()?;
-    fields.u32()?; // entry_count
+    let count = fields.u32()?;
     let mut entries = Vec::new();
-    for entry in atoms(buf, fields.pos, stsd.end) {
+    for entry in atoms(buf, fields.pos, stsd.end).take(count as usize) {
         entries.push(sample_entry(buf, entry?, &handler)?);
+    }
+    if entries.len() != count as usize {
+        return Err(malformed(format!(
+            "stsd lists {count} sample entries but holds {}",
+            entries.len()
+        )));
     }
     let mut roll = None;
     for child in stbl.children(buf) {
@@ -615,6 +621,29 @@ pub(crate) mod tests {
         assert!(matches!(
             parse(&init),
             Err(ParseError::Unsupported(reason)) if reason == "audio sample entry version 3"
+        ));
+    }
+
+    #[test]
+    fn sample_entries_are_read_as_stsd_counts_them() {
+        let entries = [audio_entry(b"mp4a", 2, 44_100, &[])];
+        let one_entry = init(&[TrackSpec {
+            entries: &entries,
+            ..SOUND
+        }]);
+        let counted = |count: u32| {
+            let mut init = one_entry.clone();
+            let stsd = init.windows(4).position(|kind| kind == b"stsd").unwrap();
+            init[stsd + 8..stsd + 12].copy_from_slice(&count.to_be_bytes());
+            parse(&init)
+        };
+
+        // Ignore sample-entry boxes beyond the count declared by `stsd`.
+        assert!(counted(0).unwrap().tracks[0].entries.is_empty());
+        assert_eq!(counted(1).unwrap().tracks[0].entries.len(), 1);
+        assert!(matches!(
+            counted(2),
+            Err(ParseError::Malformed(reason)) if reason == "stsd lists 2 sample entries but holds 1"
         ));
     }
 

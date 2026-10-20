@@ -172,7 +172,8 @@ impl Demuxer {
                     edit.segment_duration,
                     parsed.movie_timescale,
                     track.timescale,
-                ) - origin,
+                )
+                .saturating_sub(origin),
             ),
             _ => None,
         };
@@ -280,7 +281,7 @@ impl Demuxer {
                 .iter()
                 .map(|sample| u64::from(sample.duration))
                 .sum();
-            decode_time = Some(start + duration);
+            decode_time = Some(start.saturating_add(duration));
         }
         self.next_decode = decode_time.map(|time| (number.next(), time));
         Ok(Loaded {
@@ -385,7 +386,7 @@ impl Demuxer {
         let at = match landing {
             Landing::Exact => time_ticks,
             Landing::Keyframe => all.get(start).map_or(time_ticks, |entry| {
-                (entry.packet.pts + preroll).min(time_ticks)
+                entry.packet.pts.saturating_add(preroll).min(time_ticks)
             }),
         };
 
@@ -396,6 +397,8 @@ impl Demuxer {
                 .find(|&index| all[index].packet.keyframe)
                 .unwrap_or(all.len())
         };
+        let ends_after_at =
+            |packet: &Packet| i128::from(packet.pts) + i128::from(packet.duration) > i128::from(at);
         let leading_of = |start: usize, index: usize| {
             let start_pts = all.get(start).map_or(at, |entry| entry.packet.pts);
             (all[index].leading && index < next_sync(start))
@@ -403,10 +406,8 @@ impl Demuxer {
         };
         let mut start = start;
         loop {
-            let shown_leading = (start + 1..next_sync(start)).any(|index| {
-                let packet = &all[index].packet;
-                leading_of(start, index) && packet.pts + packet.duration as i64 > at
-            });
+            let shown_leading = (start + 1..next_sync(start))
+                .any(|index| leading_of(start, index) && ends_after_at(&all[index].packet));
             if !shown_leading {
                 break;
             }
@@ -422,10 +423,7 @@ impl Demuxer {
         let start_pts = all.get(start).map_or(at, |entry| entry.packet.pts);
         let leading = |index: usize| leading_of(start, index);
         let cursor = (start..all.len())
-            .find(|&index| {
-                let packet = &all[index].packet;
-                !leading(index) && packet.pts + packet.duration as i64 > at
-            })
+            .find(|&index| !leading(index) && ends_after_at(&all[index].packet))
             .unwrap_or(all.len());
         if cursor == all.len() && !at_last {
             return Split::Later;
@@ -436,9 +434,12 @@ impl Demuxer {
             .collect();
         let landed = match all.get(cursor) {
             Some(entry) => entry.packet.pts,
-            None => all
-                .last()
-                .map_or(at, |entry| entry.packet.pts + entry.packet.duration as i64),
+            None => all.last().map_or(at, |entry| {
+                entry
+                    .packet
+                    .pts
+                    .saturating_add_unsigned(entry.packet.duration)
+            }),
         };
 
         // Queue the rest, dropping leading samples of the start until the next sync sample.
@@ -517,7 +518,8 @@ impl Demuxer {
         };
         let trim_end = match self.end {
             Some(end) => {
-                let past = (pts + duration as i64 - end).max(0) as u64;
+                let past = i128::from(pts) + i128::from(duration) - i128::from(end);
+                let past = past.clamp(0, i128::from(duration)) as u64;
                 past.min(duration - trim_start)
             }
             None => 0,
@@ -895,6 +897,24 @@ mod tests {
         let next = load(&mut demuxer, 2, None, &audio_samples(1), 8);
         demuxer.push(next);
         assert_eq!(pts(drain(&mut demuxer)), [80]);
+    }
+
+    #[test]
+    fn timestamps_at_the_largest_media_time_load_and_seek_without_overflow() {
+        let mut demuxer = demuxer(one_track(b"soun", None, &[]), &[40]);
+        demuxer.set_preroll(Duration::from_millis(20));
+        let near_end = Some(u64::MAX - 5);
+        let loaded = [load(&mut demuxer, 0, near_end, &audio_samples(4), 0)];
+        assert!(
+            loaded[0]
+                .entries
+                .iter()
+                .all(|entry| entry.packet.pts == i64::MAX)
+        );
+        for landing in [Landing::Exact, Landing::Keyframe] {
+            let seeked = done(demuxer.seek(Duration::ZERO, landing, &loaded, true, true));
+            assert_eq!(seeked.landed, i64::MAX);
+        }
     }
 
     #[test]
